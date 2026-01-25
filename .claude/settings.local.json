@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(findstr:*)",
+      "Bash(dir:*)",
+      "mcp__zai-mcp-server__analyze_image"
+    ]
+  }
+}
