@@ -1,0 +1,403 @@
+package com.tabula.v3
+
+import android.Manifest
+import android.app.Activity
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.util.Log
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import com.tabula.v3.data.model.ImageFile
+import com.tabula.v3.data.preferences.AppPreferences
+import com.tabula.v3.data.preferences.ThemeMode
+import com.tabula.v3.data.preferences.TopBarDisplayMode
+import com.tabula.v3.data.repository.FileOperationManager
+import com.tabula.v3.data.repository.LocalImageRepository
+import com.tabula.v3.data.repository.RecycleBinManager
+import com.tabula.v3.ui.navigation.AppScreen
+import com.tabula.v3.ui.navigation.PredictiveBackContainer
+import com.tabula.v3.ui.screens.AboutScreen
+import com.tabula.v3.ui.screens.DeckScreen
+import com.tabula.v3.ui.screens.RecycleBinScreen
+import com.tabula.v3.ui.screens.SettingsScreen
+import com.tabula.v3.ui.screens.StatisticsScreen
+import com.tabula.v3.ui.theme.LocalIsDarkTheme
+import com.tabula.v3.ui.theme.TabulaColors
+import com.tabula.v3.ui.theme.TabulaTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/**
+ * MainActivity - Tabula 应用入口
+ *
+ * 核心功能：
+ * 1. 沉浸式 Edge-to-Edge UI
+ * 2. 权限管理（READ_MEDIA_IMAGES）
+ * 3. 简单路由管理
+ * 4. ColorOS 16 风格预测性返回
+ */
+class MainActivity : ComponentActivity() {
+
+    private var hasPermission by mutableStateOf(false)
+
+    // 权限请求
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        hasPermission = isGranted
+    }
+
+    // 删除权限请求（Android 11+ MediaStore 删除确认）
+    private lateinit var deletePermissionLauncher: ActivityResultLauncher<IntentSenderRequest>
+    private var onDeletePermissionResult: ((Boolean) -> Unit)? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
+        super.onCreate(savedInstanceState)
+
+        checkPermission()
+
+        // 初始化删除权限启动器
+        deletePermissionLauncher = registerForActivityResult(
+            ActivityResultContracts.StartIntentSenderForResult()
+        ) { result ->
+            val success = result.resultCode == Activity.RESULT_OK
+            onDeletePermissionResult?.invoke(success)
+            onDeletePermissionResult = null
+        }
+
+        setContent {
+            val context = LocalContext.current
+            val preferences = remember { AppPreferences(context) }
+            var currentTheme by remember { mutableStateOf(preferences.themeMode) }
+
+            // 根据设置决定深色模式
+            val darkTheme = when (currentTheme) {
+                ThemeMode.SYSTEM -> isSystemInDarkTheme()
+                ThemeMode.LIGHT -> false
+                ThemeMode.DARK -> true
+            }
+
+            TabulaTheme(darkTheme = darkTheme) {
+                if (hasPermission) {
+                    TabulaApp(
+                        preferences = preferences,
+                        onThemeChange = { theme -> currentTheme = theme },
+                        onRequestDeletePermission = { intentSender, callback ->
+                            onDeletePermissionResult = callback
+                            deletePermissionLauncher.launch(
+                                IntentSenderRequest.Builder(intentSender).build()
+                            )
+                        }
+                    )
+                } else {
+                    PermissionRequestScreen(
+                        onRequestPermission = { requestPermission() }
+                    )
+                }
+            }
+        }
+    }
+
+    private fun checkPermission() {
+        hasPermission = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.READ_MEDIA_IMAGES
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestPermission() {
+        permissionLauncher.launch(Manifest.permission.READ_MEDIA_IMAGES)
+    }
+}
+
+/**
+ * Tabula 应用主体
+ *
+ * 包含路由管理和预测性返回动画
+ */
+@Composable
+fun TabulaApp(
+    preferences: AppPreferences,
+    onThemeChange: (ThemeMode) -> Unit,
+    onRequestDeletePermission: (android.content.IntentSender, (Boolean) -> Unit) -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    // ========== 设置 ==========
+    var currentBatchSize by remember { mutableIntStateOf(preferences.batchSize) }
+    var currentTopBarMode by remember { mutableStateOf(preferences.topBarDisplayMode) }
+
+    // ========== 路由状态 ==========
+    var currentScreen by remember { mutableStateOf(AppScreen.DECK) }
+
+    // ========== 图片数据状态 ==========
+    var allImages by remember { mutableStateOf<List<ImageFile>>(emptyList()) }
+    var deletedImages by remember { mutableStateOf<List<ImageFile>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(true) }
+
+    // 文件操作管理器
+    val fileOperationManager = remember { FileOperationManager(context) }
+    val recycleBinManager = remember { RecycleBinManager.getInstance(context) }
+
+    // 加载图片和回收站
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            val repository = LocalImageRepository(context)
+            allImages = repository.getAllImages()
+            // 加载持久化的回收站
+            deletedImages = recycleBinManager.loadRecycleBin()
+        }
+        isLoading = false
+    }
+
+    /**
+     * 执行删除操作
+     */
+    fun performDelete(image: ImageFile) {
+        scope.launch {
+            val result = fileOperationManager.deleteImage(image.uri)
+            when (result) {
+                is FileOperationManager.DeleteResult.Success -> {
+                    Log.d("TabulaApp", "Deleted: ${image.displayName}")
+                }
+                is FileOperationManager.DeleteResult.NeedsPermission -> {
+                    onRequestDeletePermission(result.intentSender) { granted ->
+                        if (granted) {
+                            Log.d("TabulaApp", "Delete permission granted for: ${image.displayName}")
+                        }
+                    }
+                }
+                is FileOperationManager.DeleteResult.Error -> {
+                    Log.e("TabulaApp", "Delete error: ${result.message}")
+                }
+            }
+        }
+    }
+
+    // ========== 屏幕内容定义 ==========
+    val deckContent: @Composable () -> Unit = {
+        DeckScreen(
+            allImages = allImages,
+            batchSize = currentBatchSize,
+            isLoading = isLoading,
+            topBarDisplayMode = currentTopBarMode,
+            onKeep = {
+                preferences.totalReviewedCount++
+            },
+            onRemove = { image ->
+                val newImages = allImages.toMutableList().apply { remove(image) }
+                allImages = newImages
+                deletedImages = deletedImages + image
+                
+                preferences.totalReviewedCount++
+                preferences.totalDeletedCount++
+                
+                scope.launch {
+                    recycleBinManager.addToRecycleBin(image)
+                }
+                Log.d("TabulaApp", "Moved to trash: ${image.displayName}")
+            },
+            onNavigateToTrash = {
+                currentScreen = AppScreen.RECYCLE_BIN
+            },
+            onNavigateToSettings = {
+                currentScreen = AppScreen.SETTINGS
+            }
+        )
+    }
+
+    val recycleBinContent: @Composable () -> Unit = {
+        RecycleBinScreen(
+            deletedImages = deletedImages,
+            onRestore = { image ->
+                deletedImages = deletedImages.toMutableList().apply { remove(image) }
+                allImages = allImages + image
+                scope.launch {
+                    recycleBinManager.removeFromRecycleBin(image)
+                }
+                Log.d("TabulaApp", "Restored: ${image.displayName}")
+            },
+            onPermanentDelete = { image ->
+                deletedImages = deletedImages.toMutableList().apply { remove(image) }
+                scope.launch {
+                    recycleBinManager.removeFromRecycleBin(image)
+                }
+                performDelete(image)
+            },
+            onClearAll = {
+                deletedImages.forEach { image ->
+                    performDelete(image)
+                }
+                scope.launch {
+                    recycleBinManager.clearRecycleBin()
+                }
+                deletedImages = emptyList()
+            },
+            onNavigateBack = {
+                currentScreen = AppScreen.DECK
+            }
+        )
+    }
+
+    val settingsContent: @Composable () -> Unit = {
+        SettingsScreen(
+            preferences = preferences,
+            imageCount = allImages.size,
+            trashCount = deletedImages.size,
+            onThemeChange = onThemeChange,
+            onBatchSizeChange = { size -> currentBatchSize = size },
+            onTopBarModeChange = { mode -> currentTopBarMode = mode },
+            onNavigateToAbout = { currentScreen = AppScreen.ABOUT },
+            onNavigateBack = { currentScreen = AppScreen.DECK },
+            onNavigateToStatistics = { currentScreen = AppScreen.STATISTICS }
+        )
+    }
+
+    val aboutContent: @Composable () -> Unit = {
+        AboutScreen(
+            onNavigateBack = { currentScreen = AppScreen.SETTINGS }
+        )
+    }
+
+    val statisticsContent: @Composable () -> Unit = {
+        StatisticsScreen(
+            reviewedCount = preferences.totalReviewedCount.toInt(),
+            totalImages = allImages.size + preferences.totalReviewedCount.toInt(),
+            deletedCount = preferences.totalDeletedCount.toInt(),
+            markedCount = deletedImages.size,
+            onBack = { currentScreen = AppScreen.SETTINGS }
+        )
+    }
+
+    // 根据当前屏幕决定 前景 和 背景
+    val (backgroundContent, foregroundContent) = when (currentScreen) {
+        AppScreen.DECK -> deckContent to null
+        AppScreen.RECYCLE_BIN -> deckContent to recycleBinContent
+        AppScreen.SETTINGS -> deckContent to settingsContent
+        AppScreen.ABOUT -> settingsContent to aboutContent
+        AppScreen.STATISTICS -> settingsContent to statisticsContent
+    }
+    
+    // 渲染容器
+    PredictiveBackContainer(
+        currentScreen = currentScreen,
+        onNavigateBack = {
+            currentScreen = when (currentScreen) {
+                AppScreen.RECYCLE_BIN -> AppScreen.DECK
+                AppScreen.SETTINGS -> AppScreen.DECK
+                AppScreen.ABOUT -> AppScreen.SETTINGS
+                AppScreen.STATISTICS -> AppScreen.SETTINGS
+                AppScreen.DECK -> AppScreen.DECK
+            }
+        },
+        backgroundContent = backgroundContent,
+        foregroundContent = foregroundContent ?: {}
+    )
+}
+
+/**
+ * 权限请求界面 - 黑猫风格
+ */
+@Composable
+private fun PermissionRequestScreen(
+    onRequestPermission: () -> Unit
+) {
+    val isDarkTheme = LocalIsDarkTheme.current
+    val backgroundColor = if (isDarkTheme) TabulaColors.CatBlack else TabulaColors.WarmWhite
+    val textColor = if (isDarkTheme) Color.White else TabulaColors.CatBlack
+    val buttonBgColor = if (isDarkTheme) TabulaColors.EyeGold else TabulaColors.CatBlack
+    val buttonTextColor = if (isDarkTheme) TabulaColors.CatBlack else Color.White
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(backgroundColor),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(32.dp)
+        ) {
+            // Logo
+            Image(
+                painter = painterResource(id = R.drawable.logo),
+                contentDescription = "Tabula Logo",
+                modifier = Modifier.size(150.dp)
+            )
+
+            Spacer(modifier = Modifier.height(32.dp))
+
+            Text(
+                text = "欢迎使用 Tabula",
+                fontSize = 28.sp,
+                fontWeight = FontWeight.Bold,
+                color = textColor
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Text(
+                text = "高效整理你的照片库",
+                fontSize = 16.sp,
+                color = textColor.copy(alpha = 0.6f)
+            )
+
+            Spacer(modifier = Modifier.height(48.dp))
+
+            Button(
+                onClick = onRequestPermission,
+                modifier = Modifier
+                    .size(width = 200.dp, height = 56.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = buttonBgColor,
+                    contentColor = buttonTextColor
+                ),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text(
+                    text = "授权访问照片",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+    }
+}

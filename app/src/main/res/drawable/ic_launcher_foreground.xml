@@ -1,0 +1,33 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 卡片堆叠图标 -->
+    <group android:translateX="24" android:translateY="24">
+        <!-- 底层卡片 -->
+        <path
+            android:fillColor="#80FFFFFF"
+            android:pathData="M8,12 L52,12 Q56,12 56,16 L56,44 Q56,48 52,48 L8,48 Q4,48 4,44 L4,16 Q4,12 8,12 Z"/>
+        <!-- 中层卡片 -->
+        <path
+            android:fillColor="#B3FFFFFF"
+            android:pathData="M10,8 L54,8 Q58,8 58,12 L58,40 Q58,44 54,44 L10,44 Q6,44 6,40 L6,12 Q6,8 10,8 Z"/>
+        <!-- 顶层卡片 -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M12,4 L56,4 Q60,4 60,8 L60,36 Q60,40 56,40 L12,40 Q8,40 8,36 L8,8 Q8,4 12,4 Z"/>
+        <!-- 图片图标 - 背景 -->
+        <path
+            android:fillColor="#1A1A2E"
+            android:pathData="M20,12 L48,12 Q50,12 50,14 L50,30 Q50,32 48,32 L20,32 Q18,32 18,30 L18,14 Q18,12 20,12 Z"/>
+        <!-- 太阳 - 使用 path 代替 circle -->
+        <path
+            android:fillColor="#4A90D9"
+            android:pathData="M26,15 A3,3 0 1,1 26,21 A3,3 0 1,1 26,15 Z"/>
+        <!-- 山景 -->
+        <path
+            android:fillColor="#4A90D9"
+            android:pathData="M18,28 L28,22 L34,26 L42,20 L50,28 L50,30 Q50,32 48,32 L20,32 Q18,32 18,30 Z"/>
+    </group>
+</vector>
