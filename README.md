@@ -95,7 +95,7 @@ Tabula V3 在 V1 的基础上进行了
 我们深知照片是您最私密的数据。
 **Tabula 承诺：**
 1. :no_entry_sign: **不申请互联网权限**。
-2. :eye_off: **不收集任何用户行为数据**。
+2. :🙈: **不收集任何用户行为数据**。
 3. :mobile_phone_off: **所有图片读取、分析与处理均在您的手机本地完成**。
 
 ---
@@ -104,10 +104,10 @@ Tabula V3 在 V1 的基础上进行了
 
 如果您在使用过程中遇到 Bug，或对 Tabula V3 有新的功能建议，欢迎通过以下方式联系：
 
-邮箱：2922147939@qq.com
+📧 邮箱：2922147939@qq.com
 
 🐞 提交 Issues 帮助我们改进。
 
 ---
 
-<p align="center"> Made with :heart: & :cat2: for Android </p>
+<p align="center"> 欢迎你的加入 </p>
