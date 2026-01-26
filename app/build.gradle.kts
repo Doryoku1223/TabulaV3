@@ -13,7 +13,7 @@ android {
         minSdk = 34
         targetSdk = 35
         versionCode = 1
-        versionName = "1.0.0"
+        versionName = "3.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -46,6 +46,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
@@ -54,6 +55,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.exifinterface)
 
     // Compose
     implementation(libs.androidx.activity.compose)

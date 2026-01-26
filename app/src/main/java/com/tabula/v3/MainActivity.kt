@@ -164,6 +164,13 @@ fun TabulaApp(
     // ========== 设置 ==========
     var currentBatchSize by remember { mutableIntStateOf(preferences.batchSize) }
     var currentTopBarMode by remember { mutableStateOf(preferences.topBarDisplayMode) }
+    var showHdrBadges by remember { mutableStateOf(preferences.showHdrBadges) }
+    var showMotionBadges by remember { mutableStateOf(preferences.showMotionBadges) }
+    var playMotionSound by remember { mutableStateOf(preferences.playMotionSound) }
+    var motionSoundVolume by remember { mutableIntStateOf(preferences.motionSoundVolume) }
+    var hapticEnabled by remember { mutableStateOf(preferences.hapticEnabled) }
+    var hapticStrength by remember { mutableIntStateOf(preferences.hapticStrength) }
+    var swipeHapticsEnabled by remember { mutableStateOf(preferences.swipeHapticsEnabled) }
 
     // ========== 路由状态 ==========
     var currentScreen by remember { mutableStateOf(AppScreen.DECK) }
@@ -191,28 +198,74 @@ fun TabulaApp(
     /**
      * 执行删除操作
      */
-    fun performDelete(image: ImageFile) {
+    fun performDelete(image: ImageFile, onResult: (Boolean) -> Unit) {
         scope.launch {
             val result = fileOperationManager.deleteImage(image.uri)
             when (result) {
                 is FileOperationManager.DeleteResult.Success -> {
                     Log.d("TabulaApp", "Deleted: ${image.displayName}")
+                    onResult(true)
                 }
                 is FileOperationManager.DeleteResult.NeedsPermission -> {
                     onRequestDeletePermission(result.intentSender) { granted ->
                         if (granted) {
                             Log.d("TabulaApp", "Delete permission granted for: ${image.displayName}")
+                        } else {
+                            Log.w("TabulaApp", "Delete permission denied for: ${image.displayName}")
                         }
+                        onResult(granted)
                     }
                 }
                 is FileOperationManager.DeleteResult.Error -> {
                     Log.e("TabulaApp", "Delete error: ${result.message}")
+                    onResult(false)
+                }
+            }
+        }
+    }
+    
+    /**
+     * Batch delete
+     */
+    fun performDeleteBatch(images: List<ImageFile>, onResult: (Boolean) -> Unit) {
+        if (images.isEmpty()) {
+            onResult(true)
+            return
+        }
+        
+        scope.launch {
+            val result = fileOperationManager.deleteImages(images.map { it.uri })
+            when (result) {
+                is FileOperationManager.DeleteResult.Success -> {
+                    Log.d("TabulaApp", "Deleted batch: ${images.size}")
+                    onResult(true)
+                }
+                is FileOperationManager.DeleteResult.NeedsPermission -> {
+                    onRequestDeletePermission(result.intentSender) { granted ->
+                        if (granted) {
+                            Log.d("TabulaApp", "Delete permission granted for batch: ${images.size}")
+                        } else {
+                            Log.w("TabulaApp", "Delete permission denied for batch: ${images.size}")
+                        }
+                        onResult(granted)
+                    }
+                }
+                is FileOperationManager.DeleteResult.Error -> {
+                    Log.e("TabulaApp", "Delete error: ${result.message}")
+                    onResult(false)
                 }
             }
         }
     }
 
     // ========== 屏幕内容定义 ==========
+    LaunchedEffect(hapticEnabled, hapticStrength) {
+        com.tabula.v3.ui.util.HapticFeedback.updateSettings(
+            enabled = hapticEnabled,
+            strength = hapticStrength
+        )
+    }
+
     val deckContent: @Composable () -> Unit = {
         DeckScreen(
             allImages = allImages,
@@ -240,7 +293,12 @@ fun TabulaApp(
             },
             onNavigateToSettings = {
                 currentScreen = AppScreen.SETTINGS
-            }
+            },
+            showHdrBadges = showHdrBadges,
+            showMotionBadges = showMotionBadges,
+            playMotionSound = playMotionSound,
+            motionSoundVolume = motionSoundVolume,
+            enableSwipeHaptics = swipeHapticsEnabled
         )
     }
 
@@ -256,24 +314,43 @@ fun TabulaApp(
                 Log.d("TabulaApp", "Restored: ${image.displayName}")
             },
             onPermanentDelete = { image ->
-                deletedImages = deletedImages.toMutableList().apply { remove(image) }
-                scope.launch {
-                    recycleBinManager.removeFromRecycleBin(image)
+                performDelete(image) { success ->
+                    if (success) {
+                        deletedImages = deletedImages.toMutableList().apply { remove(image) }
+                        scope.launch {
+                            recycleBinManager.removeFromRecycleBin(image)
+                        }
+                    }
                 }
-                performDelete(image)
+            },
+            onPermanentDeleteBatch = { images ->
+                performDeleteBatch(images) { success ->
+                    if (success) {
+                        deletedImages = deletedImages.toMutableList().apply { removeAll(images) }
+                        scope.launch {
+                            recycleBinManager.removeAllFromRecycleBin(images)
+                        }
+                    }
+                }
             },
             onClearAll = {
-                deletedImages.forEach { image ->
-                    performDelete(image)
+                val imagesToDelete = deletedImages
+                performDeleteBatch(imagesToDelete) { success ->
+                    if (success) {
+                        scope.launch {
+                            recycleBinManager.clearRecycleBin()
+                        }
+                        deletedImages = emptyList()
+                    }
                 }
-                scope.launch {
-                    recycleBinManager.clearRecycleBin()
-                }
-                deletedImages = emptyList()
             },
             onNavigateBack = {
                 currentScreen = AppScreen.DECK
-            }
+            },
+            showHdrBadges = showHdrBadges,
+            showMotionBadges = showMotionBadges,
+            playMotionSound = playMotionSound,
+            motionSoundVolume = motionSoundVolume
         )
     }
 
@@ -285,6 +362,41 @@ fun TabulaApp(
             onThemeChange = onThemeChange,
             onBatchSizeChange = { size -> currentBatchSize = size },
             onTopBarModeChange = { mode -> currentTopBarMode = mode },
+            showHdrBadges = showHdrBadges,
+            showMotionBadges = showMotionBadges,
+            playMotionSound = playMotionSound,
+            motionSoundVolume = motionSoundVolume,
+            hapticEnabled = hapticEnabled,
+            hapticStrength = hapticStrength,
+            swipeHapticsEnabled = swipeHapticsEnabled,
+            onShowHdrBadgesChange = { enabled ->
+                showHdrBadges = enabled
+                preferences.showHdrBadges = enabled
+            },
+            onShowMotionBadgesChange = { enabled ->
+                showMotionBadges = enabled
+                preferences.showMotionBadges = enabled
+            },
+            onPlayMotionSoundChange = { enabled ->
+                playMotionSound = enabled
+                preferences.playMotionSound = enabled
+            },
+            onMotionSoundVolumeChange = { volume ->
+                motionSoundVolume = volume
+                preferences.motionSoundVolume = volume
+            },
+            onHapticEnabledChange = { enabled ->
+                hapticEnabled = enabled
+                preferences.hapticEnabled = enabled
+            },
+            onHapticStrengthChange = { strength ->
+                hapticStrength = strength
+                preferences.hapticStrength = strength
+            },
+            onSwipeHapticsEnabledChange = { enabled ->
+                swipeHapticsEnabled = enabled
+                preferences.swipeHapticsEnabled = enabled
+            },
             onNavigateToAbout = { currentScreen = AppScreen.ABOUT },
             onNavigateBack = { currentScreen = AppScreen.DECK },
             onNavigateToStatistics = { currentScreen = AppScreen.STATISTICS }

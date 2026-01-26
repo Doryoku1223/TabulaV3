@@ -25,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -32,6 +33,7 @@ import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.data.preferences.TopBarDisplayMode
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.theme.TabulaColors
+import com.tabula.v3.ui.util.HapticFeedback
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -59,6 +61,7 @@ fun TopBar(
     onSettingsClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     val isDarkTheme = LocalIsDarkTheme.current
     val textColor = if (isDarkTheme) Color.White else TabulaColors.CatBlack
     val buttonBgColor = if (isDarkTheme) TabulaColors.CatBlackLight else Color.White
@@ -108,7 +111,10 @@ fun TopBar(
             ActionIconButton(
                 icon = Icons.Outlined.Delete,
                 contentDescription = "回收站",
-                onClick = onTrashClick,
+                onClick = {
+                    HapticFeedback.lightTap(context)
+                    onTrashClick()
+                },
                 backgroundColor = buttonBgColor,
                 iconColor = buttonIconColor
             )
@@ -119,7 +125,10 @@ fun TopBar(
             ActionIconButton(
                 icon = Icons.Outlined.Settings,
                 contentDescription = "设置",
-                onClick = onSettingsClick,
+                onClick = {
+                    HapticFeedback.lightTap(context)
+                    onSettingsClick()
+                },
                 backgroundColor = buttonBgColor,
                 iconColor = buttonIconColor
             )

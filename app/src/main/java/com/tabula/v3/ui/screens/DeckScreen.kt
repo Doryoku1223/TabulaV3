@@ -87,7 +87,12 @@ fun DeckScreen(
     onRemove: (ImageFile) -> Unit,
     onKeep: () -> Unit = {},
     onNavigateToTrash: () -> Unit,
-    onNavigateToSettings: () -> Unit
+    onNavigateToSettings: () -> Unit,
+    showHdrBadges: Boolean = false,
+    showMotionBadges: Boolean = false,
+    playMotionSound: Boolean = true,
+    motionSoundVolume: Int = 100,
+    enableSwipeHaptics: Boolean = true
 ) {
     val context = LocalContext.current
     val isDarkTheme = LocalIsDarkTheme.current
@@ -157,10 +162,15 @@ fun DeckScreen(
                         images = currentBatch,
                         currentIndex = currentIndex,
                         topBarDisplayMode = topBarDisplayMode,
+                        showHdrBadges = showHdrBadges,
+                        showMotionBadges = showMotionBadges,
+                        enableSwipeHaptics = enableSwipeHaptics,
                         onIndexChange = { newIndex ->
                             // 如果向后滑超过最后一张，进入完成页面
                             if (newIndex >= currentBatch.size) {
-                                HapticFeedback.doubleTap(context)
+                                if (enableSwipeHaptics) {
+                                    HapticFeedback.doubleTap(context)
+                                }
                                 deckState = DeckState.COMPLETED
                             } else {
                                 if (newIndex > currentIndex) {
@@ -178,7 +188,9 @@ fun DeckScreen(
                             if (currentIndex >= newBatch.size && newBatch.isNotEmpty()) {
                                 currentIndex = newBatch.lastIndex
                             } else if (newBatch.isEmpty()) {
-                                HapticFeedback.doubleTap(context)
+                                if (enableSwipeHaptics) {
+                                    HapticFeedback.doubleTap(context)
+                                }
                                 deckState = DeckState.COMPLETED
                             }
                         },
@@ -196,7 +208,11 @@ fun DeckScreen(
         viewerState?.let { state ->
             ViewerOverlay(
                 viewerState = state,
-                onDismiss = { viewerState = null }
+                onDismiss = { viewerState = null },
+                showHdr = showHdrBadges,
+                showMotionPhoto = showMotionBadges,
+                playMotionSound = playMotionSound,
+                motionSoundVolume = motionSoundVolume
             )
         }
     }
@@ -210,6 +226,9 @@ private fun DeckContent(
     images: List<ImageFile>,
     currentIndex: Int,
     topBarDisplayMode: TopBarDisplayMode,
+    showHdrBadges: Boolean,
+    showMotionBadges: Boolean,
+    enableSwipeHaptics: Boolean,
     onIndexChange: (Int) -> Unit,
     onRemove: (ImageFile) -> Unit,
     onCardClick: (ImageFile, SourceRect) -> Unit,
@@ -254,6 +273,9 @@ private fun DeckContent(
                     onIndexChange = onIndexChange,
                     onRemove = onRemove,
                     onCardClick = onCardClick,
+                    showHdrBadges = showHdrBadges,
+                    showMotionBadges = showMotionBadges,
+                    enableSwipeHaptics = enableSwipeHaptics,
                     modifier = Modifier.fillMaxSize()
                 )
             }

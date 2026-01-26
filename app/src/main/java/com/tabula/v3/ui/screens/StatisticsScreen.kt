@@ -42,12 +42,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.theme.TabulaColors
+import com.tabula.v3.ui.util.HapticFeedback
 
 /**
  * 综合统计页面
@@ -62,6 +64,7 @@ fun StatisticsScreen(
     markedCount: Int = 13,     // 当前标记
     onBack: () -> Unit
 ) {
+    val context = LocalContext.current
     val isDarkTheme = LocalIsDarkTheme.current
     
     // 配色
@@ -100,7 +103,10 @@ fun StatisticsScreen(
                 .padding(horizontal = 16.dp, vertical = 12.dp)
         ) {
             IconButton(
-                onClick = onBack,
+                onClick = {
+                    HapticFeedback.lightTap(context)
+                    onBack()
+                },
                 modifier = Modifier.align(Alignment.CenterStart)
             ) {
                 Icon(

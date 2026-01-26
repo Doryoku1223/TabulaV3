@@ -105,6 +105,8 @@ class RecycleBinManager(private val context: Context) {
             
             for (i in 0 until jsonArray.length()) {
                 val obj = jsonArray.getJSONObject(i)
+                val bucket = obj.optString("bucketDisplayName", "")
+                val bucketDisplay = bucket.ifBlank { null }
                 val imageFile = ImageFile(
                     id = obj.getLong("id"),
                     uri = Uri.parse(obj.getString("uri")),
@@ -113,7 +115,7 @@ class RecycleBinManager(private val context: Context) {
                     size = obj.getLong("size"),
                     width = obj.getInt("width"),
                     height = obj.getInt("height"),
-                    bucketDisplayName = obj.optString("bucketDisplayName", null)
+                    bucketDisplayName = bucketDisplay
                 )
                 items.add(imageFile)
             }

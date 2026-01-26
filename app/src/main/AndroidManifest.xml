@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- 仅需要读取图片权限，Android 13+ 细粒度权限 -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
@@ -8,10 +7,9 @@
     <!-- 振动权限 -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
-    <!-- 禁止联网 - 移除所有网络权限 -->
-    <uses-permission
-        android:name="android.permission.INTERNET"
-        tools:node="remove" />
+    <!-- Update check & install -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:name=".TabulaApplication"
@@ -23,7 +21,7 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.TabulaV3"
-        tools:targetApi="35">
+    >
 
         <activity
             android:name=".MainActivity"

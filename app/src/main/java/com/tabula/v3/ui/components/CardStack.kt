@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.ui.util.HapticFeedback
+import com.tabula.v3.ui.util.rememberImageFeatures
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 
@@ -47,6 +48,31 @@ private enum class SwipeDirection {
     NONE,
     HORIZONTAL,  // 左右滑 → 洗牌
     UP           // 上滑 → 删除
+}
+
+@Composable
+private fun rememberImageBadges(
+    image: ImageFile?,
+    showHdr: Boolean,
+    showMotion: Boolean
+): List<String> {
+    if (image == null) return emptyList()
+
+    val features = rememberImageFeatures(
+        image = image,
+        enableHdr = showHdr,
+        enableMotion = showMotion
+    )
+
+    val badges = mutableListOf<String>()
+    if (showHdr && features?.isHdr == true) {
+        badges.add("HDR")
+    }
+    if (showMotion && features?.isMotionPhoto == true) {
+        badges.add("Live")
+    }
+
+    return badges
 }
 
 /**
@@ -71,6 +97,9 @@ fun SwipeableCardStack(
     onIndexChange: (Int) -> Unit,
     onRemove: (ImageFile) -> Unit,
     onCardClick: ((ImageFile, SourceRect) -> Unit)? = null,
+    showHdrBadges: Boolean = false,
+    showMotionBadges: Boolean = false,
+    enableSwipeHaptics: Boolean = true,
     modifier: Modifier = Modifier,
     cardAspectRatio: Float = 3f / 4f
 ) {
@@ -107,6 +136,8 @@ fun SwipeableCardStack(
     var lockedDirection by remember { mutableStateOf(SwipeDirection.NONE) }
     var isDragging by remember { mutableStateOf(false) }
     var hasDragged by remember { mutableStateOf(false) }  // 是否发生过拖动
+    var swipeThresholdHapticTriggered by remember { mutableStateOf(false) }
+    var deleteThresholdHapticTriggered by remember { mutableStateOf(false) }
 
     // ========== 背景卡片呼吸感响应 ==========
     var breathScale by remember { mutableFloatStateOf(0f) }
@@ -138,6 +169,8 @@ fun SwipeableCardStack(
         scope.launch { dragScale.animateTo(1f, spring(stiffness = Spring.StiffnessMedium)) }
         lockedDirection = SwipeDirection.NONE
         breathScale = 0f
+        swipeThresholdHapticTriggered = false
+        deleteThresholdHapticTriggered = false
     }
 
     /**
@@ -183,11 +216,13 @@ fun SwipeableCardStack(
      * 
      * 卡片缩小 + 抛物线轨迹飞向右上角回收站图标
      */
-    suspend fun executeDeleteAnimation() {
+    suspend fun executeDeleteAnimation(playHaptic: Boolean) {
         val currentImg = currentImage ?: return
         
         // 触发震动反馈
-        HapticFeedback.heavyTap(context)
+        if (enableSwipeHaptics && playHaptic) {
+            HapticFeedback.heavyTap(context)
+        }
         
         // macOS Genie 效果动画时长
         val animDuration = 400
@@ -272,7 +307,8 @@ fun SwipeableCardStack(
                             rotationZ = -8f
                         },
                     cornerRadius = 16.dp,
-                    elevation = 4.dp
+                    elevation = 4.dp,
+                    badges = rememberImageBadges(prevImage, showHdrBadges, showMotionBadges)
                 )
             }
         } else {
@@ -310,7 +346,8 @@ fun SwipeableCardStack(
                             rotationZ = 8f
                         },
                     cornerRadius = 16.dp,
-                    elevation = 6.dp
+                    elevation = 6.dp,
+                    badges = rememberImageBadges(nextImage, showHdrBadges, showMotionBadges)
                 )
             }
         } else {
@@ -377,6 +414,8 @@ fun SwipeableCardStack(
                                     isDragging = true
                                     hasDragged = false
                                     velocityTracker.resetTracking()
+                                    swipeThresholdHapticTriggered = false
+                                    deleteThresholdHapticTriggered = false
                                 },
                                 onDrag = { change, dragAmount ->
                                     change.consume()
@@ -400,10 +439,25 @@ fun SwipeableCardStack(
                                                 val newY = (dragOffsetY.value + dragAmount.y).coerceAtMost(0f)
                                                 dragOffsetY.snapTo(newY)
                                                 dragOffsetX.snapTo(dragOffsetX.value + dragAmount.x * 0.3f)
+                                                if (enableSwipeHaptics &&
+                                                    !deleteThresholdHapticTriggered &&
+                                                    -newY > deleteThresholdPx
+                                                ) {
+                                                    deleteThresholdHapticTriggered = true
+                                                    HapticFeedback.heavyTap(context)
+                                                }
                                             }
                                             SwipeDirection.HORIZONTAL -> {
-                                                dragOffsetX.snapTo(dragOffsetX.value + dragAmount.x)
+                                                val newX = dragOffsetX.value + dragAmount.x
+                                                dragOffsetX.snapTo(newX)
                                                 dragOffsetY.snapTo(dragOffsetY.value + dragAmount.y * 0.2f)
+                                                if (enableSwipeHaptics &&
+                                                    !swipeThresholdHapticTriggered &&
+                                                    abs(newX) > swipeThresholdPx
+                                                ) {
+                                                    swipeThresholdHapticTriggered = true
+                                                    HapticFeedback.mediumTap(context)
+                                                }
                                             }
                                             else -> {
                                                 dragOffsetX.snapTo(dragOffsetX.value + dragAmount.x)
@@ -427,7 +481,7 @@ fun SwipeableCardStack(
                                                 if (abs(dragOffsetY.value) > deleteThresholdPx ||
                                                     abs(velocity.y) > velocityThreshold
                                                 ) {
-                                                    executeDeleteAnimation()
+                                                    executeDeleteAnimation(playHaptic = !deleteThresholdHapticTriggered)
                                                 } else {
                                                     resetDragState()
                                                 }
@@ -444,6 +498,9 @@ fun SwipeableCardStack(
                                                     // 向前滑(direction > 0)始终允许，即使超出边界（进入完成页）
                                                     // 向后滑(direction < 0)需要有上一张
                                                     if (direction > 0 || (direction < 0 && hasPrev)) {
+                                                        if (enableSwipeHaptics && !swipeThresholdHapticTriggered) {
+                                                            HapticFeedback.mediumTap(context)
+                                                        }
                                                         executeShuffleAnimation(direction)
                                                     } else {
                                                         resetDragState()
@@ -468,9 +525,11 @@ fun SwipeableCardStack(
                             )
                         },
                     cornerRadius = 16.dp,
-                    elevation = 8.dp
+                    elevation = 8.dp,
+                    badges = rememberImageBadges(currentImage, showHdrBadges, showMotionBadges)
                 )
             }
         }
     }
 }
+

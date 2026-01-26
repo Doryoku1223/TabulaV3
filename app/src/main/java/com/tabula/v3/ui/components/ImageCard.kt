@@ -3,6 +3,7 @@ package com.tabula.v3.ui.components
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -34,7 +35,8 @@ fun ImageCard(
     imageFile: ImageFile,
     modifier: Modifier = Modifier,
     cornerRadius: Dp = 16.dp,
-    elevation: Dp = 8.dp
+    elevation: Dp = 8.dp,
+    badges: List<String> = emptyList()
 ) {
     val context = LocalContext.current
     val imageLoader = CoilSetup.getImageLoader(context)
@@ -63,6 +65,13 @@ fun ImageCard(
             imageLoader = imageLoader,
             contentScale = ContentScale.Crop,  // 裁剪填充
             modifier = Modifier.fillMaxSize()
+        )
+
+        MediaBadgeRow(
+            badges = badges,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(8.dp)
         )
     }
 }

@@ -1,5 +1,6 @@
 package com.tabula.v3.ui.screens
 
+import android.content.pm.ActivityInfo
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateDpAsState
@@ -12,9 +13,11 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -56,6 +59,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -67,8 +71,13 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -79,9 +88,14 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.di.CoilSetup
+import com.tabula.v3.ui.components.MediaBadgeRow
+import com.tabula.v3.ui.components.MotionPhotoPlayer
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.theme.TabulaColors
 import com.tabula.v3.ui.util.HapticFeedback
+import com.tabula.v3.ui.util.findActivity
+import com.tabula.v3.ui.util.rememberImageFeatures
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -93,8 +107,13 @@ fun RecycleBinScreen(
     deletedImages: List<ImageFile>,
     onRestore: (ImageFile) -> Unit,
     onPermanentDelete: (ImageFile) -> Unit,
+    onPermanentDeleteBatch: (List<ImageFile>) -> Unit,
     onClearAll: () -> Unit,
-    onNavigateBack: () -> Unit
+    onNavigateBack: () -> Unit,
+    showHdrBadges: Boolean = false,
+    showMotionBadges: Boolean = false,
+    playMotionSound: Boolean = true,
+    motionSoundVolume: Int = 100
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -158,8 +177,11 @@ fun RecycleBinScreen(
                         selectedImages = emptySet()
                     },
                     onDeleteSelected = {
-                        selectedImages.forEach { id ->
-                            deletedImages.find { it.id == id }?.let { onPermanentDelete(it) }
+                        val imagesToDelete = selectedImages.mapNotNull { id ->
+                            deletedImages.find { it.id == id }
+                        }
+                        if (imagesToDelete.isNotEmpty()) {
+                            onPermanentDeleteBatch(imagesToDelete)
                         }
                         isSelectionMode = false
                         selectedImages = emptySet()
@@ -201,6 +223,7 @@ fun RecycleBinScreen(
                             imageLoader = imageLoader,
                             isSelected = isSelected,
                             isSelectionMode = isSelectionMode,
+                            badges = rememberImageBadges(image, showHdrBadges, showMotionBadges),
                             onClick = {
                                 if (isSelectionMode) {
                                     // 在多选模式下切换选中
@@ -251,7 +274,11 @@ fun RecycleBinScreen(
                     onDelete = { image ->
                         // 触发删除确认
                         imageToDelete = image
-                    }
+                    },
+                    showHdr = showHdrBadges,
+                    showMotionPhoto = showMotionBadges,
+                    playMotionSound = playMotionSound,
+                    motionSoundVolume = motionSoundVolume
                 )
             }
         }
@@ -412,6 +439,7 @@ private fun RecycleBinItem(
     imageLoader: coil.ImageLoader,
     isSelected: Boolean,
     isSelectionMode: Boolean,
+    badges: List<String>,
     onClick: () -> Unit,
     onLongClick: () -> Unit
 ) {
@@ -467,6 +495,13 @@ private fun RecycleBinItem(
                     .aspectRatio(aspectRatio)
             )
             
+            MediaBadgeRow(
+                badges = badges,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(6.dp)
+            )
+
             // 选中时的覆盖蒙版 (轻微黑透)
             if (isSelected) {
                 Box(
@@ -535,18 +570,138 @@ private fun FullScreenViewer(
     initialIndex: Int,
     onDismiss: () -> Unit,
     onRestore: (ImageFile) -> Unit,
-    onDelete: (ImageFile) -> Unit
+    onDelete: (ImageFile) -> Unit,
+    showHdr: Boolean,
+    showMotionPhoto: Boolean,
+    playMotionSound: Boolean,
+    motionSoundVolume: Int
 ) {
     val context = LocalContext.current
     val imageLoader = CoilSetup.getImageLoader(context)
     val isDarkTheme = LocalIsDarkTheme.current
+
+    var zoomScale by remember { mutableFloatStateOf(1f) }
+    var zoomOffset by remember { mutableStateOf(Offset.Zero) }
+    var zoomSize by remember { mutableStateOf(Size.Zero) }
+    val minScale = 1f
+    val maxScale = 8f
+    val doubleTapScale = 3f
+
+    fun clampOffset(
+        offset: Offset,
+        scale: Float,
+        size: Size
+    ): Offset {
+        if (size.width <= 0f || size.height <= 0f) return Offset.Zero
+        val maxOffsetX = ((size.width * scale) - size.width).coerceAtLeast(0f) / 2f
+        val maxOffsetY = ((size.height * scale) - size.height).coerceAtLeast(0f) / 2f
+        return Offset(
+            x = offset.x.coerceIn(-maxOffsetX, maxOffsetX),
+            y = offset.y.coerceIn(-maxOffsetY, maxOffsetY)
+        )
+    }
+
+    fun applyScaleAndOffset(newScale: Float, newOffset: Offset, size: Size) {
+        val clampedScale = newScale.coerceIn(minScale, maxScale)
+        if (size.width <= 0f || size.height <= 0f) {
+            zoomScale = clampedScale
+            zoomOffset = Offset.Zero
+            return
+        }
+        if (clampedScale <= minScale) {
+            zoomScale = minScale
+            zoomOffset = Offset.Zero
+            return
+        }
+        zoomScale = clampedScale
+        zoomOffset = clampOffset(newOffset, clampedScale, size)
+    }
     
     val pagerState = rememberPagerState(
         initialPage = initialIndex.coerceIn(0, images.lastIndex.coerceAtLeast(0)),
         pageCount = { images.size }
     )
+
+    LaunchedEffect(pagerState.currentPage) {
+        zoomScale = minScale
+        zoomOffset = Offset.Zero
+        zoomSize = Size.Zero
+    }
+
+    LaunchedEffect(zoomSize, zoomScale) {
+        if (zoomSize.width <= 0f || zoomSize.height <= 0f) return@LaunchedEffect
+        if (zoomScale <= minScale) {
+            zoomOffset = Offset.Zero
+        } else {
+            zoomOffset = clampOffset(zoomOffset, zoomScale, zoomSize)
+        }
+    }
     
     val currentImage = images.getOrNull(pagerState.currentPage)
+    val currentFeatures = currentImage?.let { image ->
+        rememberImageFeatures(
+            image = image,
+            enableHdr = showHdr,
+            enableMotion = showMotionPhoto
+        )
+    }
+    val isHdr = showHdr && (currentFeatures?.isHdr == true)
+    val currentMotionInfo = if (showMotionPhoto) currentFeatures?.motionPhotoInfo else null
+    var isHdrComparePressed by remember { mutableStateOf(false) }
+    var isLivePressed by remember { mutableStateOf(false) }
+    var isPressing by remember { mutableStateOf(false) }
+    val pressDelayMs = 80L
+
+    LaunchedEffect(isPressing, isHdr, currentMotionInfo, pagerState.currentPage) {
+        if (!isPressing) {
+            isHdrComparePressed = false
+            isLivePressed = false
+            return@LaunchedEffect
+        }
+        delay(pressDelayMs)
+        if (isPressing) {
+            if (isHdr) {
+                isHdrComparePressed = true
+            }
+            if (currentMotionInfo != null) {
+                isLivePressed = true
+            }
+        }
+    }
+
+    LaunchedEffect(pagerState.currentPage) {
+        isHdrComparePressed = false
+        isLivePressed = false
+        isPressing = false
+    }
+
+    val activity = context.findActivity()
+    val window = activity?.window
+    val originalColorMode = remember(window) { window?.colorMode ?: ActivityInfo.COLOR_MODE_DEFAULT }
+    val desiredColorMode = when {
+        isHdr && !isHdrComparePressed -> ActivityInfo.COLOR_MODE_HDR
+        isHdr && isHdrComparePressed -> ActivityInfo.COLOR_MODE_DEFAULT
+        else -> originalColorMode
+    }
+
+    LaunchedEffect(desiredColorMode, window) {
+        if (window != null) {
+            window.colorMode = desiredColorMode
+        }
+    }
+
+    androidx.compose.runtime.DisposableEffect(window) {
+        onDispose {
+            if (window != null) {
+                window.colorMode = originalColorMode
+            }
+        }
+    }
+
+
+
+
+
 
     Box(
         modifier = Modifier
@@ -556,26 +711,127 @@ private fun FullScreenViewer(
         // 图片翻页器
         HorizontalPager(
             state = pagerState,
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier.fillMaxSize(),
+            userScrollEnabled = zoomScale <= minScale
         ) { page ->
             val image = images.getOrNull(page)
             if (image != null) {
-                AsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(image.uri)
-                        .crossfade(200)
-                        .build(),
-                    contentDescription = image.displayName,
-                    imageLoader = imageLoader,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .pointerInput(Unit) {
-                            // 点击关闭
-                            detectHorizontalDragGestures { _, _ -> }
-                        }
+                val features = rememberImageFeatures(
+                    image = image,
+                    enableHdr = showHdr,
+                    enableMotion = showMotionPhoto
                 )
+                val motionInfo = if (showMotionPhoto) features?.motionPhotoInfo else null
+                val isCurrentPage = page == pagerState.currentPage
+
+                BoxWithConstraints(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    val aspectRatio = if (image.height > 0) {
+                        image.width.toFloat() / image.height
+                    } else {
+                        1f
+                    }
+                    val containerRatio = maxWidth.value / maxHeight.value
+                    val (targetWidth, targetHeight) = if (aspectRatio > containerRatio) {
+                        maxWidth to (maxWidth / aspectRatio)
+                    } else {
+                        (maxHeight * aspectRatio) to maxHeight
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .size(targetWidth, targetHeight)
+                            .onSizeChanged { size ->
+                                if (isCurrentPage) {
+                                    zoomSize = Size(size.width.toFloat(), size.height.toFloat())
+                                }
+                            }
+                            .graphicsLayer {
+                                val scale = if (isCurrentPage) zoomScale else 1f
+                                val offset = if (isCurrentPage) zoomOffset else Offset.Zero
+                                scaleX = scale
+                                scaleY = scale
+                                translationX = offset.x
+                                translationY = offset.y
+                                transformOrigin = TransformOrigin(0.5f, 0.5f)
+                            }
+                            .pointerInput(isCurrentPage) {
+                                if (!isCurrentPage) return@pointerInput
+                                detectTransformGestures { centroid, pan, zoom, _ ->
+                                    val oldScale = zoomScale
+                                    val newScale = (zoomScale * zoom).coerceIn(minScale, maxScale)
+                                    if (zoomSize.width <= 0f || zoomSize.height <= 0f) {
+                                        zoomScale = newScale
+                                        zoomOffset = Offset.Zero
+                                        return@detectTransformGestures
+                                    }
+                                    val center = Offset(zoomSize.width / 2f, zoomSize.height / 2f)
+                                    val scaleChange = if (oldScale == 0f) 1f else newScale / oldScale
+                                    val panMultiplier = oldScale.coerceIn(1f, 3f)
+                                    val adjustedPan = Offset(pan.x * panMultiplier, pan.y * panMultiplier)
+                                    val newOffset = (zoomOffset + adjustedPan) + (centroid - center) * (1 - scaleChange)
+                                    applyScaleAndOffset(newScale, newOffset, zoomSize)
+                                }
+                            }
+                            .pointerInput(isCurrentPage) {
+                                detectTapGestures(
+                                    onPress = {
+                                        if (!isCurrentPage) {
+                                            return@detectTapGestures
+                                        }
+                                        isPressing = true
+                                        tryAwaitRelease()
+                                        isPressing = false
+                                    },
+                                    onDoubleTap = { tapOffset ->
+                                        if (!isCurrentPage) {
+                                            return@detectTapGestures
+                                        }
+                                        val targetScale = if (zoomScale > 1.2f) minScale else doubleTapScale
+                                        if (zoomSize.width <= 0f || zoomSize.height <= 0f) {
+                                            zoomScale = targetScale
+                                            zoomOffset = Offset.Zero
+                                            return@detectTapGestures
+                                        }
+                                        val center = Offset(zoomSize.width / 2f, zoomSize.height / 2f)
+                                        val scaleChange = if (zoomScale == 0f) 1f else targetScale / zoomScale
+                                        val newOffset = if (targetScale <= minScale) {
+                                            Offset.Zero
+                                        } else {
+                                            (zoomOffset + (tapOffset - center) * (1 - scaleChange))
+                                        }
+                                        applyScaleAndOffset(targetScale, newOffset, zoomSize)
+                                    }
+                                )
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        AsyncImage(
+                            model = ImageRequest.Builder(context)
+                                .data(image.uri)
+                                .crossfade(200)
+                                .build(),
+                            contentDescription = image.displayName,
+                            imageLoader = imageLoader,
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier.fillMaxSize()
+                        )
+
+                        if (motionInfo != null && page == pagerState.currentPage) {
+                        MotionPhotoPlayer(
+                            imageUri = image.uri,
+                            motionInfo = motionInfo,
+                            modifier = Modifier.fillMaxSize(),
+                            playWhen = isLivePressed && isCurrentPage,
+                            playAudio = playMotionSound,
+                            volumePercent = motionSoundVolume
+                        )
+                    }
+                }
             }
+        }
         }
 
         // 顶部渐变遮罩 + 关闭按钮 + 页码
@@ -847,4 +1103,27 @@ private fun EmptyRecycleBin(
             )
         }
     }
+}
+
+@Composable
+private fun rememberImageBadges(
+    image: ImageFile,
+    showHdr: Boolean,
+    showMotion: Boolean
+): List<String> {
+    val features = rememberImageFeatures(
+        image = image,
+        enableHdr = showHdr,
+        enableMotion = showMotion
+    )
+
+    val badges = mutableListOf<String>()
+    if (showHdr && features?.isHdr == true) {
+        badges.add("HDR")
+    }
+    if (showMotion && features?.isMotionPhoto == true) {
+        badges.add("Live")
+    }
+
+    return badges
 }

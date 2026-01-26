@@ -1,4 +1,4 @@
-<p align="center">
+﻿<p align="center">
   <img src="app\src\main\res\mipmap-xxxhdpi\ic_launcher.webp" width="120" alt="Tabula Logo">
 </p>
 
@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Platform-Android-green?style=flat-square" alt="Platform">
-  <img src="https://img.shields.io/badge/Version-3.0.1-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Version-3.1.0-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/API-34%2B-orange?style=flat-square" alt="Min SDK">
 </p>
 
@@ -21,7 +21,7 @@
 
 <div align="center">
 
-### :inbox_tray: [点击下载最新 APK (Download V3 .apk)](https://github.com/Doryoku1223/TabulaV3/releases/download/V3/TabulaV3.0.1.apk)
+### :inbox_tray: [点击下载最新 APK (Download V3 .apk)](https://github.com/Doryoku1223/TabulaV3/releases/download/V3/TabulaV3.1.0.apk)
 
 </div>
 
@@ -41,7 +41,30 @@ Tabula V3 在 V1 的基础上进行了
 
 ---
 
-## :iphone: 应用预览 (Showcase)
+
+
+---
+
+
+---
+
+## :memo: v3.1.0 更新说明 (Changelog)
+
+* **回收站 Live 查看优化**: 全屏查看保持原始比例, Live 视频不再被拉伸.
+* **预测返回体验优化**: 取消手势会完整复位, 不再留缝; 侧滑开始时增加轻触反馈.
+* **振动与声音二级设置**: 新增「振动与声音」页面, 支持 Live 音量(0~100), 全局振动开关与强度调节, 滑动卡片振动开关.
+* **Live 声音联动播放**: Live 播放时可按设置决定是否有声音, 并跟随音量滑块.
+* **交互反馈补全**: 设置/回收站按钮点击增加振动反馈.
+* **版本信息更新**: 版本号升级为 v3.1.0, 并在关于页新增版本日期 2026.1.26.
+* **检查更新**: 关于页新增检查更新按钮，检测 GitHub Release 并后台下载完成后提示安装。
+* **振动反馈增强**: 增强全局振动强度与时长，调节时有实时反馈。
+* **滑动阈值反馈**: 卡片滑动越过阈值时即刻震动提示，体感更清晰。
+* **查看器缩放与拖动修复**: 双指缩放按手势位置放大，放大后可拖动浏览其他区域。
+* **查看器缩放流畅度提升**: 优化双指缩放与拖动的手势处理，提升流畅度并放大倍率上限。
+* **回收站查看可缩放**: 回收站全屏查看支持双指缩放与拖动。
+* **检查更新流程完善**: 关于页新增检查更新弹窗、后台下载与安装提示，并补全异常提示。
+
+## :应用预览 (Showcase)
 
 > *"在整理相册的过程中，不仅是释放空间，更是与回忆的一次次重逢。"*
 

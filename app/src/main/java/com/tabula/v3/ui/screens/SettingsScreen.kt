@@ -1,12 +1,14 @@
 package com.tabula.v3.ui.screens
 
-import androidx.compose.animation.AnimatedVisibility
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -33,9 +35,11 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Numbers
 import androidx.compose.material.icons.outlined.TextFormat
-import androidx.compose.material3.CardDefaults
+import androidx.compose.material.icons.outlined.VolumeUp
+import androidx.compose.material.icons.outlined.Vibration
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -53,9 +57,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -68,6 +79,7 @@ import com.tabula.v3.data.preferences.TopBarDisplayMode
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.theme.TabulaColors
 import com.tabula.v3.ui.util.HapticFeedback
+import kotlin.math.roundToInt
 
 /**
  * 设置屏幕 - 极简主义设计风格
@@ -81,6 +93,20 @@ fun SettingsScreen(
     onThemeChange: (ThemeMode) -> Unit,
     onBatchSizeChange: (Int) -> Unit,
     onTopBarModeChange: (TopBarDisplayMode) -> Unit,
+    showHdrBadges: Boolean,
+    showMotionBadges: Boolean,
+    playMotionSound: Boolean,
+    motionSoundVolume: Int,
+    hapticEnabled: Boolean,
+    hapticStrength: Int,
+    swipeHapticsEnabled: Boolean,
+    onShowHdrBadgesChange: (Boolean) -> Unit,
+    onShowMotionBadgesChange: (Boolean) -> Unit,
+    onPlayMotionSoundChange: (Boolean) -> Unit,
+    onMotionSoundVolumeChange: (Int) -> Unit,
+    onHapticEnabledChange: (Boolean) -> Unit,
+    onHapticStrengthChange: (Int) -> Unit,
+    onSwipeHapticsEnabledChange: (Boolean) -> Unit,
     onNavigateToAbout: () -> Unit,
     onNavigateBack: () -> Unit,
     onNavigateToStatistics: () -> Unit = {} // 新增回调，暂给默认值避免报错
@@ -102,58 +128,118 @@ fun SettingsScreen(
     var showDeleteConfirm by remember { mutableStateOf(preferences.showDeleteConfirm) }
     var currentBatchSize by remember { mutableIntStateOf(preferences.batchSize) }
     var currentTopBarMode by remember { mutableStateOf(preferences.topBarDisplayMode) }
+    var currentShowHdrBadges by remember { mutableStateOf(showHdrBadges) }
+    var currentShowMotionBadges by remember { mutableStateOf(showMotionBadges) }
+    var currentPlayMotionSound by remember { mutableStateOf(playMotionSound) }
+    var currentMotionSoundVolume by remember { mutableIntStateOf(motionSoundVolume) }
+    var currentHapticEnabled by remember { mutableStateOf(hapticEnabled) }
+    var currentHapticStrength by remember { mutableIntStateOf(hapticStrength) }
+    var currentSwipeHapticsEnabled by remember { mutableStateOf(swipeHapticsEnabled) }
 
     // 底栏状态
     var showThemeSheet by remember { mutableStateOf(false) }
     var showBatchSizeSheet by remember { mutableStateOf(false) }
     var showTopBarModeSheet by remember { mutableStateOf(false) }
+    var showVibrationSoundPage by remember { mutableStateOf(false) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(backgroundColor)
-            .statusBarsPadding()
-            .navigationBarsPadding()
-    ) {
-        // ========== 顶部大标题栏 ==========
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 12.dp)
-        ) {
-            // 返回按钮
-            IconButton(
-                onClick = onNavigateBack,
-                modifier = Modifier.align(Alignment.CenterStart)
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = "返回",
-                    tint = textColor,
-                    modifier = Modifier.size(24.dp)
+    BackHandler(enabled = showVibrationSoundPage) {
+        HapticFeedback.lightTap(context)
+        showVibrationSoundPage = false
+    }
+
+    if (showVibrationSoundPage) {
+        VibrationSoundScreen(
+            backgroundColor = backgroundColor,
+            cardColor = cardColor,
+            textColor = textColor,
+            secondaryTextColor = secondaryTextColor,
+            accentColor = accentColor,
+            showMotionBadges = currentShowMotionBadges,
+            playMotionSound = currentPlayMotionSound,
+            motionSoundVolume = currentMotionSoundVolume,
+            hapticEnabled = currentHapticEnabled,
+            hapticStrength = currentHapticStrength,
+            swipeHapticsEnabled = currentSwipeHapticsEnabled,
+            onPlayMotionSoundChange = {
+                HapticFeedback.lightTap(context)
+                currentPlayMotionSound = it
+                onPlayMotionSoundChange(it)
+            },
+            onMotionSoundVolumeChange = {
+                currentMotionSoundVolume = it
+                onMotionSoundVolumeChange(it)
+            },
+            onHapticEnabledChange = {
+                HapticFeedback.lightTap(context)
+                currentHapticEnabled = it
+                HapticFeedback.updateSettings(
+                    enabled = it,
+                    strength = currentHapticStrength
                 )
-            }
-            
-            // 标题
-            Text(
-                text = "设置",
-                style = MaterialTheme.typography.titleLarge.copy(
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 20.sp
-                ),
-                color = textColor,
-                modifier = Modifier.align(Alignment.Center)
-            )
-        }
-
-        // ========== 内容滚动区 ==========
+                onHapticEnabledChange(it)
+            },
+            onHapticStrengthChange = {
+                currentHapticStrength = it
+                HapticFeedback.updateSettings(
+                    enabled = currentHapticEnabled,
+                    strength = it
+                )
+                onHapticStrengthChange(it)
+            },
+            onSwipeHapticsEnabledChange = {
+                HapticFeedback.lightTap(context)
+                currentSwipeHapticsEnabled = it
+                onSwipeHapticsEnabledChange(it)
+            },
+            onNavigateBack = { showVibrationSoundPage = false }
+        )
+    } else {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp)
+                .background(backgroundColor)
+                .statusBarsPadding()
+                .navigationBarsPadding()
         ) {
-            Spacer(modifier = Modifier.height(12.dp))
+            // ========== 顶部大标题栏 ==========
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp)
+            ) {
+                // 返回按钮
+                IconButton(
+                    onClick = onNavigateBack,
+                    modifier = Modifier.align(Alignment.CenterStart)
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
+                        contentDescription = "返回",
+                        tint = textColor,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+                
+                // 标题
+                Text(
+                    text = "设置",
+                    style = MaterialTheme.typography.titleLarge.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 20.sp
+                    ),
+                    color = textColor,
+                    modifier = Modifier.align(Alignment.Center)
+                )
+            }
+
+            // ========== 内容滚动区 ==========
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp)
+            ) {
+                Spacer(modifier = Modifier.height(12.dp))
 
             // ========== 外观 ==========
             SectionHeader("外观", textColor)
@@ -226,6 +312,50 @@ fun SettingsScreen(
                         HapticFeedback.lightTap(context)
                         showDeleteConfirm = it
                         preferences.showDeleteConfirm = it
+                    }
+                )
+                Divider(isDarkTheme)
+
+                SettingsSwitchItem(
+                    icon = Icons.Outlined.Image,
+                    iconTint = Color(0xFF0A84FF), // Blue
+                    title = "显示 HDR 标识",
+                    textColor = textColor,
+                    checked = currentShowHdrBadges,
+                    onCheckedChange = {
+                        HapticFeedback.lightTap(context)
+                        currentShowHdrBadges = it
+                        onShowHdrBadgesChange(it)
+                    }
+                )
+
+                Divider(isDarkTheme)
+
+                SettingsSwitchItem(
+                    icon = Icons.Outlined.Movie,
+                    iconTint = Color(0xFF30D158), // Green
+                    title = "显示 Live 照片",
+                    textColor = textColor,
+                    checked = currentShowMotionBadges,
+                    onCheckedChange = {
+                        HapticFeedback.lightTap(context)
+                        currentShowMotionBadges = it
+                        onShowMotionBadgesChange(it)
+                    }
+                )
+
+                Divider(isDarkTheme)
+
+                SettingsItem(
+                    icon = Icons.Outlined.VolumeUp,
+                    iconTint = Color(0xFF64D2FF), // Light Blue
+                    title = "振动与声音",
+                    value = "",
+                    textColor = textColor,
+                    secondaryTextColor = secondaryTextColor,
+                    onClick = {
+                        HapticFeedback.lightTap(context)
+                        showVibrationSoundPage = true
                     }
                 )
             }
@@ -301,7 +431,7 @@ fun SettingsScreen(
                     icon = Icons.Outlined.Info,
                     iconTint = accentColor,
                     title = "关于 Tabula",
-                    value = "v3.0.1",
+                    value = "v3.1.0",
                     textColor = textColor,
                     secondaryTextColor = secondaryTextColor,
                     onClick = {
@@ -339,81 +469,227 @@ fun SettingsScreen(
         }
     }
 
-    // ========== 各种底栏 (Modals) ==========
-    
-    // 主题选择
-    if (showThemeSheet) {
-        CustomBottomSheet(
-            title = "选择主题",
-            onDismiss = { showThemeSheet = false },
-            containerColor = cardColor,
-            textColor = textColor
-        ) {
-            OptionItem("跟随系统", currentTheme == ThemeMode.SYSTEM, accentColor, textColor) {
-                val mode = ThemeMode.SYSTEM
-                currentTheme = mode
-                preferences.themeMode = mode
-                onThemeChange(mode)
-                showThemeSheet = false
-            }
-            OptionItem("浅色模式", currentTheme == ThemeMode.LIGHT, accentColor, textColor) {
-                val mode = ThemeMode.LIGHT
-                currentTheme = mode
-                preferences.themeMode = mode
-                onThemeChange(mode)
-                showThemeSheet = false
-            }
-            OptionItem("深色模式", currentTheme == ThemeMode.DARK, accentColor, textColor) {
-                val mode = ThemeMode.DARK
-                currentTheme = mode
-                preferences.themeMode = mode
-                onThemeChange(mode)
-                showThemeSheet = false
-            }
-        }
     }
 
-    // 每组数量选择
-    if (showBatchSizeSheet) {
-        CustomBottomSheet(
-            title = "每组显示数量",
-            onDismiss = { showBatchSizeSheet = false },
-            containerColor = cardColor,
-            textColor = textColor
-        ) {
-            listOf(5, 10, 15, 20, 30).forEach { size ->
-                OptionItem("$size 张", currentBatchSize == size, accentColor, textColor) {
-                    currentBatchSize = size
-                    preferences.batchSize = size
-                    onBatchSizeChange(size)
-                    showBatchSizeSheet = false
+    if (!showVibrationSoundPage) {
+        // ========== 各种底栏 (Modals) ==========
+        
+        // 主题选择
+        if (showThemeSheet) {
+            CustomBottomSheet(
+                title = "选择主题",
+                onDismiss = { showThemeSheet = false },
+                containerColor = cardColor,
+                textColor = textColor
+            ) {
+                OptionItem("跟随系统", currentTheme == ThemeMode.SYSTEM, accentColor, textColor) {
+                    val mode = ThemeMode.SYSTEM
+                    currentTheme = mode
+                    preferences.themeMode = mode
+                    onThemeChange(mode)
+                    showThemeSheet = false
+                }
+                OptionItem("浅色模式", currentTheme == ThemeMode.LIGHT, accentColor, textColor) {
+                    val mode = ThemeMode.LIGHT
+                    currentTheme = mode
+                    preferences.themeMode = mode
+                    onThemeChange(mode)
+                    showThemeSheet = false
+                }
+                OptionItem("深色模式", currentTheme == ThemeMode.DARK, accentColor, textColor) {
+                    val mode = ThemeMode.DARK
+                    currentTheme = mode
+                    preferences.themeMode = mode
+                    onThemeChange(mode)
+                    showThemeSheet = false
+                }
+            }
+        }
+
+        // 每组数量选择
+        if (showBatchSizeSheet) {
+            CustomBottomSheet(
+                title = "每组显示数量",
+                onDismiss = { showBatchSizeSheet = false },
+                containerColor = cardColor,
+                textColor = textColor
+            ) {
+                listOf(5, 10, 15, 20, 30).forEach { size ->
+                    OptionItem("$size 张", currentBatchSize == size, accentColor, textColor) {
+                        currentBatchSize = size
+                        preferences.batchSize = size
+                        onBatchSizeChange(size)
+                        showBatchSizeSheet = false
+                    }
+                }
+            }
+        }
+
+        // 顶部显示模式选择
+        if (showTopBarModeSheet) {
+            CustomBottomSheet(
+                title = "顶部显示模式",
+                onDismiss = { showTopBarModeSheet = false },
+                containerColor = cardColor,
+                textColor = textColor
+            ) {
+                OptionItem("索引 (1/15)", currentTopBarMode == TopBarDisplayMode.INDEX, accentColor, textColor) {
+                    val mode = TopBarDisplayMode.INDEX
+                    currentTopBarMode = mode
+                    preferences.topBarDisplayMode = mode
+                    onTopBarModeChange(mode)
+                    showTopBarModeSheet = false
+                }
+                OptionItem("日期 (Jan 2026)", currentTopBarMode == TopBarDisplayMode.DATE, accentColor, textColor) {
+                    val mode = TopBarDisplayMode.DATE
+                    currentTopBarMode = mode
+                    preferences.topBarDisplayMode = mode
+                    onTopBarModeChange(mode)
+                    showTopBarModeSheet = false
                 }
             }
         }
     }
+}
 
-    // 顶部显示模式选择
-    if (showTopBarModeSheet) {
-        CustomBottomSheet(
-            title = "顶部显示模式",
-            onDismiss = { showTopBarModeSheet = false },
-            containerColor = cardColor,
-            textColor = textColor
+@Composable
+private fun VibrationSoundScreen(
+    backgroundColor: Color,
+    cardColor: Color,
+    textColor: Color,
+    secondaryTextColor: Color,
+    accentColor: Color,
+    showMotionBadges: Boolean,
+    playMotionSound: Boolean,
+    motionSoundVolume: Int,
+    hapticEnabled: Boolean,
+    hapticStrength: Int,
+    swipeHapticsEnabled: Boolean,
+    onPlayMotionSoundChange: (Boolean) -> Unit,
+    onMotionSoundVolumeChange: (Int) -> Unit,
+    onHapticEnabledChange: (Boolean) -> Unit,
+    onHapticStrengthChange: (Int) -> Unit,
+    onSwipeHapticsEnabledChange: (Boolean) -> Unit,
+    onNavigateBack: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(backgroundColor)
+            .statusBarsPadding()
+            .navigationBarsPadding()
+    ) {
+        val context = LocalContext.current
+        // 顶部栏
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp)
         ) {
-            OptionItem("索引 (1/15)", currentTopBarMode == TopBarDisplayMode.INDEX, accentColor, textColor) {
-                val mode = TopBarDisplayMode.INDEX
-                currentTopBarMode = mode
-                preferences.topBarDisplayMode = mode
-                onTopBarModeChange(mode)
-                showTopBarModeSheet = false
+            IconButton(
+                onClick = {
+                    HapticFeedback.lightTap(context)
+                    onNavigateBack()
+                },
+                modifier = Modifier.align(Alignment.CenterStart)
+            ) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
+                    contentDescription = "返回",
+                    tint = textColor,
+                    modifier = Modifier.size(24.dp)
+                )
             }
-            OptionItem("日期 (Jan 2026)", currentTopBarMode == TopBarDisplayMode.DATE, accentColor, textColor) {
-                val mode = TopBarDisplayMode.DATE
-                currentTopBarMode = mode
-                preferences.topBarDisplayMode = mode
-                onTopBarModeChange(mode)
-                showTopBarModeSheet = false
+            Text(
+                text = "振动与声音",
+                style = MaterialTheme.typography.titleLarge.copy(
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 20.sp
+                ),
+                color = textColor,
+                modifier = Modifier.align(Alignment.Center)
+            )
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp)
+        ) {
+            Spacer(modifier = Modifier.height(12.dp))
+
+            SectionHeader("声音", textColor)
+            SettingsGroup(cardColor) {
+                SettingsSwitchItem(
+                    icon = Icons.Outlined.Movie,
+                    iconTint = Color(0xFF30D158),
+                    title = "Live 声音",
+                    textColor = textColor,
+                    checked = playMotionSound,
+                    onCheckedChange = onPlayMotionSoundChange,
+                    enabled = showMotionBadges
+                )
+
+                Divider(LocalIsDarkTheme.current)
+
+                SettingsSliderItem(
+                    icon = Icons.Outlined.VolumeUp,
+                    iconTint = Color(0xFF64D2FF),
+                    title = "Live 音量",
+                    value = motionSoundVolume,
+                    textColor = textColor,
+                    secondaryTextColor = secondaryTextColor,
+                    enabled = showMotionBadges && playMotionSound,
+                    accentColor = accentColor,
+                    onValueChange = onMotionSoundVolumeChange
+                )
             }
+
+            Spacer(modifier = Modifier.height(28.dp))
+
+            SectionHeader("振动", textColor)
+            SettingsGroup(cardColor) {
+                SettingsSwitchItem(
+                    icon = Icons.Outlined.Vibration,
+                    iconTint = Color(0xFFFF9F0A),
+                    title = "启用振动",
+                    textColor = textColor,
+                    checked = hapticEnabled,
+                    onCheckedChange = onHapticEnabledChange
+                )
+
+                Divider(LocalIsDarkTheme.current)
+
+                SettingsSliderItem(
+                    icon = Icons.Outlined.Vibration,
+                    iconTint = Color(0xFFFF9F0A),
+                    title = "振动强度",
+                    value = hapticStrength,
+                    textColor = textColor,
+                    secondaryTextColor = secondaryTextColor,
+                    enabled = hapticEnabled,
+                    accentColor = accentColor,
+                    onValueChange = onHapticStrengthChange,
+                    previewHaptics = true,
+                    previewStep = 1,
+                    onPreviewHaptic = { HapticFeedback.lightTap(context) }
+                )
+
+                Divider(LocalIsDarkTheme.current)
+
+                SettingsSwitchItem(
+                    icon = Icons.Outlined.Vibration,
+                    iconTint = Color(0xFFFF9F0A),
+                    title = "滑动卡片振动",
+                    textColor = textColor,
+                    checked = swipeHapticsEnabled,
+                    onCheckedChange = onSwipeHapticsEnabledChange,
+                    enabled = hapticEnabled
+                )
+            }
+
+            Spacer(modifier = Modifier.height(28.dp))
         }
     }
 }
@@ -518,7 +794,8 @@ fun SettingsSwitchItem(
     title: String,
     textColor: Color,
     checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true
 ) {
     Row(
         modifier = Modifier
@@ -548,21 +825,200 @@ fun SettingsSwitchItem(
             style = MaterialTheme.typography.bodyLarge.copy(
                 fontWeight = FontWeight.Medium
             ),
-            color = textColor,
+            color = textColor.copy(alpha = if (enabled) 1f else 0.4f),
             modifier = Modifier.weight(1f)
         )
         
-        Switch(
-            checked = checked,
-            onCheckedChange = onCheckedChange,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = Color.White,
-                checkedTrackColor = TabulaColors.EyeGold,
-                uncheckedThumbColor = Color.White,
-                uncheckedTrackColor = Color(0xFFE9E9EB)
-            ),
-            modifier = Modifier.height(24.dp)
+        Box(
+            modifier = Modifier.size(40.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Switch(
+                checked = checked,
+                onCheckedChange = onCheckedChange,
+                enabled = enabled,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = Color.White,
+                    checkedTrackColor = TabulaColors.EyeGold,
+                    uncheckedThumbColor = Color.White,
+                    uncheckedTrackColor = Color(0xFFE9E9EB)
+                ),
+                modifier = Modifier
+                    .height(20.dp)
+                    .scale(0.85f)
+            )
+        }
+    }
+}
+
+@Composable
+fun SettingsSliderItem(
+    icon: ImageVector,
+    iconTint: Color,
+    title: String,
+    value: Int,
+    textColor: Color,
+    secondaryTextColor: Color,
+    enabled: Boolean,
+    accentColor: Color,
+    onValueChange: (Int) -> Unit,
+    previewHaptics: Boolean = false,
+    previewStep: Int = 5,
+    onPreviewHaptic: (() -> Unit)? = null
+) {
+    var lastHapticValue by remember { mutableIntStateOf(value.coerceIn(0, 100)) }
+    val isDarkTheme = LocalIsDarkTheme.current
+    val inactiveTrackColor = if (isDarkTheme) Color(0xFF2C2C2E) else Color(0xFFE0E0E0)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(32.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(iconTint.copy(alpha = 0.15f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = iconTint,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(16.dp))
+
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyLarge.copy(
+                    fontWeight = FontWeight.Medium
+                ),
+                color = textColor.copy(alpha = if (enabled) 1f else 0.4f),
+                modifier = Modifier.weight(1f)
+            )
+
+            Text(
+                text = value.coerceIn(0, 100).toString(),
+                style = MaterialTheme.typography.bodyMedium,
+                color = secondaryTextColor.copy(alpha = if (enabled) 1f else 0.4f)
+            )
+        }
+
+        StyledSlider(
+            value = value,
+            enabled = enabled,
+            activeColor = accentColor,
+            inactiveColor = inactiveTrackColor,
+            onValueChange = { newValue ->
+                val clampedValue = newValue.coerceIn(0, 100)
+                onValueChange(clampedValue)
+                if (previewHaptics && enabled && onPreviewHaptic != null) {
+                    if (kotlin.math.abs(clampedValue - lastHapticValue) >= previewStep) {
+                        lastHapticValue = clampedValue
+                        onPreviewHaptic()
+                    }
+                }
+            }
         )
+    }
+}
+
+@Composable
+private fun StyledSlider(
+    value: Int,
+    enabled: Boolean,
+    activeColor: Color,
+    inactiveColor: Color,
+    thumbColor: Color = Color.White,
+    onValueChange: (Int) -> Unit,
+    trackHeight: androidx.compose.ui.unit.Dp = 10.dp,
+    thumbSize: androidx.compose.ui.unit.Dp = 20.dp
+) {
+    val density = LocalDensity.current
+    val clampedValue = value.coerceIn(0, 100)
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(maxOf(trackHeight, thumbSize))
+    ) {
+        val widthPx = with(density) { maxWidth.toPx() }
+        val thumbPx = with(density) { thumbSize.toPx() }
+        val trackHeightPx = with(density) { trackHeight.toPx() }
+        val trackStartX = thumbPx / 2f
+        val trackEndX = (widthPx - thumbPx / 2f).coerceAtLeast(trackStartX)
+        val trackWidth = (trackEndX - trackStartX).coerceAtLeast(0f)
+        val fraction = (clampedValue / 100f).coerceIn(0f, 1f)
+        val activeEndX = trackStartX + trackWidth * fraction
+        val centerY = trackHeightPx / 2f
+
+        val effectiveActive = if (enabled) activeColor else activeColor.copy(alpha = 0.4f)
+        val effectiveInactive = if (enabled) inactiveColor else inactiveColor.copy(alpha = 0.4f)
+
+        fun updateFromX(x: Float) {
+            if (!enabled) return
+            val clampedX = x.coerceIn(trackStartX, trackEndX)
+            val newFraction = if (trackWidth <= 0f) 0f else (clampedX - trackStartX) / trackWidth
+            val newValue = (newFraction * 100f).roundToInt().coerceIn(0, 100)
+            onValueChange(newValue)
+        }
+
+        androidx.compose.foundation.Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(enabled, trackStartX, trackEndX, trackWidth) {
+                    if (!enabled) return@pointerInput
+                    detectTapGestures { offset -> updateFromX(offset.x) }
+                }
+                .pointerInput(enabled, trackStartX, trackEndX, trackWidth) {
+                    if (!enabled) return@pointerInput
+                    detectDragGestures { change, _ ->
+                        updateFromX(change.position.x)
+                        change.consume()
+                    }
+                }
+        ) {
+            val y = size.height / 2f
+            val top = y - trackHeightPx / 2f
+            val radius = trackHeightPx / 2f
+
+            drawRoundRect(
+                color = effectiveInactive,
+                topLeft = Offset(trackStartX, top),
+                size = Size(trackWidth, trackHeightPx),
+                cornerRadius = CornerRadius(radius, radius)
+            )
+
+            if (activeEndX > trackStartX) {
+                drawRoundRect(
+                    color = effectiveActive,
+                    topLeft = Offset(trackStartX, top),
+                    size = Size(activeEndX - trackStartX, trackHeightPx),
+                    cornerRadius = CornerRadius(radius, radius)
+                )
+            }
+
+            val thumbRadius = thumbPx / 2f
+            val thumbCenter = Offset(activeEndX, y)
+            val borderColor = effectiveActive.copy(alpha = if (enabled) 1f else 0.6f)
+
+            drawCircle(
+                color = thumbColor.copy(alpha = if (enabled) 1f else 0.5f),
+                radius = thumbRadius,
+                center = thumbCenter
+            )
+            drawCircle(
+                color = borderColor,
+                radius = thumbRadius,
+                center = thumbCenter,
+                style = Stroke(width = with(density) { 2.dp.toPx() })
+            )
+        }
     }
 }
 

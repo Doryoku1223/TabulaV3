@@ -64,6 +64,55 @@ class AppPreferences(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_DELETE_CONFIRM, value).apply()
 
     /**
+     * Show HDR badges
+     */
+    var showHdrBadges: Boolean
+        get() = prefs.getBoolean(KEY_SHOW_HDR_BADGES, true)
+        set(value) = prefs.edit().putBoolean(KEY_SHOW_HDR_BADGES, value).apply()
+
+    /**
+     * Show Live photo badges
+     */
+    var showMotionBadges: Boolean
+        get() = prefs.getBoolean(KEY_SHOW_MOTION_BADGES, true)
+        set(value) = prefs.edit().putBoolean(KEY_SHOW_MOTION_BADGES, value).apply()
+
+    /**
+     * Play Live photo sound
+     */
+    var playMotionSound: Boolean
+        get() = prefs.getBoolean(KEY_PLAY_MOTION_SOUND, true)
+        set(value) = prefs.edit().putBoolean(KEY_PLAY_MOTION_SOUND, value).apply()
+
+    /**
+     * Live photo sound volume (0-100)
+     */
+    var motionSoundVolume: Int
+        get() = prefs.getInt(KEY_MOTION_SOUND_VOLUME, 100)
+        set(value) = prefs.edit().putInt(KEY_MOTION_SOUND_VOLUME, value.coerceIn(0, 100)).apply()
+
+    /**
+     * Global haptic enable
+     */
+    var hapticEnabled: Boolean
+        get() = prefs.getBoolean(KEY_HAPTIC_ENABLED, true)
+        set(value) = prefs.edit().putBoolean(KEY_HAPTIC_ENABLED, value).apply()
+
+    /**
+     * Haptic strength (0-100)
+     */
+    var hapticStrength: Int
+        get() = prefs.getInt(KEY_HAPTIC_STRENGTH, 70)
+        set(value) = prefs.edit().putInt(KEY_HAPTIC_STRENGTH, value.coerceIn(0, 100)).apply()
+
+    /**
+     * Swipe card haptics enable
+     */
+    var swipeHapticsEnabled: Boolean
+        get() = prefs.getBoolean(KEY_SWIPE_HAPTICS_ENABLED, true)
+        set(value) = prefs.edit().putBoolean(KEY_SWIPE_HAPTICS_ENABLED, value).apply()
+
+    /**
      * 一组显示的照片数量（默认 15 张）
      */
     var batchSize: Int
@@ -101,6 +150,13 @@ class AppPreferences(context: Context) {
         private const val KEY_SORT_ORDER = "sort_order"
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_DELETE_CONFIRM = "delete_confirm"
+        private const val KEY_SHOW_HDR_BADGES = "show_hdr_badges"
+        private const val KEY_SHOW_MOTION_BADGES = "show_motion_badges"
+        private const val KEY_PLAY_MOTION_SOUND = "play_motion_sound"
+        private const val KEY_MOTION_SOUND_VOLUME = "motion_sound_volume"
+        private const val KEY_HAPTIC_ENABLED = "haptic_enabled"
+        private const val KEY_HAPTIC_STRENGTH = "haptic_strength"
+        private const val KEY_SWIPE_HAPTICS_ENABLED = "swipe_haptics_enabled"
         private const val KEY_BATCH_SIZE = "batch_size"
         private const val KEY_TOP_BAR_MODE = "top_bar_mode"
         private const val KEY_TOTAL_REVIEWED = "total_reviewed"

@@ -20,10 +20,12 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import com.tabula.v3.ui.util.HapticFeedback
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 
@@ -47,6 +49,7 @@ fun PredictiveBackContainer(
     backgroundContent: @Composable () -> Unit,
     foregroundContent: @Composable () -> Unit
 ) {
+    val context = LocalContext.current
     val density = LocalDensity.current
     val configuration = LocalConfiguration.current
 
@@ -71,6 +74,7 @@ fun PredictiveBackContainer(
         PredictiveBackHandler { backEvents: Flow<BackEventCompat> ->
             var maxProgress = 0f
             var lastProgress = backProgress.value
+            var didHaptic = false
             backProgress.stop()
             gestureScreen = currentScreen
 
@@ -81,6 +85,10 @@ fun PredictiveBackContainer(
                     maxProgress = maxOf(maxProgress, clampedProgress)
                     swipeEdge = event.swipeEdge
                     backProgress.snapTo(clampedProgress)
+                    if (!didHaptic && clampedProgress > 0f) {
+                        HapticFeedback.lightTap(context)
+                        didHaptic = true
+                    }
                 }
                 val settleFrom = if (lastProgress > 0f) lastProgress else maxProgress
                 backProgress.snapTo(settleFrom.coerceIn(0f, 1f))
@@ -92,26 +100,19 @@ fun PredictiveBackContainer(
                     )
                 )
                 onNavigateBack()
+            } catch (e: CancellationException) {
+                val settleFrom = if (lastProgress > 0f) lastProgress else maxProgress
+                backProgress.snapTo(settleFrom.coerceIn(0f, 1f))
+                backProgress.animateTo(
+                    targetValue = 0f,
+                    animationSpec = tween(
+                        durationMillis = 220,
+                        easing = androidx.compose.animation.core.FastOutSlowInEasing
+                    )
+                )
+            } finally {
                 backProgress.snapTo(0f)
                 gestureScreen = null
-            } catch (e: CancellationException) {
-                if (maxProgress > 0f) {
-                    val settleFrom = if (lastProgress > 0f) lastProgress else maxProgress
-                    backProgress.snapTo(settleFrom.coerceIn(0f, 1f))
-                    backProgress.animateTo(
-                        targetValue = 1f,
-                        animationSpec = tween(
-                            durationMillis = 200,
-                            easing = androidx.compose.animation.core.FastOutSlowInEasing
-                        )
-                    )
-                    onNavigateBack()
-                    backProgress.snapTo(0f)
-                    gestureScreen = null
-                } else {
-                    backProgress.snapTo(0f)
-                    gestureScreen = null
-                }
             }
         }
     }
