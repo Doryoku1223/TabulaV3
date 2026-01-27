@@ -298,10 +298,10 @@ fun ViewerOverlay(
         Box(
             modifier = Modifier
                 .graphicsLayer {
-                    // ??
+ // TODO
                     translationX = currentX + userOffset.x
                     translationY = currentY + userOffset.y
-                    // ??????????
+ // TODO
                     scaleX = userScale
                     scaleY = userScale
                     transformOrigin = TransformOrigin(0.5f, 0.5f)

@@ -4,7 +4,6 @@ import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.ui.draw.shadow
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -30,10 +29,10 @@ import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.util.HapticFeedback
 
 /**
- * 底部模式切换器
+// TODO
  * 
- * 类似 iOS 相册的 "照片 | 图集" 切换器
- * 用于在 "滑一滑"（卡片模式）和 "图集"（相册列表）之间切换
+// TODO
+// TODO
  */
 @Composable
 fun ModeToggle(
@@ -46,18 +45,25 @@ fun ModeToggle(
     
     // 容器背景色：浅色模式下使用纯白半透明，深色模式下使用深灰半透明
     // 避免使用与页面背景相同的灰色 (F2F2F7)，否则会"隐身"
-    val containerColor = if (isDarkTheme) {
-        Color(0xFF252525).copy(alpha = 0.85f)
+    val containerTint = if (isDarkTheme) {
+        Color(0xFF1C1C1E).copy(alpha = 0.68f)
     } else {
-        Color.White.copy(alpha = 0.85f)
+        Color.White.copy(alpha = 0.72f)
     }
+
+    val highlightBrush = androidx.compose.ui.graphics.Brush.verticalGradient(
+        colors = listOf(
+            Color.White.copy(alpha = 0.45f),
+            Color.White.copy(alpha = 0.08f)
+        )
+    )
     
     // 边框：垂直渐变，模拟顶部高光反射
     val borderBrush = if (isDarkTheme) {
         androidx.compose.ui.graphics.Brush.verticalGradient(
             colors = listOf(
-                Color.White.copy(alpha = 0.15f), // 顶部亮
-                Color.White.copy(alpha = 0.05f)  // 底部暗
+                Color.White.copy(alpha = 0.15f), // TODO
+                Color.White.copy(alpha = 0.05f) // TODO
             )
         )
     } else {
@@ -71,9 +77,9 @@ fun ModeToggle(
 
     // 滑块颜色
     val selectedBgColor = if (isDarkTheme) {
-        Color(0xFF636366) 
+        Color(0xFF3A3A3C).copy(alpha = 0.85f)
     } else {
-        Color(0xFFF2F2F7) // 浅灰，与白色背景形成微弱对比
+        Color(0xFFF2F2F7).copy(alpha = 0.9f) // TODO
     }
     
     val textColor = if (isDarkTheme) Color.White else Color.Black
@@ -93,26 +99,28 @@ fun ModeToggle(
         label = "toggle_offset"
     )
 
-    Box(
+    FrostedGlass(
         modifier = modifier
-            // 投影：更柔和、更扩散的阴影
+ // TODO
             .shadow(
                 elevation = 12.dp,
                 shape = RoundedCornerShape(100),
                 spotColor = Color.Black.copy(alpha = 0.15f),
                 ambientColor = Color.Black.copy(alpha = 0.1f)
-            )
-            // 边框
-            .border(
-                width = 1.dp,
-                brush = borderBrush,
-                shape = RoundedCornerShape(100)
-            )
-            .clip(RoundedCornerShape(100))
-            .background(containerColor)
-            .padding(4.dp), 
+            ),
+        shape = RoundedCornerShape(100),
+        blurRadius = 34.dp,
+        tint = containerTint,
+        borderBrush = borderBrush,
+        borderWidth = 1.dp,
+        highlightBrush = highlightBrush,
+        noiseAlpha = if (isDarkTheme) 0.04f else 0.06f,
         contentAlignment = Alignment.CenterStart
     ) {
+        Box(
+            modifier = Modifier.padding(4.dp),
+            contentAlignment = Alignment.CenterStart
+        ) {
         // 滑动选中背景
         Box(
             modifier = Modifier
@@ -182,5 +190,7 @@ fun ModeToggle(
                 )
             }
         }
+        }
     }
 }
+

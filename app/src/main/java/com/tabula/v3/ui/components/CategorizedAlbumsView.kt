@@ -67,7 +67,9 @@ fun CategorizedAlbumsView(
     modifier: Modifier = Modifier,
     hideHeaders: Boolean = false, // 是否隐藏分节标题
     listState: LazyListState = rememberLazyListState(),
-    topPadding: Dp = 100.dp // 顶部内边距
+    topPadding: Dp = 100.dp, // 顶部内边距
+    headerContent: (@Composable () -> Unit)? = null,
+    userScrollEnabled: Boolean = true
 ) {
     val context = LocalContext.current
     val imageMap = remember(allImages) { allImages.associateBy { it.id } }
@@ -75,8 +77,21 @@ fun CategorizedAlbumsView(
     LazyColumn(
         state = listState,
         modifier = modifier.fillMaxSize(),
-        contentPadding = PaddingValues(top = topPadding, bottom = 100.dp)
+        contentPadding = PaddingValues(top = topPadding, bottom = 100.dp),
+        userScrollEnabled = userScrollEnabled
     ) {
+        if (headerContent != null) {
+            item {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 2.dp, bottom = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    headerContent()
+                }
+            }
+        }
         // App 图集区域 (仅当 appAlbums 不为 null 时显示)
         if (appAlbums != null) {
             if (!hideHeaders) {
