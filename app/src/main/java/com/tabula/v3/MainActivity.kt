@@ -3,6 +3,7 @@ package com.tabula.v3
 import android.Manifest
 import android.graphics.Color as AndroidColor
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
@@ -68,6 +69,7 @@ import androidx.compose.runtime.collectAsState
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.theme.TabulaColors
 import com.tabula.v3.ui.theme.TabulaTheme
+import com.tabula.v3.service.FluidCloudService
 import android.widget.Toast
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -85,6 +87,10 @@ import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
 
     private var hasPermission by mutableStateOf(false)
+    
+    // 流体云：跟踪当前批次剩余数量
+    private var currentBatchRemaining = 0
+    private var isFluidCloudEnabled = false
 
     // 权限请求
     private val permissionLauncher = registerForActivityResult(
@@ -153,6 +159,28 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+    
+    override fun onResume() {
+        super.onResume()
+        // 返回应用时隐藏流体云
+        FluidCloudService.hide(this)
+    }
+    
+    override fun onStop() {
+        super.onStop()
+        // 离开应用时，如果有未完成的批次且流体云已启用，则显示流体云
+        if (isFluidCloudEnabled && currentBatchRemaining > 0) {
+            FluidCloudService.show(this, currentBatchRemaining)
+        }
+    }
+    
+    /**
+     * 更新批次剩余数量（供 Composable 调用）
+     */
+    fun updateBatchRemaining(remaining: Int, fluidCloudEnabled: Boolean) {
+        currentBatchRemaining = remaining
+        isFluidCloudEnabled = fluidCloudEnabled
+    }
 
     private fun checkPermission() {
         hasPermission = ContextCompat.checkSelfPermission(
@@ -164,6 +192,7 @@ class MainActivity : ComponentActivity() {
     private fun requestPermission() {
         permissionLauncher.launch(Manifest.permission.READ_MEDIA_IMAGES)
     }
+    
 }
 
 /**
@@ -190,6 +219,7 @@ fun TabulaApp(
     var hapticEnabled by remember { mutableStateOf(preferences.hapticEnabled) }
     var hapticStrength by remember { mutableIntStateOf(preferences.hapticStrength) }
     var swipeHapticsEnabled by remember { mutableStateOf(preferences.swipeHapticsEnabled) }
+    var fluidCloudEnabled by remember { mutableStateOf(preferences.fluidCloudEnabled) }
 
     // ========== 路由状态 ==========
     var currentScreen by remember { mutableStateOf(AppScreen.DECK) }
@@ -378,20 +408,28 @@ fun TabulaApp(
                             val result = albumManager.syncAllEnabledAlbumsToSystem()
                             withContext(Dispatchers.Main) {
                                 val message = when {
-                                    result.totalAlbums == 0 -> "没有启用同步的图集\n请在图集设置中开启同步"
-                                    result.syncedImages == 0 && result.successCount > 0 -> "所有 ${result.totalAlbums} 个图集已是最新"
-                                    result.successCount == result.totalAlbums -> 
-                                        "同步完成！\n${result.totalAlbums} 个图集，共 ${result.syncedImages} 张图片"
+                                    result.totalAlbums == 0 -> "没有可同步的图集\n请先创建图集并添加图片"
+                                    result.newlySyncedImages == 0 && result.skippedImages > 0 -> 
+                                        "所有 ${result.totalAlbums} 个图集已是最新\n共 ${result.skippedImages} 张图片无需更新"
+                                    result.newlySyncedImages > 0 && result.skippedImages > 0 ->
+                                        "同步完成！\n新增 ${result.newlySyncedImages} 张，${result.skippedImages} 张已存在"
+                                    result.newlySyncedImages > 0 -> 
+                                        "同步完成！\n${result.totalAlbums} 个图集，共 ${result.newlySyncedImages} 张新图片"
                                     else -> 
                                         "同步完成\n成功 ${result.successCount}/${result.totalAlbums} 个图集"
                                 }
                                 Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                                 
-                                // 刷新系统相册列表
+                                // 刷新系统相册列表和图片列表
                                 val repository = LocalImageRepository(context)
-                                systemBuckets = withContext(Dispatchers.IO) {
-                                    repository.getAllBucketsWithInfo()
+                                val refreshedData = withContext(Dispatchers.IO) {
+                                    Pair(
+                                        repository.getAllBucketsWithInfo(),
+                                        repository.getAllImages()
+                                    )
                                 }
+                                systemBuckets = refreshedData.first
+                                allImages = refreshedData.second
                             }
                         } catch (e: Exception) {
                             Log.e("TabulaApp", "Sync failed", e)
@@ -412,7 +450,11 @@ fun TabulaApp(
             motionSoundVolume = motionSoundVolume,
             enableSwipeHaptics = swipeHapticsEnabled,
             isAlbumMode = isAlbumMode,
-            onModeChange = { isAlbumMode = it }
+            onModeChange = { isAlbumMode = it },
+            onBatchRemainingChange = { remaining ->
+                // 更新流体云的批次剩余数量
+                (context as? MainActivity)?.updateBatchRemaining(remaining, fluidCloudEnabled)
+            }
         )
     }
 
@@ -517,6 +559,11 @@ fun TabulaApp(
             onRecommendModeChange = { 
                 // 切换推荐模式后，增加刷新触发器以刷新批次
                 recommendModeRefreshKey++
+            },
+            fluidCloudEnabled = fluidCloudEnabled,
+            onFluidCloudEnabledChange = { enabled ->
+                fluidCloudEnabled = enabled
+                preferences.fluidCloudEnabled = enabled
             }
         )
     }

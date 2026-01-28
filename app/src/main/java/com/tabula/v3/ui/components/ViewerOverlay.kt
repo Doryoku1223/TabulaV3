@@ -98,9 +98,26 @@ fun ViewerOverlay(
     val screenWidthPx = with(density) { configuration.screenWidthDp.dp.toPx() }
     val screenHeightPx = with(density) { configuration.screenHeightDp.dp.toPx() }
 
-    // 源位置信息
-    val source = viewerState.sourceRect
+    // 源位置信息 - 使用remember保存初始值，确保退出动画时使用正确的位置
+    val initialSourceRect = remember { viewerState.sourceRect }
     val image = viewerState.image
+    
+    // 检查源位置是否有效（宽高大于0）
+    val isSourceValid = initialSourceRect.width > 0f && initialSourceRect.height > 0f
+    
+    // 如果源位置无效，使用屏幕中心作为fallback
+    val source = if (isSourceValid) {
+        initialSourceRect
+    } else {
+        // 无效时使用屏幕中心作为源位置（会产生居中缩放效果）
+        SourceRect(
+            x = screenWidthPx / 2f - 100f,
+            y = screenHeightPx / 2f - 150f,
+            width = 200f,
+            height = 300f,
+            cornerRadius = 16f
+        )
+    }
     val features = rememberImageFeatures(
         image = image,
         enableHdr = showHdr,

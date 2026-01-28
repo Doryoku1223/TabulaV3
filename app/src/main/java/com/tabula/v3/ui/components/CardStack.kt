@@ -35,11 +35,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.ui.util.HapticFeedback
 import com.tabula.v3.ui.util.rememberImageFeatures
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+import kotlin.math.pow
 
 /**
  * 手势方向判定
@@ -47,7 +49,8 @@ import kotlin.math.abs
 private enum class SwipeDirection {
     NONE,
     HORIZONTAL,  // 左右滑 → 洗牌
-    UP           // 上滑 → 删除
+    UP,          // 上滑 → 删除
+    DOWN         // 下滑 → 归类到图集
 }
 
 @Composable
@@ -101,7 +104,15 @@ fun SwipeableCardStack(
     showMotionBadges: Boolean = false,
     enableSwipeHaptics: Boolean = true,
     modifier: Modifier = Modifier,
-    cardAspectRatio: Float = 3f / 4f
+    cardAspectRatio: Float = 3f / 4f,
+    // 下滑归类相关参数
+    albums: List<Album> = emptyList(),
+    onClassifyToAlbum: ((ImageFile, Album) -> Unit)? = null,
+    onCreateNewAlbum: ((ImageFile) -> Unit)? = null,
+    // 归类模式状态回调
+    onClassifyModeChange: ((Boolean) -> Unit)? = null,
+    onDragPositionChange: ((Offset?) -> Unit)? = null,
+    onHoveredAlbumChange: ((Album?) -> Unit)? = null
 ) {
     if (images.isEmpty()) return
 
@@ -121,9 +132,11 @@ fun SwipeableCardStack(
     val swipeThresholdPx = screenWidthPx * 0.25f
     val velocityThreshold = 800f
     val deleteThresholdPx = screenHeightPx * 0.15f
+    val classifyThresholdPx = screenHeightPx * 0.12f  // 下滑归类阈值
 
     // 动画时长
     val shuffleAnimDuration = 120
+    val genieAnimDuration = 500  // Genie动画时长
 
     // ========== 顶层卡片拖拽状态 ==========
     val dragOffsetX = remember { Animatable(0f) }
@@ -138,6 +151,13 @@ fun SwipeableCardStack(
     var hasDragged by remember { mutableStateOf(false) }  // 是否发生过拖动
     var swipeThresholdHapticTriggered by remember { mutableStateOf(false) }
     var deleteThresholdHapticTriggered by remember { mutableStateOf(false) }
+    var classifyThresholdHapticTriggered by remember { mutableStateOf(false) }
+    
+    // 归类模式状态
+    var isClassifyMode by remember { mutableStateOf(false) }
+    var currentDragPosition by remember { mutableStateOf<Offset?>(null) }
+    var hoveredAlbum by remember { mutableStateOf<Album?>(null) }
+    var targetAlbumBounds by remember { mutableStateOf<Rect?>(null) }
 
     // ========== 背景卡片呼吸感响应 ==========
     var breathScale by remember { mutableFloatStateOf(0f) }
@@ -171,6 +191,16 @@ fun SwipeableCardStack(
         breathScale = 0f
         swipeThresholdHapticTriggered = false
         deleteThresholdHapticTriggered = false
+        classifyThresholdHapticTriggered = false
+        
+        // 重置归类模式
+        isClassifyMode = false
+        currentDragPosition = null
+        hoveredAlbum = null
+        targetAlbumBounds = null
+        onClassifyModeChange?.invoke(false)
+        onDragPositionChange?.invoke(null)
+        onHoveredAlbumChange?.invoke(null)
     }
 
     /**
@@ -329,6 +359,140 @@ fun SwipeableCardStack(
         breathScale = 0f
     }
 
+    /**
+     * 执行归类动画 - macOS Genie 收缩效果
+     * 
+     * 模拟macOS最小化时的布料收缩效果：
+     * 1. 阶段一：卡片向下移动并开始缩放
+     * 2. 阶段二：沿贝塞尔曲线收缩到目标位置
+     * 3. 阶段三：最终缩小并淡出
+     * 
+     * @param targetAlbum 目标图集
+     * @param targetBounds 目标位置边界
+     */
+    suspend fun executeGenieAnimation(targetAlbum: Album?, targetBounds: Rect?) {
+        val currentImg = currentImage ?: return
+        
+        // 触发震动反馈
+        if (enableSwipeHaptics) {
+            HapticFeedback.heavyTap(context)
+        }
+        
+        // 计算目标位置
+        val targetCenterX = targetBounds?.center?.x ?: (screenWidthPx / 2f)
+        val targetCenterY = targetBounds?.center?.y ?: screenHeightPx
+        
+        // 当前卡片中心
+        val cardCenterX = topCardBounds.center.x
+        val cardCenterY = topCardBounds.center.y
+        
+        // 计算偏移量
+        val finalOffsetX = targetCenterX - cardCenterX
+        val finalOffsetY = targetCenterY - cardCenterY
+        
+        // 贝塞尔曲线控制点（模拟Genie弯曲效果）
+        val controlPointY = cardCenterY + (finalOffsetY * 0.3f)
+        
+        // 缓动曲线 - 自定义贝塞尔实现更自然的收缩感
+        val genieEasing = CubicBezierEasing(0.2f, 0.8f, 0.2f, 1f)
+        
+        // 阶段一：向下移动 + 轻微缩放 (0-30%)
+        val phase1Duration = (genieAnimDuration * 0.3).toInt()
+        scope.launch {
+            dragOffsetY.animateTo(
+                finalOffsetY * 0.3f,
+                tween(phase1Duration, easing = genieEasing)
+            )
+        }
+        scope.launch {
+            dragScale.animateTo(
+                0.85f,
+                tween(phase1Duration, easing = genieEasing)
+            )
+        }
+        scope.launch {
+            // 轻微旋转增加动感
+            dragRotation.animateTo(
+                5f,
+                tween(phase1Duration, easing = genieEasing)
+            )
+        }
+        
+        kotlinx.coroutines.delay(phase1Duration.toLong())
+        
+        // 阶段二：沿曲线收缩到目标 (30-80%)
+        val phase2Duration = (genieAnimDuration * 0.5).toInt()
+        scope.launch {
+            dragOffsetX.animateTo(
+                finalOffsetX,
+                tween(phase2Duration, easing = genieEasing)
+            )
+        }
+        scope.launch {
+            dragOffsetY.animateTo(
+                finalOffsetY,
+                tween(phase2Duration, easing = genieEasing)
+            )
+        }
+        scope.launch {
+            // 主要缩放阶段
+            dragScale.animateTo(
+                0.15f,
+                tween(phase2Duration, easing = genieEasing)
+            )
+        }
+        scope.launch {
+            // 旋转复位
+            dragRotation.animateTo(
+                0f,
+                tween(phase2Duration, easing = genieEasing)
+            )
+        }
+        
+        kotlinx.coroutines.delay((phase2Duration * 0.6).toLong())
+        
+        // 阶段三：最终收缩 + 淡出 (80-100%)
+        val phase3Duration = (genieAnimDuration * 0.2).toInt()
+        scope.launch {
+            dragScale.animateTo(
+                0.05f,
+                tween(phase3Duration, easing = CubicBezierEasing(0.4f, 0f, 1f, 1f))
+            )
+        }
+        scope.launch {
+            dragAlpha.animateTo(
+                0f,
+                tween(phase3Duration, easing = CubicBezierEasing(0.4f, 0f, 1f, 1f))
+            )
+        }
+        
+        kotlinx.coroutines.delay(phase3Duration.toLong())
+        
+        // 执行归类回调
+        if (targetAlbum != null) {
+            onClassifyToAlbum?.invoke(currentImg, targetAlbum)
+        } else {
+            // 新建图集
+            onCreateNewAlbum?.invoke(currentImg)
+        }
+        
+        // 重置状态
+        dragOffsetX.snapTo(0f)
+        dragOffsetY.snapTo(0f)
+        dragRotation.snapTo(0f)
+        dragAlpha.snapTo(1f)
+        dragScale.snapTo(1f)
+        lockedDirection = SwipeDirection.NONE
+        breathScale = 0f
+        isClassifyMode = false
+        currentDragPosition = null
+        hoveredAlbum = null
+        targetAlbumBounds = null
+        onClassifyModeChange?.invoke(false)
+        onDragPositionChange?.invoke(null)
+        onHoveredAlbumChange?.invoke(null)
+    }
+
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -453,14 +617,15 @@ fun SwipeableCardStack(
                                 }
                             )
                         }
-                        .pointerInput(currentIndex) {
+                        .pointerInput(currentIndex, albums) {
                             detectDragGestures(
-                                onDragStart = { _ ->
+                                onDragStart = { startOffset ->
                                     isDragging = true
                                     hasDragged = false
                                     velocityTracker.resetTracking()
                                     swipeThresholdHapticTriggered = false
                                     deleteThresholdHapticTriggered = false
+                                    classifyThresholdHapticTriggered = false
                                 },
                                 onDrag = { change, dragAmount ->
                                     change.consume()
@@ -471,8 +636,12 @@ fun SwipeableCardStack(
                                         val totalDx = abs(dragOffsetX.value + dragAmount.x)
                                         val totalDy = abs(dragOffsetY.value + dragAmount.y)
 
+                                        // 判断滑动方向
                                         if (totalDy > totalDx * 1.5f && dragAmount.y < 0) {
                                             lockedDirection = SwipeDirection.UP
+                                        } else if (totalDy > totalDx * 1.5f && dragAmount.y > 0 && albums.isNotEmpty()) {
+                                            // 下滑且有图集可选
+                                            lockedDirection = SwipeDirection.DOWN
                                         } else if (totalDx > 20f || totalDy > 20f) {
                                             lockedDirection = SwipeDirection.HORIZONTAL
                                         }
@@ -492,6 +661,37 @@ fun SwipeableCardStack(
                                                     HapticFeedback.heavyTap(context)
                                                 }
                                             }
+                                            SwipeDirection.DOWN -> {
+                                                // 下滑归类模式
+                                                val newY = (dragOffsetY.value + dragAmount.y).coerceAtLeast(0f)
+                                                dragOffsetY.snapTo(newY)
+                                                dragOffsetX.snapTo(dragOffsetX.value + dragAmount.x * 0.5f)
+                                                
+                                                // 进入归类模式
+                                                if (newY > classifyThresholdPx && !isClassifyMode) {
+                                                    isClassifyMode = true
+                                                    onClassifyModeChange?.invoke(true)
+                                                    if (enableSwipeHaptics && !classifyThresholdHapticTriggered) {
+                                                        classifyThresholdHapticTriggered = true
+                                                        HapticFeedback.mediumTap(context)
+                                                    }
+                                                }
+                                                
+                                                // 更新拖拽位置（用于标签选择器检测悬停）
+                                                if (isClassifyMode) {
+                                                    // 计算实际屏幕位置
+                                                    val screenPosition = Offset(
+                                                        topCardBounds.center.x + dragOffsetX.value,
+                                                        topCardBounds.center.y + dragOffsetY.value
+                                                    )
+                                                    currentDragPosition = screenPosition
+                                                    onDragPositionChange?.invoke(screenPosition)
+                                                }
+                                                
+                                                // 轻微缩放效果
+                                                val scaleProgress = (newY / (screenHeightPx * 0.3f)).coerceIn(0f, 1f)
+                                                dragScale.snapTo(1f - scaleProgress * 0.15f)
+                                            }
                                             SwipeDirection.HORIZONTAL -> {
                                                 val newX = dragOffsetX.value + dragAmount.x
                                                 dragOffsetX.snapTo(newX)
@@ -510,7 +710,9 @@ fun SwipeableCardStack(
                                             }
                                         }
 
-                                        val rotation = (dragOffsetX.value / screenWidthPx) * 15f
+                                        // 旋转效果（归类模式下减弱）
+                                        val rotationFactor = if (lockedDirection == SwipeDirection.DOWN) 0.3f else 1f
+                                        val rotation = (dragOffsetX.value / screenWidthPx) * 15f * rotationFactor
                                         dragRotation.snapTo(rotation.coerceIn(-20f, 20f))
 
                                         breathScale = (abs(dragOffsetX.value) / swipeThresholdPx).coerceIn(0f, 1f)
@@ -527,6 +729,23 @@ fun SwipeableCardStack(
                                                     abs(velocity.y) > velocityThreshold
                                                 ) {
                                                     executeDeleteAnimation(playHaptic = !deleteThresholdHapticTriggered)
+                                                } else {
+                                                    resetDragState()
+                                                }
+                                            }
+                                            SwipeDirection.DOWN -> {
+                                                // 下滑归类处理
+                                                if (isClassifyMode && hoveredAlbum != null) {
+                                                    // 有选中的图集，执行Genie动画
+                                                    executeGenieAnimation(hoveredAlbum, targetAlbumBounds)
+                                                } else if (isClassifyMode && currentDragPosition != null) {
+                                                    // 可能选中了"新建"，检查是否在新建区域
+                                                    // 这里简化处理，如果拖到底部足够远就触发新建
+                                                    if (dragOffsetY.value > screenHeightPx * 0.4f) {
+                                                        executeGenieAnimation(null, null)
+                                                    } else {
+                                                        resetDragState()
+                                                    }
                                                 } else {
                                                     resetDragState()
                                                 }

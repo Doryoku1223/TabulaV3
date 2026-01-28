@@ -42,6 +42,7 @@ import androidx.compose.material.icons.outlined.Shuffle
 import androidx.compose.material.icons.outlined.TextFormat
 import androidx.compose.material.icons.outlined.VolumeUp
 import androidx.compose.material.icons.outlined.Vibration
+import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -115,7 +116,9 @@ fun SettingsScreen(
     onNavigateBack: () -> Unit,
     onNavigateToStatistics: () -> Unit = {},
     onNavigateToAlbums: () -> Unit = {},
-    onRecommendModeChange: () -> Unit = {}  // 推荐模式变更后通知主页刷新
+    onRecommendModeChange: () -> Unit = {},  // 推荐模式变更后通知主页刷新
+    fluidCloudEnabled: Boolean = false,
+    onFluidCloudEnabledChange: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
     val isDarkTheme = LocalIsDarkTheme.current
@@ -142,6 +145,7 @@ fun SettingsScreen(
     var currentHapticStrength by remember { mutableIntStateOf(hapticStrength) }
     var currentSwipeHapticsEnabled by remember { mutableStateOf(swipeHapticsEnabled) }
     var currentRecommendMode by remember { mutableStateOf(preferences.recommendMode) }
+    var currentFluidCloudEnabled by remember { mutableStateOf(fluidCloudEnabled) }
 
     // 底栏状态
     var showThemeSheet by remember { mutableStateOf(false) }
@@ -386,6 +390,40 @@ fun SettingsScreen(
                         showVibrationSoundPage = true
                     }
                 )
+            }
+
+            Spacer(modifier = Modifier.height(28.dp))
+            
+            // ========== 进阶功能 ==========
+            SectionHeader("进阶功能", textColor)
+            
+            SettingsGroup(cardColor) {
+                SettingsSwitchItem(
+                    icon = Icons.Outlined.Cloud,
+                    iconTint = Color(0xFF5E5CE6), // Indigo
+                    title = "流体云",
+                    textColor = textColor,
+                    checked = currentFluidCloudEnabled,
+                    onCheckedChange = { enabled ->
+                        HapticFeedback.lightTap(context)
+                        currentFluidCloudEnabled = enabled
+                        onFluidCloudEnabledChange(enabled)
+                    }
+                )
+                
+                // 流体云说明
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                        .padding(bottom = 12.dp)
+                ) {
+                    Text(
+                        text = "退出应用时在流体云/状态栏显示剩余照片数量，支持 ColorOS 流体云",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = secondaryTextColor.copy(alpha = 0.7f)
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(28.dp))

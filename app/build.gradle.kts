@@ -78,6 +78,9 @@ dependencies {
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.lifecycle.process)
+    
+    // Media Session (for Fluid Cloud)
+    implementation(libs.androidx.media)
 
     // Debug
     debugImplementation(libs.androidx.ui.tooling)

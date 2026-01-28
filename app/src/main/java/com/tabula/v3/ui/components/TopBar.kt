@@ -147,10 +147,20 @@ private fun formatDateForTopBar(timestamp: Long): String {
 }
 
 /**
- * 操作图标按钮组件
+ * 操作图标按钮组件 - 统一的图标按钮样式
+ * 
+ * 用于顶部栏的操作按钮，带背景色和圆角。
+ * 此组件可在多处复用以保持UI一致性。
+ * 
+ * @param icon 图标
+ * @param contentDescription 无障碍描述
+ * @param onClick 点击回调
+ * @param backgroundColor 背景色
+ * @param iconColor 图标颜色
+ * @param modifier 外部修饰符
  */
 @Composable
-private fun ActionIconButton(
+fun ActionIconButton(
     icon: ImageVector,
     contentDescription: String,
     onClick: () -> Unit,

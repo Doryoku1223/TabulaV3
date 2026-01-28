@@ -283,6 +283,43 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
     }
 
     /**
+     * 检查目标相册中是否已存在同名文件
+     * 
+     * @return 如果已存在，返回现有文件的 URI；否则返回 null
+     */
+    private fun findExistingImageInAlbum(
+        relativePath: String,
+        fileName: String
+    ): Uri? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val targetRelativePath = "${Environment.DIRECTORY_PICTURES}/$TABULA_ALBUMS_FOLDER/$relativePath"
+            val selection = "${MediaStore.Images.Media.RELATIVE_PATH} = ? AND ${MediaStore.Images.Media.DISPLAY_NAME} = ?"
+            val selectionArgs = arrayOf("$targetRelativePath/", fileName)
+            
+            contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.Images.Media._ID),
+                selection,
+                selectionArgs,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID))
+                    return Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString())
+                }
+            }
+        } else {
+            // Android 9 及以下：检查文件是否存在
+            val albumFolder = getAlbumFolder(relativePath)
+            val targetFile = File(albumFolder, fileName)
+            if (targetFile.exists()) {
+                return Uri.fromFile(targetFile)
+            }
+        }
+        return null
+    }
+
+    /**
      * 使用 MediaStore API 复制图片 (Android 10+)
      */
     private fun copyImageUsingMediaStore(
@@ -291,9 +328,42 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
         fileName: String
     ): Uri? {
         try {
+            // #region agent log
+            Log.d("DEBUG_SYNC", "[B2] copyImageUsingMediaStore:entry | sourceUri=$sourceUri | relativePath=$relativePath | fileName=$fileName | targetPath=${Environment.DIRECTORY_PICTURES}/$TABULA_ALBUMS_FOLDER/$relativePath")
+            // #endregion
+            
+            // 检查是否已存在同名文件，避免重复复制
+            val existingUri = findExistingImageInAlbum(relativePath, fileName)
+            if (existingUri != null) {
+                // #region agent log
+                Log.d("DEBUG_SYNC", "[B2] copyImageUsingMediaStore:skipped | fileName=$fileName already exists at $existingUri")
+                // #endregion
+                Log.d(TAG, "Image already exists in album, skipping: $fileName")
+                return existingUri
+            }
+            
+            // 获取源图片的 DATE_TAKEN，用于保持封面排序一致性
+            var dateTaken: Long? = null
+            contentResolver.query(
+                sourceUri,
+                arrayOf(MediaStore.Images.Media.DATE_TAKEN),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val dateIndex = cursor.getColumnIndex(MediaStore.Images.Media.DATE_TAKEN)
+                    if (dateIndex >= 0) {
+                        dateTaken = cursor.getLong(dateIndex)
+                    }
+                }
+            }
+            
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
                 put(MediaStore.Images.Media.MIME_TYPE, getMimeType(fileName))
+                // 保留原始拍摄时间，帮助系统相册正确排序
+                dateTaken?.let { put(MediaStore.Images.Media.DATE_TAKEN, it) }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     put(MediaStore.Images.Media.RELATIVE_PATH, 
                         "${Environment.DIRECTORY_PICTURES}/$TABULA_ALBUMS_FOLDER/$relativePath")
@@ -305,6 +375,10 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
                 MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
                 values
             ) ?: return null
+            
+            // #region agent log
+            Log.d("DEBUG_SYNC", "[B2] copyImageUsingMediaStore:inserted | newUri=$newUri | fileName=$fileName")
+            // #endregion
 
             contentResolver.openInputStream(sourceUri)?.use { input ->
                 contentResolver.openOutputStream(newUri)?.use { output ->
@@ -337,6 +411,12 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
     ): Uri? {
         try {
             val targetFile = File(targetFolder, fileName)
+            
+            // 检查文件是否已存在，避免重复复制
+            if (targetFile.exists()) {
+                Log.d(TAG, "Image already exists, skipping: ${targetFile.absolutePath}")
+                return Uri.fromFile(targetFile)
+            }
 
             contentResolver.openInputStream(sourceUri)?.use { input ->
                 FileOutputStream(targetFile).use { output ->
@@ -440,41 +520,117 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
     }
 
     /**
+     * 同步结果详情
+     */
+    data class SyncResultDetail(
+        val newlySynced: Int,      // 新同步的图片数
+        val alreadyExists: Int,    // 已存在跳过的图片数
+        val failed: Int            // 失败的图片数
+    ) {
+        val total get() = newlySynced + alreadyExists + failed
+        val success get() = newlySynced + alreadyExists
+    }
+
+    /**
      * 同步相册到系统
      *
      * @param albumName 相册名称
      * @param imageUris 图片 URI 列表
      * @param syncMode 同步模式：COPY 或 MOVE
      * @param onProgress 进度回调 (current, total)
-     * @return 成功同步的图片数量
+     * @return 同步结果详情
      */
     suspend fun syncAlbumToSystem(
         albumName: String,
         imageUris: List<Uri>,
         syncMode: SyncMode = SyncMode.MOVE,
         onProgress: ((Int, Int) -> Unit)? = null
-    ): Int = withContext(Dispatchers.IO) {
-        var successCount = 0
+    ): SyncResultDetail = withContext(Dispatchers.IO) {
+        var newlySynced = 0
+        var alreadyExists = 0
+        var failed = 0
 
         // 确保相册存在
         createSystemAlbum(albumName)
+        
+        // #region agent log
+        Log.d("DEBUG_SYNC", "[B1,B2,B3] syncAlbumToSystem:entry | albumName=$albumName | imageCount=${imageUris.size} | syncMode=${syncMode.name} | firstUri=${imageUris.firstOrNull()}")
+        // #endregion
 
         imageUris.forEachIndexed { index, uri ->
             onProgress?.invoke(index + 1, imageUris.size)
-
-            val result = when (syncMode) {
-                SyncMode.COPY -> addImageToSystemAlbum(uri, albumName)
-                SyncMode.MOVE -> moveImageToSystemAlbum(uri, albumName)
-            }
             
-            if (result != null) {
-                successCount++
+            val fileName = getFileNameFromUri(uri)
+            
+            // #region agent log
+            Log.d("DEBUG_SYNC", "[B1,B2] Processing image | index=$index | fileName=$fileName | albumName=$albumName | uri=$uri")
+            // #endregion
+
+            // 先检查是否已存在
+            val existingUri = fileName?.let { findExistingImageInAlbum(albumName, it) }
+            
+            if (existingUri != null) {
+                // 已存在，跳过
+                alreadyExists++
+                // #region agent log
+                Log.d("DEBUG_SYNC", "[B1,B2] Image sync result | index=$index | fileName=$fileName | status=skipped | existingUri=$existingUri")
+                // #endregion
+            } else {
+                // 不存在，执行同步
+                val result = when (syncMode) {
+                    SyncMode.COPY -> addImageToSystemAlbum(uri, albumName)
+                    SyncMode.MOVE -> moveImageToSystemAlbum(uri, albumName)
+                }
+                
+                if (result != null) {
+                    newlySynced++
+                    // #region agent log
+                    Log.d("DEBUG_SYNC", "[B1,B2] Image sync result | index=$index | fileName=$fileName | status=synced | resultUri=$result")
+                    // #endregion
+                } else {
+                    failed++
+                    // #region agent log
+                    Log.d("DEBUG_SYNC", "[B1,B2] Image sync result | index=$index | fileName=$fileName | status=failed")
+                    // #endregion
+                }
             }
         }
 
         val modeText = if (syncMode == SyncMode.MOVE) "moved" else "copied"
-        Log.d(TAG, "Synced album '$albumName': $successCount/${imageUris.size} images $modeText")
-        successCount
+        Log.d(TAG, "Synced album '$albumName': newlySynced=$newlySynced, alreadyExists=$alreadyExists, failed=$failed ($modeText)")
+        
+        // 更新最后一张图片（封面）的 DATE_MODIFIED，确保它在系统相册中显示为封面
+        // 系统相册按 DATE_MODIFIED DESC 选择封面
+        if (imageUris.isNotEmpty()) {
+            val lastFileName = getFileNameFromUri(imageUris.last())
+            if (lastFileName != null) {
+                updateImageDateModified(albumName, lastFileName)
+            }
+        }
+        
+        SyncResultDetail(newlySynced, alreadyExists, failed)
+    }
+    
+    /**
+     * 更新图片的 DATE_MODIFIED 为当前时间
+     * 用于确保封面图片在系统相册中显示正确
+     */
+    private fun updateImageDateModified(albumName: String, fileName: String) {
+        try {
+            val existingUri = findExistingImageInAlbum(albumName, fileName)
+            if (existingUri != null) {
+                val updateValues = ContentValues().apply {
+                    put(MediaStore.Images.Media.DATE_MODIFIED, System.currentTimeMillis() / 1000)
+                }
+                val updated = contentResolver.update(existingUri, updateValues, null, null)
+                if (updated > 0) {
+                    Log.d(TAG, "Updated DATE_MODIFIED for cover image: $fileName")
+                }
+            }
+        } catch (e: Exception) {
+            // 更新失败不影响同步结果，只记录日志
+            Log.w(TAG, "Failed to update DATE_MODIFIED for cover image: $fileName", e)
+        }
     }
 
     /**

@@ -112,6 +112,35 @@ fun CategorizedAlbumsView(
                         textColor = secondaryTextColor
                     )
                 }
+            } else if (hideHeaders) {
+                // Tabbed视图下使用网格布局（一行两个）
+                val chunkedAlbums = appAlbums.chunked(2)
+                items(chunkedAlbums.size) { rowIndex ->
+                    val rowAlbums = chunkedAlbums[rowIndex]
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        rowAlbums.forEach { album ->
+                            val coverImage = album.coverImageId?.let { imageMap[it] }
+                            AppAlbumGridCard(
+                                album = album,
+                                coverImage = coverImage,
+                                onClick = { onAppAlbumClick(album) },
+                                textColor = textColor,
+                                secondaryTextColor = secondaryTextColor,
+                                isDarkTheme = isDarkTheme,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        // 如果只有一个元素，添加空占位
+                        if (rowAlbums.size == 1) {
+                            Spacer(modifier = Modifier.weight(1f))
+                        }
+                    }
+                }
             } else {
                 item {
                     // 横向滚动的App图集卡片
@@ -312,6 +341,85 @@ private fun AppAlbumCard(
             text = "${album.imageCount} 张",
             color = secondaryTextColor,
             fontSize = 12.sp
+        )
+    }
+}
+
+/**
+ * App图集卡片（网格布局版，一行两个）
+ */
+@Composable
+private fun AppAlbumGridCard(
+    album: Album,
+    coverImage: ImageFile?,
+    onClick: () -> Unit,
+    textColor: Color,
+    secondaryTextColor: Color,
+    isDarkTheme: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = modifier
+            .clickable {
+                HapticFeedback.lightTap(context)
+                onClick()
+            }
+    ) {
+        // 封面 - 使用宽度自适应，保持正方形比例
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(1f)
+                .clip(RoundedCornerShape(16.dp))
+                .background(if (isDarkTheme) Color(0xFF1C1C1E) else Color.White)
+        ) {
+            if (coverImage != null) {
+                AsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(coverImage.uri)
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else {
+                val albumColor = album.color?.let { Color(it) } ?: Color(0xFF7986CB)
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(albumColor.copy(alpha = 0.2f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = album.emoji ?: "📁",
+                        fontSize = 40.sp
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // 名称
+        Text(
+            text = album.name,
+            color = textColor,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center
+        )
+
+        // 数量
+        Text(
+            text = "${album.imageCount} 张",
+            color = secondaryTextColor,
+            fontSize = 13.sp
         )
     }
 }

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/fluid_cloud_container"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content">
+
+    <!-- 流体云主体 - 灵动岛胶囊样式 -->
+    <LinearLayout
+        android:id="@+id/fluid_cloud_pill"
+        android:layout_width="wrap_content"
+        android:layout_height="40dp"
+        android:minWidth="160dp"
+        android:background="@drawable/fluid_cloud_background"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:paddingHorizontal="16dp"
+        android:elevation="12dp">
+
+        <!-- Tabula Logo -->
+        <ImageView
+            android:id="@+id/fluid_cloud_icon"
+            android:layout_width="22dp"
+            android:layout_height="22dp"
+            android:src="@drawable/logo"
+            android:scaleType="centerCrop"
+            android:contentDescription="Tabula" />
+
+        <!-- 分隔线 -->
+        <View
+            android:layout_width="1dp"
+            android:layout_height="16dp"
+            android:layout_marginHorizontal="12dp"
+            android:background="#33FFFFFF" />
+
+        <!-- 剩余数量 -->
+        <TextView
+            android:id="@+id/fluid_cloud_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="剩余 14 张"
+            android:textColor="#FFD700"
+            android:textSize="14sp"
+            android:fontFamily="sans-serif-medium" />
+
+    </LinearLayout>
+
+</FrameLayout>

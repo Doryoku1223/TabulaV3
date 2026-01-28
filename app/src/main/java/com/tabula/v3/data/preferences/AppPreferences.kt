@@ -157,6 +157,27 @@ class AppPreferences(context: Context) {
             prefs.edit().putString(KEY_RECOMMEND_MODE, value.name).apply()
         }
 
+    /**
+     * 上次已知的图片数量（用于小组件检测新增照片）
+     */
+    var lastKnownImageCount: Int
+        get() = prefs.getInt(KEY_LAST_KNOWN_IMAGE_COUNT, 0)
+        set(value) = prefs.edit().putInt(KEY_LAST_KNOWN_IMAGE_COUNT, value).apply()
+
+    /**
+     * 流体云（灵动岛）功能开关
+     */
+    var fluidCloudEnabled: Boolean
+        get() = prefs.getBoolean(KEY_FLUID_CLOUD_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(KEY_FLUID_CLOUD_ENABLED, value).apply()
+
+    /**
+     * 未完成的批次剩余数量（用于流体云显示）
+     */
+    var pendingBatchRemaining: Int
+        get() = prefs.getInt(KEY_PENDING_BATCH_REMAINING, 0)
+        set(value) = prefs.edit().putInt(KEY_PENDING_BATCH_REMAINING, value).apply()
+
     // 照片抽取时间戳和冷却天数记录（用于冷却期逻辑）
     private val pickTimestampsPrefs: SharedPreferences = context.getSharedPreferences(
         PICK_TIMESTAMPS_PREFS_NAME,
@@ -284,11 +305,26 @@ class AppPreferences(context: Context) {
         private const val KEY_TOTAL_REVIEWED = "total_reviewed"
         private const val KEY_TOTAL_DELETED = "total_deleted"
         private const val KEY_RECOMMEND_MODE = "recommend_mode"
+        private const val KEY_LAST_KNOWN_IMAGE_COUNT = "last_known_image_count"
+        private const val KEY_FLUID_CLOUD_ENABLED = "fluid_cloud_enabled"
+        private const val KEY_PENDING_BATCH_REMAINING = "pending_batch_remaining"
 
         private const val PICK_TIMESTAMPS_PREFS_NAME = "tabula_pick_timestamps"
 
         const val DEFAULT_BATCH_SIZE = 15
         val BATCH_SIZE_OPTIONS = listOf(5, 10, 15, 20, 30, 50)
+        
+        @Volatile
+        private var instance: AppPreferences? = null
+        
+        /**
+         * 获取单例实例 (用于小组件等后台服务)
+         */
+        fun getInstance(context: Context): AppPreferences {
+            return instance ?: synchronized(this) {
+                instance ?: AppPreferences(context.applicationContext).also { instance = it }
+            }
+        }
     }
 
     /**

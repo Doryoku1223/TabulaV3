@@ -1,3 +1,11 @@
 <resources>
     <string name="app_name">Tabula</string>
+    <string name="widget_description">显示相册待整理照片数量</string>
+    <string name="widget_name">Tabula 照片整理</string>
+    
+    <!-- App Shortcuts -->
+    <string name="shortcut_widget_short">添加小组件</string>
+    <string name="shortcut_widget_long">添加桌面小组件</string>
+    <string name="shortcut_start_short">开始整理</string>
+    <string name="shortcut_start_long">快速开始整理照片</string>
 </resources>

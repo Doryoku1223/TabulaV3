@@ -2,8 +2,10 @@ package com.tabula.v3.ui.screens
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
@@ -78,7 +80,10 @@ import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.data.preferences.TopBarDisplayMode
 import com.tabula.v3.data.repository.LocalImageRepository
+import androidx.compose.ui.geometry.Offset
+import com.tabula.v3.ui.components.ActionIconButton
 import com.tabula.v3.ui.components.AlbumChips
+import com.tabula.v3.ui.components.AlbumDropTarget
 import com.tabula.v3.ui.components.AlbumChipsEmpty
 import com.tabula.v3.ui.components.AlbumEditDialog
 import com.tabula.v3.ui.components.BatchCompletionScreen
@@ -156,7 +161,9 @@ fun DeckScreen(
     lastAlbumActionName: String? = null,
     // 模式切换
     isAlbumMode: Boolean = false,
-    onModeChange: (Boolean) -> Unit = {}
+    onModeChange: (Boolean) -> Unit = {},
+    // 流体云：批次剩余数量回调
+    onBatchRemainingChange: (Int) -> Unit = {}
 ) {
     val context = LocalContext.current
     val isDarkTheme = LocalIsDarkTheme.current
@@ -179,6 +186,16 @@ fun DeckScreen(
     // 用于异步初始化批次
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     var needsInitialBatch by remember { mutableStateOf(true) }
+    
+    // 监听批次剩余数量变化，通知流体云
+    androidx.compose.runtime.LaunchedEffect(currentBatch, currentIndex, deckState) {
+        val remaining = if (deckState == DeckState.BROWSING && currentBatch.isNotEmpty()) {
+            (currentBatch.size - currentIndex - 1).coerceAtLeast(0)
+        } else {
+            0
+        }
+        onBatchRemainingChange(remaining)
+    }
 
     // 异步初始化批次
     androidx.compose.runtime.LaunchedEffect(allImages, isLoading, needsInitialBatch) {
@@ -426,80 +443,124 @@ private fun DeckContent(
     val hasNext = currentIndex < images.lastIndex
     val remaining = (images.size - currentIndex - 1).coerceAtLeast(0)
     val currentImage = images.getOrNull(currentIndex)
+    
+    // 下滑归类模式状态
+    var isClassifyMode by remember { mutableStateOf(false) }
+    var dragPosition by remember { mutableStateOf<Offset?>(null) }
+    var hoveredAlbum by remember { mutableStateOf<Album?>(null) }
 
-    Column(
+    Box(
         modifier = Modifier
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
     ) {
-        // 顶部栏（显示时间或索引）
-        TopBar(
-            currentIndex = currentIndex,
-            totalCount = images.size,
-            currentImage = currentImage,
-            displayMode = topBarDisplayMode,
-            onTrashClick = onTrashClick,
-            onSettingsClick = onSettingsClick
-        )
-
-        // 卡片堆叠区域
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            contentAlignment = Alignment.Center
+        Column(
+            modifier = Modifier.fillMaxSize()
         ) {
-            if (images.isNotEmpty() && currentIndex < images.size) {
-                SwipeableCardStack(
-                    images = images,
-                    currentIndex = currentIndex,
-                    onIndexChange = onIndexChange,
-                    onRemove = onRemove,
-                    onCardClick = onCardClick,
-                    showHdrBadges = showHdrBadges,
-                    showMotionBadges = showMotionBadges,
-                    enableSwipeHaptics = enableSwipeHaptics,
-                    modifier = Modifier.fillMaxSize()
-                )
+            // 顶部栏（显示时间或索引）
+            TopBar(
+                currentIndex = currentIndex,
+                totalCount = images.size,
+                currentImage = currentImage,
+                displayMode = topBarDisplayMode,
+                onTrashClick = onTrashClick,
+                onSettingsClick = onSettingsClick
+            )
+
+            // 卡片堆叠区域
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                contentAlignment = Alignment.Center
+            ) {
+                if (images.isNotEmpty() && currentIndex < images.size) {
+                    SwipeableCardStack(
+                        images = images,
+                        currentIndex = currentIndex,
+                        onIndexChange = onIndexChange,
+                        onRemove = onRemove,
+                        onCardClick = onCardClick,
+                        showHdrBadges = showHdrBadges,
+                        showMotionBadges = showMotionBadges,
+                        enableSwipeHaptics = enableSwipeHaptics,
+                        modifier = Modifier.fillMaxSize(),
+                        // 下滑归类相关参数
+                        albums = albums,
+                        onClassifyToAlbum = { image, album ->
+                            // 将图片添加到图集
+                            onAlbumClick(album)
+                        },
+                        onCreateNewAlbum = { image ->
+                            // 打开新建图集对话框
+                            onAddAlbumClick()
+                        },
+                        onClassifyModeChange = { mode ->
+                            isClassifyMode = mode
+                        },
+                        onDragPositionChange = { position ->
+                            dragPosition = position
+                        },
+                        onHoveredAlbumChange = { album ->
+                            hoveredAlbum = album
+                        }
+                    )
+                }
+            }
+
+            // 底部剩余提示 (上移至标签上方，设计感优化)
+            // 归类模式下隐藏
+            if (!isClassifyMode) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "${remaining} 张待整理",
+                        style = MaterialTheme.typography.labelMedium.copy(
+                            letterSpacing = 2.sp, // 增加字间距，增加呼吸感
+                            fontWeight = FontWeight.Medium
+                        ),
+                        color = textColor.copy(alpha = 0.5f),
+                        fontSize = 12.sp
+                    )
+                }
+
+                // 相册归类 Chips - 归类模式下隐藏
+                if (albums.isNotEmpty()) {
+                    AlbumChips(
+                        albums = albums,
+                        selectedAlbumIds = currentImageAlbumIds,
+                        onAlbumClick = onAlbumClick,
+                        onAddAlbumClick = onAddAlbumClick,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 80.dp) // 增加底部间距，避免遮挡
+                    )
+                } else {
+                    AlbumChipsEmpty(
+                        onAddAlbumClick = onAddAlbumClick,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 80.dp)
+                    )
+                }
             }
         }
-
-        // 底部剩余提示 (上移至标签上方，设计感优化)
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 8.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                text = "${remaining} 张待整理",
-                style = MaterialTheme.typography.labelMedium.copy(
-                    letterSpacing = 2.sp, // 增加字间距，增加呼吸感
-                    fontWeight = FontWeight.Medium
-                ),
-                color = textColor.copy(alpha = 0.5f),
-                fontSize = 12.sp
-            )
-        }
-
-        // 相册归类 Chips
-        if (albums.isNotEmpty()) {
-            AlbumChips(
+        
+        // 下滑归类模式下显示标签选择器
+        if (isClassifyMode) {
+            AlbumDropTarget(
                 albums = albums,
-                selectedAlbumIds = currentImageAlbumIds,
-                onAlbumClick = onAlbumClick,
-                onAddAlbumClick = onAddAlbumClick,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 80.dp) // 增加底部间距，避免遮挡
-            )
-        } else {
-            AlbumChipsEmpty(
-                onAddAlbumClick = onAddAlbumClick,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 80.dp)
+                dragPosition = dragPosition,
+                isDragging = isClassifyMode,
+                onHoveredAlbumChange = { album ->
+                    hoveredAlbum = album
+                },
+                modifier = Modifier.align(Alignment.BottomCenter)
             )
         }
     }
@@ -652,10 +713,25 @@ private fun AlbumsGridContent(
     val topBarVisibleHeight = if (topBarHeight > 0.dp) {
         topBarHeight
     } else {
-        136.dp
+        // 默认高度，状态栏+标题栏
+        100.dp
     }
 
-    val contentTopPadding = topBarVisibleHeight + if (isTabbedView) 36.dp else 24.dp
+    // 减少间距以紧凑显示
+    val contentTopPadding = topBarVisibleHeight + if (isTabbedView) 12.dp else 8.dp
+    // Tab切换器配置
+    val tabSegmentWidth = 100.dp
+    
+    // 滑块动画 - 使用Spring动画实现弹性效果
+    val tabSliderOffset by animateDpAsState(
+        targetValue = if (selectedTab == 0) 0.dp else tabSegmentWidth,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMedium
+        ),
+        label = "tab_slider_offset"
+    )
+    
     val tabSwitcher: (@Composable () -> Unit)? = if (isTabbedView) {
         {
             Row(
@@ -667,21 +743,36 @@ private fun AlbumsGridContent(
                     modifier = Modifier
                         .clip(RoundedCornerShape(100))
                         .background(if (isDarkTheme) Color(0xFF2C2C2E) else Color(0xFFE5E5EA))
-                        .padding(2.dp)
+                        .padding(2.dp),
+                    contentAlignment = Alignment.CenterStart
                 ) {
+                    // 滑块背景 - 带弹性动画
+                    Box(
+                        modifier = Modifier
+                            .offset(x = tabSliderOffset)
+                            .width(tabSegmentWidth)
+                            .clip(RoundedCornerShape(100))
+                            .background(
+                                if (isDarkTheme) Color(0xFF636366) else Color.White
+                            )
+                            .shadow(
+                                elevation = 2.dp,
+                                shape = RoundedCornerShape(100),
+                                spotColor = Color.Black.copy(alpha = 0.1f)
+                            )
+                            .padding(vertical = 6.dp)
+                    ) {
+                        // 占位文本保持高度一致
+                        Text(text = " ", fontSize = 14.sp)
+                    }
+                    
+                    // 按钮区域
                     Row {
-    // TODO
+                        // App图集按钮
                         Box(
                             modifier = Modifier
-                                .width(100.dp)
+                                .width(tabSegmentWidth)
                                 .clip(RoundedCornerShape(100))
-                                .background(
-                                    if (selectedTab == 0) {
-                                        if (isDarkTheme) Color(0xFF636366) else Color.White
-                                    } else {
-                                        Color.Transparent
-                                    }
-                                )
                                 .clickable {
                                     com.tabula.v3.ui.util.HapticFeedback.lightTap(context)
                                     selectedTab = 0
@@ -697,18 +788,11 @@ private fun AlbumsGridContent(
                             )
                         }
 
-    // TODO
+                        // 手机相册按钮
                         Box(
                             modifier = Modifier
-                                .width(100.dp)
+                                .width(tabSegmentWidth)
                                 .clip(RoundedCornerShape(100))
-                                .background(
-                                    if (selectedTab == 1) {
-                                        if (isDarkTheme) Color(0xFF636366) else Color.White
-                                    } else {
-                                        Color.Transparent
-                                    }
-                                )
                                 .clickable {
                                     com.tabula.v3.ui.util.HapticFeedback.lightTap(context)
                                     selectedTab = 1
@@ -814,15 +898,15 @@ private fun AlbumsGridContent(
                 modifier = Modifier
                     .fillMaxWidth()
                     .statusBarsPadding()
-                    .padding(bottom = 14.dp)
+                    .padding(bottom = 8.dp)
             ) {
-    // TODO
+                // 顶部栏内容 - 与照片界面保持一致的padding
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 12.dp, start = 20.dp, end = 16.dp)
+                        .padding(top = 12.dp, start = 20.dp, end = 20.dp)
                 ) {
-    // TODO
+                    // 标题
                     Text(
                         text = "图集",
                         color = textColor,
@@ -831,57 +915,51 @@ private fun AlbumsGridContent(
                         modifier = Modifier.align(Alignment.CenterStart)
                     )
                     
-    // TODO
+                    // 右侧图标按钮组 - 使用统一的ActionIconButton样式
+                    val buttonBgColor = if (isDarkTheme) TabulaColors.CatBlackLight else Color.White
+                    val buttonIconColor = if (isDarkTheme) Color.White else TabulaColors.CatBlack
+                    
                     Row(
                         modifier = Modifier
                             .align(Alignment.CenterEnd),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-    // TODO
-                        IconButton(
+                        // 切换视图按钮
+                        ActionIconButton(
+                            icon = if (isTabbedView) Icons.Rounded.ViewModule else Icons.Rounded.ViewList,
+                            contentDescription = "切换视图",
                             onClick = {
                                 com.tabula.v3.ui.util.HapticFeedback.lightTap(context)
                                 isTabbedView = !isTabbedView
-                            }
-                        ) {
-                            Icon(
-                                imageVector = if (isTabbedView) Icons.Rounded.ViewModule else Icons.Rounded.ViewList,
-                                contentDescription = "切换视图",
-                                tint = textColor,
-                                modifier = Modifier.size(24.dp)
-                            )
-                        }
+                            },
+                            backgroundColor = buttonBgColor,
+                            iconColor = buttonIconColor
+                        )
                         
-    // TODO
-                        IconButton(
+                        // 同步按钮
+                        ActionIconButton(
+                            icon = Icons.Outlined.Sync,
+                            contentDescription = "同步到相册",
                             onClick = {
                                 com.tabula.v3.ui.util.HapticFeedback.lightTap(context)
                                 onSyncClick()
-                            }
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Sync,
-                                contentDescription = "同步到相册",
-                                tint = textColor,
-                                modifier = Modifier.size(24.dp)
-                            )
-                        }
+                            },
+                            backgroundColor = buttonBgColor,
+                            iconColor = buttonIconColor
+                        )
                         
-    // TODO
-                        IconButton(
+                        // 设置按钮
+                        ActionIconButton(
+                            icon = Icons.Outlined.Settings,
+                            contentDescription = "设置",
                             onClick = {
                                 com.tabula.v3.ui.util.HapticFeedback.lightTap(context)
                                 onSettingsClick()
-                            }
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Settings,
-                                contentDescription = "设置",
-                                tint = textColor,
-                                modifier = Modifier.size(24.dp)
-                            )
-                        }
+                            },
+                            backgroundColor = buttonBgColor,
+                            iconColor = buttonIconColor
+                        )
                     }
                 }
             }

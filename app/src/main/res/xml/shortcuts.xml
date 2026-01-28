@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 快速开始整理 -->
+    <shortcut
+        android:shortcutId="quick_start"
+        android:enabled="true"
+        android:icon="@drawable/ic_quick_start"
+        android:shortcutShortLabel="@string/shortcut_start_short"
+        android:shortcutLongLabel="@string/shortcut_start_long">
+        <intent
+            android:action="android.intent.action.MAIN"
+            android:targetPackage="com.tabula.v3"
+            android:targetClass="com.tabula.v3.MainActivity" />
+    </shortcut>
+
+</shortcuts>

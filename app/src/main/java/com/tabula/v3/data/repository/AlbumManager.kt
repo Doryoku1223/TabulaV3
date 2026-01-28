@@ -410,7 +410,8 @@ class AlbumManager(private val context: Context) {
         if (imageUris.isEmpty()) return@withContext 0
 
         Log.d(TAG, "Syncing ${imageUris.size} images to system album: ${album.name} (mode: ${album.syncMode})")
-        syncManager.syncAlbumToSystem(album.name, imageUris, album.syncMode, onProgress)
+        val result = syncManager.syncAlbumToSystem(album.name, imageUris, album.syncMode, onProgress)
+        result.newlySynced  // 返回新同步的图片数量
     }
 
     /**
@@ -419,18 +420,29 @@ class AlbumManager(private val context: Context) {
     data class SyncResult(
         val successCount: Int,
         val totalAlbums: Int,
-        val syncedImages: Int,
+        val newlySyncedImages: Int,    // 新同步的图片总数
+        val skippedImages: Int,         // 已存在跳过的图片总数
         val albumResults: List<AlbumSyncResult>
-    )
+    ) {
+        // 兼容旧的 syncedImages 属性
+        val syncedImages get() = newlySyncedImages
+    }
 
     data class AlbumSyncResult(
         val albumName: String,
-        val imagesSynced: Int,
+        val newlySynced: Int,    // 新同步的图片数
+        val skipped: Int,        // 已存在跳过的图片数
         val success: Boolean
-    )
+    ) {
+        // 兼容旧的 imagesSynced 属性
+        val imagesSynced get() = newlySynced
+    }
 
     /**
-     * 同步所有启用同步的图集到系统相册
+     * 同步所有有图片的图集到系统相册
+     * 注意：现在同步所有有图片的图集，不再依赖 isSyncEnabled 标志
+     * isSyncEnabled 标志改为控制"实时自动同步"（添加图片时自动同步）
+     * 
      * @param onProgress 进度回调，参数为 (当前图集索引, 总图集数, 当前图集已同步图片数, 当前图集总图片数)
      * @return 同步结果
      */
@@ -438,67 +450,91 @@ class AlbumManager(private val context: Context) {
         onProgress: ((albumIndex: Int, totalAlbums: Int, currentImages: Int, totalImages: Int) -> Unit)? = null
     ): SyncResult = withContext(Dispatchers.IO) {
         val allAlbums = loadAlbums()
-        val enabledAlbums = allAlbums.filter { it.isSyncEnabled }
+        // 同步所有有图片的图集（不再限制 isSyncEnabled）
+        val albumsWithImages = allAlbums.filter { it.imageCount > 0 }
         
-        if (enabledAlbums.isEmpty()) {
-            Log.d(TAG, "No albums enabled for sync")
-            return@withContext SyncResult(0, 0, 0, emptyList())
+        // #region agent log
+        Log.d("DEBUG_SYNC", "[A1,A2,B1] syncAllEnabledAlbumsToSystem:entry | albumsWithImagesCount=${albumsWithImages.size} | albumNames=${albumsWithImages.map { it.name }} | albumCoverIds=${albumsWithImages.map { "${it.name}:${it.coverImageId}" }}")
+        // #endregion
+        
+        if (albumsWithImages.isEmpty()) {
+            Log.d(TAG, "No albums with images to sync")
+            return@withContext SyncResult(0, 0, 0, 0, emptyList())
         }
 
-        Log.d(TAG, "Starting sync for ${enabledAlbums.size} albums")
+        Log.d(TAG, "Starting sync for ${albumsWithImages.size} albums")
         
         val albumResults = mutableListOf<AlbumSyncResult>()
         var totalSyncedImages = 0
+        var totalSkippedImages = 0
         var successCount = 0
 
-        enabledAlbums.forEachIndexed { index, album ->
+        albumsWithImages.forEachIndexed { index, album ->
             try {
                 val imageIds = getImageIdsForAlbum(album.id)
                 val mappings = loadMappings()
-                val imageUris = imageIds.mapNotNull { imageId ->
+                
+                // 确保封面图片排在最后同步，这样它的 DATE_MODIFIED 最新
+                // 系统相册按 DATE_MODIFIED DESC 选择封面，所以最后同步的图片会成为封面
+                val sortedImageIds = if (album.coverImageId != null && imageIds.contains(album.coverImageId)) {
+                    imageIds.filter { it != album.coverImageId } + listOf(album.coverImageId)
+                } else {
+                    imageIds
+                }
+                
+                val imageUris = sortedImageIds.mapNotNull { imageId ->
                     mappings.find { it.imageId == imageId }?.imageUri?.let { Uri.parse(it) }
                 }
 
+                // #region agent log
+                Log.d("DEBUG_SYNC", "[A2,A3,B1] Processing album | name=${album.name} | coverImageId=${album.coverImageId} | imageIds=$sortedImageIds | imageUrisCount=${imageUris.size} | firstImageUri=${imageUris.firstOrNull()}")
+                // #endregion
+
                 if (imageUris.isEmpty()) {
                     Log.d(TAG, "Album '${album.name}' has no images to sync")
-                    albumResults.add(AlbumSyncResult(album.name, 0, true))
+                    albumResults.add(AlbumSyncResult(album.name, 0, 0, true))
                     successCount++
-                    onProgress?.invoke(index + 1, enabledAlbums.size, 0, 0)
+                    onProgress?.invoke(index + 1, albumsWithImages.size, 0, 0)
                     return@forEachIndexed
                 }
 
-                // 确保系统相册文件夹存在
+                // 确保系统相册文件夹存在（为所有图集创建，不限于 isSyncEnabled）
                 if (album.systemAlbumPath.isNullOrBlank()) {
                     val systemPath = syncManager.createSystemAlbum(album.name)
                     if (systemPath != null) {
-                        val updatedAlbum = album.copy(systemAlbumPath = systemPath)
+                        val updatedAlbum = album.copy(systemAlbumPath = systemPath, isSyncEnabled = true)
                         updateAlbum(updatedAlbum)
                     }
                 }
 
                 Log.d(TAG, "Syncing album '${album.name}' with ${imageUris.size} images")
                 
-                val syncedCount = syncManager.syncAlbumToSystem(
+                val syncResult = syncManager.syncAlbumToSystem(
                     album.name, 
                     imageUris, 
                     album.syncMode
                 ) { current, total ->
-                    onProgress?.invoke(index + 1, enabledAlbums.size, current, total)
+                    onProgress?.invoke(index + 1, albumsWithImages.size, current, total)
                 }
                 
-                totalSyncedImages += syncedCount
-                albumResults.add(AlbumSyncResult(album.name, syncedCount, true))
+                // #region agent log
+                Log.d("DEBUG_SYNC", "[B1,B2] Album sync completed | albumName=${album.name} | newlySynced=${syncResult.newlySynced} | alreadyExists=${syncResult.alreadyExists} | totalImages=${imageUris.size}")
+                // #endregion
+                
+                totalSyncedImages += syncResult.newlySynced
+                totalSkippedImages += syncResult.alreadyExists
+                albumResults.add(AlbumSyncResult(album.name, syncResult.newlySynced, syncResult.alreadyExists, true))
                 successCount++
                 
-                Log.d(TAG, "Successfully synced ${syncedCount} images to album '${album.name}'")
+                Log.d(TAG, "Successfully synced album '${album.name}': ${syncResult.newlySynced} new, ${syncResult.alreadyExists} skipped")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to sync album '${album.name}'", e)
-                albumResults.add(AlbumSyncResult(album.name, 0, false))
+                albumResults.add(AlbumSyncResult(album.name, 0, 0, false))
             }
         }
 
-        Log.d(TAG, "Sync completed: $successCount/${enabledAlbums.size} albums, $totalSyncedImages images")
-        SyncResult(successCount, enabledAlbums.size, totalSyncedImages, albumResults)
+        Log.d(TAG, "Sync completed: $successCount/${albumsWithImages.size} albums, $totalSyncedImages new, $totalSkippedImages skipped")
+        SyncResult(successCount, albumsWithImages.size, totalSyncedImages, totalSkippedImages, albumResults)
     }
 
     /**
