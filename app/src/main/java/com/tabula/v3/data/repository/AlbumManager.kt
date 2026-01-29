@@ -187,8 +187,9 @@ class AlbumManager(private val context: Context) {
         // 更新相册图片数量和封面
         updateAlbumStats(albumId)
 
-        // 同步到系统相册（如果开启）
-        syncImageToSystemIfEnabled(imageUri, albumId)
+        // 注意：不再自动同步到系统相册
+        // 用户需要手动点击同步按钮来同步图片到手机相册
+        // 这样可以避免每次添加图片都立即出现在微信等应用的最近照片中
 
         // 记录撤销操作
         if (recordUndo) {
@@ -499,10 +500,11 @@ class AlbumManager(private val context: Context) {
                 }
 
                 // 确保系统相册文件夹存在（为所有图集创建，不限于 isSyncEnabled）
+                // 注意：不再自动设置 isSyncEnabled = true，避免后续添加图片时自动同步
                 if (album.systemAlbumPath.isNullOrBlank()) {
                     val systemPath = syncManager.createSystemAlbum(album.name)
                     if (systemPath != null) {
-                        val updatedAlbum = album.copy(systemAlbumPath = systemPath, isSyncEnabled = true)
+                        val updatedAlbum = album.copy(systemAlbumPath = systemPath)
                         updateAlbum(updatedAlbum)
                     }
                 }

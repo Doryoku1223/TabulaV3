@@ -35,11 +35,17 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import android.graphics.Bitmap
+import coil.imageLoader
+import coil.request.ImageRequest
+import coil.request.SuccessResult
 import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.ui.util.HapticFeedback
 import com.tabula.v3.ui.util.rememberImageFeatures
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.pow
 
@@ -111,8 +117,9 @@ fun SwipeableCardStack(
     onCreateNewAlbum: ((ImageFile) -> Unit)? = null,
     // 归类模式状态回调
     onClassifyModeChange: ((Boolean) -> Unit)? = null,
-    onDragPositionChange: ((Offset?) -> Unit)? = null,
-    onHoveredAlbumChange: ((Album?) -> Unit)? = null
+    onSelectedIndexChange: ((Int) -> Unit)? = null,
+    // 标签位置映射（索引 -> 屏幕坐标）
+    tagPositions: Map<Int, Rect> = emptyMap()
 ) {
     if (images.isEmpty()) return
 
@@ -132,11 +139,13 @@ fun SwipeableCardStack(
     val swipeThresholdPx = screenWidthPx * 0.25f
     val velocityThreshold = 800f
     val deleteThresholdPx = screenHeightPx * 0.15f
-    val classifyThresholdPx = screenHeightPx * 0.12f  // 下滑归类阈值
+    val classifyThresholdPx = screenHeightPx * 0.05f  // 下滑归类阈值（约40-50px）
+    val classifyExitThresholdPx = screenHeightPx * 0.03f  // 退出归类模式的阈值
+    val tagSwitchDistancePx = with(density) { 18.dp.toPx() }  // 切换标签的拖动距离（更灵敏）
 
     // 动画时长
     val shuffleAnimDuration = 120
-    val genieAnimDuration = 500  // Genie动画时长
+    val genieAnimDuration = 380  // Genie动画时长（与GenieAnimationController同步）
 
     // ========== 顶层卡片拖拽状态 ==========
     val dragOffsetX = remember { Animatable(0f) }
@@ -155,9 +164,12 @@ fun SwipeableCardStack(
     
     // 归类模式状态
     var isClassifyMode by remember { mutableStateOf(false) }
-    var currentDragPosition by remember { mutableStateOf<Offset?>(null) }
-    var hoveredAlbum by remember { mutableStateOf<Album?>(null) }
-    var targetAlbumBounds by remember { mutableStateOf<Rect?>(null) }
+    var selectedAlbumIndex by remember { mutableIntStateOf(0) }
+    var classifyStartX by remember { mutableFloatStateOf(0f) }  // 进入归类模式时的X位置
+    var lastSelectedIndex by remember { mutableIntStateOf(-1) }  // 上次选中的索引，用于触发振动
+
+    // ========== Genie动画状态 ==========
+    val genieController = rememberGenieAnimationController()
 
     // ========== 背景卡片呼吸感响应 ==========
     var breathScale by remember { mutableFloatStateOf(0f) }
@@ -168,6 +180,9 @@ fun SwipeableCardStack(
 
     // ========== 卡片位置记录（用于容器变换）==========
     var topCardBounds by remember { mutableStateOf(Rect.Zero) }
+    
+    // ========== Box容器位置记录（用于坐标转换）==========
+    var containerBounds by remember { mutableStateOf(Rect.Zero) }
 
     // 获取三张卡的数据
     val currentImage = images.getOrNull(currentIndex)
@@ -195,12 +210,10 @@ fun SwipeableCardStack(
         
         // 重置归类模式
         isClassifyMode = false
-        currentDragPosition = null
-        hoveredAlbum = null
-        targetAlbumBounds = null
+        selectedAlbumIndex = 0
+        classifyStartX = 0f
+        lastSelectedIndex = -1
         onClassifyModeChange?.invoke(false)
-        onDragPositionChange?.invoke(null)
-        onHoveredAlbumChange?.invoke(null)
     }
 
     /**
@@ -360,120 +373,130 @@ fun SwipeableCardStack(
     }
 
     /**
-     * 执行归类动画 - macOS Genie 收缩效果
+     * 执行归类动画 - macOS Genie 液体吸入效果
      * 
-     * 模拟macOS最小化时的布料收缩效果：
-     * 1. 阶段一：卡片向下移动并开始缩放
-     * 2. 阶段二：沿贝塞尔曲线收缩到目标位置
-     * 3. 阶段三：最终缩小并淡出
+     * 使用Canvas.drawBitmapMesh实现真正的网格变形效果：
+     * 图像底部收缩为一个点，呈现漏斗状并带有S形弯曲
      * 
-     * @param targetAlbum 目标图集
-     * @param targetBounds 目标位置边界
+     * @param targetIndex 目标标签索引
      */
-    suspend fun executeGenieAnimation(targetAlbum: Album?, targetBounds: Rect?) {
+    suspend fun executeGenieAnimation(targetIndex: Int) {
         val currentImg = currentImage ?: return
+        
+        // 获取目标相册
+        val targetAlbum = if (targetIndex < albums.size) albums[targetIndex] else null
+        val isCreateNew = targetIndex >= albums.size
         
         // 触发震动反馈
         if (enableSwipeHaptics) {
             HapticFeedback.heavyTap(context)
         }
         
+        // 使用实际测量的标签位置
+        val tagBounds = tagPositions[targetIndex]
+        
         // 计算目标位置
-        val targetCenterX = targetBounds?.center?.x ?: (screenWidthPx / 2f)
-        val targetCenterY = targetBounds?.center?.y ?: screenHeightPx
+        // 重要：需要将绝对坐标（boundsInRoot）转换为相对于容器的坐标
+        val targetCenterX: Float
+        val targetCenterY: Float
         
-        // 当前卡片中心
-        val cardCenterX = topCardBounds.center.x
-        val cardCenterY = topCardBounds.center.y
-        
-        // 计算偏移量
-        val finalOffsetX = targetCenterX - cardCenterX
-        val finalOffsetY = targetCenterY - cardCenterY
-        
-        // 贝塞尔曲线控制点（模拟Genie弯曲效果）
-        val controlPointY = cardCenterY + (finalOffsetY * 0.3f)
-        
-        // 缓动曲线 - 自定义贝塞尔实现更自然的收缩感
-        val genieEasing = CubicBezierEasing(0.2f, 0.8f, 0.2f, 1f)
-        
-        // 阶段一：向下移动 + 轻微缩放 (0-30%)
-        val phase1Duration = (genieAnimDuration * 0.3).toInt()
-        scope.launch {
-            dragOffsetY.animateTo(
-                finalOffsetY * 0.3f,
-                tween(phase1Duration, easing = genieEasing)
-            )
-        }
-        scope.launch {
-            dragScale.animateTo(
-                0.85f,
-                tween(phase1Duration, easing = genieEasing)
-            )
-        }
-        scope.launch {
-            // 轻微旋转增加动感
-            dragRotation.animateTo(
-                5f,
-                tween(phase1Duration, easing = genieEasing)
-            )
-        }
-        
-        kotlinx.coroutines.delay(phase1Duration.toLong())
-        
-        // 阶段二：沿曲线收缩到目标 (30-80%)
-        val phase2Duration = (genieAnimDuration * 0.5).toInt()
-        scope.launch {
-            dragOffsetX.animateTo(
-                finalOffsetX,
-                tween(phase2Duration, easing = genieEasing)
-            )
-        }
-        scope.launch {
-            dragOffsetY.animateTo(
-                finalOffsetY,
-                tween(phase2Duration, easing = genieEasing)
-            )
-        }
-        scope.launch {
-            // 主要缩放阶段
-            dragScale.animateTo(
-                0.15f,
-                tween(phase2Duration, easing = genieEasing)
-            )
-        }
-        scope.launch {
-            // 旋转复位
-            dragRotation.animateTo(
-                0f,
-                tween(phase2Duration, easing = genieEasing)
-            )
-        }
-        
-        kotlinx.coroutines.delay((phase2Duration * 0.6).toLong())
-        
-        // 阶段三：最终收缩 + 淡出 (80-100%)
-        val phase3Duration = (genieAnimDuration * 0.2).toInt()
-        scope.launch {
-            dragScale.animateTo(
-                0.05f,
-                tween(phase3Duration, easing = CubicBezierEasing(0.4f, 0f, 1f, 1f))
-            )
-        }
-        scope.launch {
-            dragAlpha.animateTo(
-                0f,
-                tween(phase3Duration, easing = CubicBezierEasing(0.4f, 0f, 1f, 1f))
-            )
-        }
-        
-        kotlinx.coroutines.delay(phase3Duration.toLong())
-        
-        // 执行归类回调
-        if (targetAlbum != null) {
-            onClassifyToAlbum?.invoke(currentImg, targetAlbum)
+        if (tagBounds != null && tagBounds != Rect.Zero && containerBounds != Rect.Zero) {
+            // 使用标签上边的中点作为目标位置（更符合视觉效果）
+            // 将绝对坐标转换为相对于容器的坐标
+            targetCenterX = tagBounds.center.x - containerBounds.left
+            targetCenterY = tagBounds.top - containerBounds.top  // 上边的Y坐标
         } else {
-            // 新建图集
-            onCreateNewAlbum?.invoke(currentImg)
+            // 回退到估算值（仅在无法获取实际位置时使用）
+            val tagEstimatedWidth = with(density) { 65.dp.toPx() }
+            val tagSpacing = with(density) { 12.dp.toPx() }
+            val listPadding = with(density) { 24.dp.toPx() }
+            val tagsStartX = listPadding
+            targetCenterX = tagsStartX + targetIndex * (tagEstimatedWidth + tagSpacing) + tagEstimatedWidth / 2f
+            // 回退时使用容器底部作为目标
+            targetCenterY = containerBounds.height - with(density) { 80.dp.toPx() }
+        }
+        
+        // 加载当前图片的缩略图用于Genie效果
+        // 使用较小的尺寸以提高加载速度（最大 300px）
+        val maxSize = 300
+        val scale = minOf(maxSize / topCardBounds.width, maxSize / topCardBounds.height, 1f)
+        val bitmapWidth = (topCardBounds.width * scale).toInt().coerceAtLeast(50)
+        val bitmapHeight = (topCardBounds.height * scale).toInt().coerceAtLeast(50)
+        
+        // 优先使用 Coil 缓存（图片已被 ImageCard 显示过，应该在缓存中）
+        val bitmap = try {
+            val request = ImageRequest.Builder(context)
+                .data(currentImg.uri)
+                .size(bitmapWidth, bitmapHeight)
+                .allowHardware(false)  // 需要软件 bitmap 才能用于 Canvas
+                .build()
+            
+            val result = context.imageLoader.execute(request)
+            if (result is SuccessResult) {
+                (result.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
+            } else {
+                // 回退到直接加载
+                withContext(Dispatchers.IO) {
+                    createGenieBitmap(context, currentImg.uri, bitmapWidth, bitmapHeight)
+                }
+            }
+        } catch (e: Exception) {
+            // 回退到直接加载
+            withContext(Dispatchers.IO) {
+                createGenieBitmap(context, currentImg.uri, bitmapWidth, bitmapHeight)
+            }
+        }
+        
+        // 将卡片的绝对坐标转换为相对于容器的坐标
+        val relativeSourceBounds = if (containerBounds != Rect.Zero) {
+            Rect(
+                left = topCardBounds.left - containerBounds.left,
+                top = topCardBounds.top - containerBounds.top,
+                right = topCardBounds.right - containerBounds.left,
+                bottom = topCardBounds.bottom - containerBounds.top
+            )
+        } else {
+            topCardBounds
+        }
+        
+        if (bitmap != null) {
+            // 隐藏原始卡片
+            dragAlpha.snapTo(0f)
+            
+            // 启动Genie网格变形动画
+            genieController.startAnimation(
+                bitmap = bitmap,
+                sourceBounds = relativeSourceBounds,
+                targetX = targetCenterX,
+                targetY = targetCenterY,
+                screenHeight = screenHeightPx,
+                durationMs = genieAnimDuration,
+                onComplete = {
+                    // 执行归类回调
+                    if (!isCreateNew && targetAlbum != null) {
+                        onClassifyToAlbum?.invoke(currentImg, targetAlbum)
+                    } else {
+                        onCreateNewAlbum?.invoke(currentImg)
+                    }
+                }
+            )
+        } else {
+            // 如果加载Bitmap失败，使用简单的缩放淡出动画作为fallback
+            val finalOffsetX = targetCenterX - topCardBounds.center.x
+            val finalOffsetY = targetCenterY - topCardBounds.center.y
+            
+            scope.launch { dragOffsetX.animateTo(finalOffsetX, tween(genieAnimDuration)) }
+            scope.launch { dragOffsetY.animateTo(finalOffsetY, tween(genieAnimDuration)) }
+            scope.launch { dragScale.animateTo(0.05f, tween(genieAnimDuration)) }
+            scope.launch { dragAlpha.animateTo(0f, tween(genieAnimDuration)) }
+            
+            kotlinx.coroutines.delay(genieAnimDuration.toLong())
+            
+            if (!isCreateNew && targetAlbum != null) {
+                onClassifyToAlbum?.invoke(currentImg, targetAlbum)
+            } else {
+                onCreateNewAlbum?.invoke(currentImg)
+            }
         }
         
         // 重置状态
@@ -485,18 +508,19 @@ fun SwipeableCardStack(
         lockedDirection = SwipeDirection.NONE
         breathScale = 0f
         isClassifyMode = false
-        currentDragPosition = null
-        hoveredAlbum = null
-        targetAlbumBounds = null
+        selectedAlbumIndex = 0
+        classifyStartX = 0f
+        lastSelectedIndex = -1
         onClassifyModeChange?.invoke(false)
-        onDragPositionChange?.invoke(null)
-        onHoveredAlbumChange?.invoke(null)
     }
 
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 24.dp, vertical = 16.dp),
+            .padding(horizontal = 24.dp, vertical = 16.dp)
+            .onGloballyPositioned { coordinates ->
+                containerBounds = coordinates.boundsInRoot()
+            },
         contentAlignment = Alignment.Center
     ) {
         // ========== 底层卡片 (Prev) ==========
@@ -665,32 +689,58 @@ fun SwipeableCardStack(
                                                 // 下滑归类模式
                                                 val newY = (dragOffsetY.value + dragAmount.y).coerceAtLeast(0f)
                                                 dragOffsetY.snapTo(newY)
-                                                dragOffsetX.snapTo(dragOffsetX.value + dragAmount.x * 0.5f)
+                                                dragOffsetX.snapTo(dragOffsetX.value + dragAmount.x * 0.7f)
                                                 
                                                 // 进入归类模式
                                                 if (newY > classifyThresholdPx && !isClassifyMode) {
                                                     isClassifyMode = true
+                                                    classifyStartX = dragOffsetX.value  // 记录进入归类模式时的X位置
+                                                    selectedAlbumIndex = 0  // 默认选中第一个
+                                                    lastSelectedIndex = 0
                                                     onClassifyModeChange?.invoke(true)
-                                                    if (enableSwipeHaptics && !classifyThresholdHapticTriggered) {
+                                                    onSelectedIndexChange?.invoke(0)
+                                                    if (enableSwipeHaptics) {
                                                         classifyThresholdHapticTriggered = true
                                                         HapticFeedback.mediumTap(context)
                                                     }
                                                 }
                                                 
-                                                // 更新拖拽位置（用于标签选择器检测悬停）
-                                                if (isClassifyMode) {
-                                                    // 计算实际屏幕位置
-                                                    val screenPosition = Offset(
-                                                        topCardBounds.center.x + dragOffsetX.value,
-                                                        topCardBounds.center.y + dragOffsetY.value
-                                                    )
-                                                    currentDragPosition = screenPosition
-                                                    onDragPositionChange?.invoke(screenPosition)
+                                                // 允许用户向上拖动取消归类模式
+                                                if (isClassifyMode && newY < classifyExitThresholdPx) {
+                                                    isClassifyMode = false
+                                                    classifyThresholdHapticTriggered = false
+                                                    selectedAlbumIndex = 0
+                                                    lastSelectedIndex = -1
+                                                    onClassifyModeChange?.invoke(false)
+                                                    if (enableSwipeHaptics) {
+                                                        HapticFeedback.lightTap(context)
+                                                    }
+                                                }
+                                                
+                                                // 归类模式下，根据X方向拖动切换标签
+                                                if (isClassifyMode && albums.isNotEmpty()) {
+                                                    // 计算相对于进入归类模式时的X偏移
+                                                    val relativeX = dragOffsetX.value - classifyStartX
+                                                    // 每移动一定距离切换一个标签
+                                                    val indexOffset = (relativeX / tagSwitchDistancePx).toInt()
+                                                    // 计算新的选中索引（包括"新建"选项）
+                                                    val maxIndex = albums.size  // 最后一个是"新建"
+                                                    val newIndex = (0 + indexOffset).coerceIn(0, maxIndex)
+                                                    
+                                                    if (newIndex != selectedAlbumIndex) {
+                                                        selectedAlbumIndex = newIndex
+                                                        onSelectedIndexChange?.invoke(newIndex)
+                                                        // 切换标签时触发振动
+                                                        if (enableSwipeHaptics && newIndex != lastSelectedIndex) {
+                                                            lastSelectedIndex = newIndex
+                                                            HapticFeedback.lightTap(context)
+                                                        }
+                                                    }
                                                 }
                                                 
                                                 // 轻微缩放效果
-                                                val scaleProgress = (newY / (screenHeightPx * 0.3f)).coerceIn(0f, 1f)
-                                                dragScale.snapTo(1f - scaleProgress * 0.15f)
+                                                val scaleProgress = (newY / (screenHeightPx * 0.2f)).coerceIn(0f, 1f)
+                                                dragScale.snapTo(1f - scaleProgress * 0.1f)
                                             }
                                             SwipeDirection.HORIZONTAL -> {
                                                 val newX = dragOffsetX.value + dragAmount.x
@@ -735,17 +785,9 @@ fun SwipeableCardStack(
                                             }
                                             SwipeDirection.DOWN -> {
                                                 // 下滑归类处理
-                                                if (isClassifyMode && hoveredAlbum != null) {
-                                                    // 有选中的图集，执行Genie动画
-                                                    executeGenieAnimation(hoveredAlbum, targetAlbumBounds)
-                                                } else if (isClassifyMode && currentDragPosition != null) {
-                                                    // 可能选中了"新建"，检查是否在新建区域
-                                                    // 这里简化处理，如果拖到底部足够远就触发新建
-                                                    if (dragOffsetY.value > screenHeightPx * 0.4f) {
-                                                        executeGenieAnimation(null, null)
-                                                    } else {
-                                                        resetDragState()
-                                                    }
+                                                if (isClassifyMode) {
+                                                    // 执行Genie动画，归类到选中的标签
+                                                    executeGenieAnimation(selectedAlbumIndex)
                                                 } else {
                                                     resetDragState()
                                                 }
@@ -793,6 +835,19 @@ fun SwipeableCardStack(
                     badges = rememberImageBadges(currentImage, showHdrBadges, showMotionBadges)
                 )
             }
+        }
+        
+        // ========== Genie Effect 覆盖层 ==========
+        if (genieController.isAnimating) {
+            GenieEffectOverlay(
+                bitmap = genieController.bitmap,
+                sourceBounds = genieController.sourceBounds,
+                targetX = genieController.targetX,
+                targetY = genieController.targetY,
+                progress = genieController.progress,
+                screenHeight = genieController.screenHeight,
+                modifier = Modifier.zIndex(10f)
+            )
         }
     }
 }

@@ -65,6 +65,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
@@ -351,24 +352,31 @@ fun DeckScreen(
                             }
                         },
                         onAddAlbumClick = { showCreateAlbumDialog = true },
-                        onAlbumsClick = onNavigateToAlbums
+                        onAlbumsClick = onNavigateToAlbums,
+                        isAlbumMode = isAlbumMode,
+                        onModeChange = onModeChange
                     )
                 }
             }
         }
 
-        // 底部模式切换器 (悬浮)
-        if (deckState != DeckState.COMPLETED) {
+        // 底部模式切换器 (悬浮) - 在所有模式下都显示
+        // 移到顶层，确保在图片模式和图集模式下都可见
+        androidx.compose.animation.AnimatedVisibility(
+            visible = !isLoading && allImages.isNotEmpty(),
+            enter = androidx.compose.animation.fadeIn(),
+            exit = androidx.compose.animation.fadeOut(),
+            modifier = Modifier.align(Alignment.BottomCenter)
+        ) {
             Box(
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
                     .fillMaxWidth()
-                    .background(Color.Transparent)
                     .navigationBarsPadding()
+                    .background(Color.Transparent)
                     .padding(bottom = 24.dp),
                 contentAlignment = Alignment.Center
             ) {
-                 ModeToggle(
+                ModeToggle(
                     isAlbumMode = isAlbumMode,
                     onModeChange = onModeChange
                 )
@@ -434,7 +442,9 @@ private fun DeckContent(
     onSettingsClick: () -> Unit,
     onAlbumClick: (Album) -> Unit,
     onAddAlbumClick: () -> Unit,
-    onAlbumsClick: () -> Unit
+    onAlbumsClick: () -> Unit,
+    isAlbumMode: Boolean = false,
+    onModeChange: (Boolean) -> Unit = {}
 ) {
     val isDarkTheme = LocalIsDarkTheme.current
     val textColor = if (isDarkTheme) Color.White else TabulaColors.CatBlack
@@ -446,8 +456,10 @@ private fun DeckContent(
     
     // 下滑归类模式状态
     var isClassifyMode by remember { mutableStateOf(false) }
-    var dragPosition by remember { mutableStateOf<Offset?>(null) }
-    var hoveredAlbum by remember { mutableStateOf<Album?>(null) }
+    var selectedAlbumIndex by remember { mutableIntStateOf(0) }
+    
+    // 标签位置映射（索引 -> 屏幕坐标）
+    var tagPositions by remember { mutableStateOf<Map<Int, androidx.compose.ui.geometry.Rect>>(emptyMap()) }
 
     Box(
         modifier = Modifier
@@ -498,71 +510,109 @@ private fun DeckContent(
                         },
                         onClassifyModeChange = { mode ->
                             isClassifyMode = mode
+                            if (mode) {
+                                // 进入归类模式时，默认选中第一个标签
+                                selectedAlbumIndex = 0
+                            }
                         },
-                        onDragPositionChange = { position ->
-                            dragPosition = position
+                        onSelectedIndexChange = { index ->
+                            selectedAlbumIndex = index
                         },
-                        onHoveredAlbumChange = { album ->
-                            hoveredAlbum = album
-                        }
+                        // 传递标签位置
+                        tagPositions = tagPositions
                     )
                 }
             }
 
-            // 底部剩余提示 (上移至标签上方，设计感优化)
-            // 归类模式下隐藏
-            if (!isClassifyMode) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 8.dp),
-                    contentAlignment = Alignment.Center
+            // 底部固定高度区域 - 保持布局稳定，避免下滑时整体移动
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(140.dp) // 固定高度
+            ) {
+                // 正常模式：显示剩余提示和标签
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = !isClassifyMode,
+                    enter = androidx.compose.animation.fadeIn(),
+                    exit = androidx.compose.animation.fadeOut()
                 ) {
-                    Text(
-                        text = "${remaining} 张待整理",
-                        style = MaterialTheme.typography.labelMedium.copy(
-                            letterSpacing = 2.sp, // 增加字间距，增加呼吸感
-                            fontWeight = FontWeight.Medium
-                        ),
-                        color = textColor.copy(alpha = 0.5f),
-                        fontSize = 12.sp
-                    )
-                }
+                    Column(
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 8.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "${remaining} 张待整理",
+                                style = MaterialTheme.typography.labelMedium.copy(
+                                    letterSpacing = 2.sp,
+                                    fontWeight = FontWeight.Medium
+                                ),
+                                color = textColor.copy(alpha = 0.5f),
+                                fontSize = 12.sp
+                            )
+                        }
 
-                // 相册归类 Chips - 归类模式下隐藏
+                        // 相册归类 Chips
+                        if (albums.isNotEmpty()) {
+                            AlbumChips(
+                                albums = albums,
+                                selectedAlbumIds = currentImageAlbumIds,
+                                onAlbumClick = onAlbumClick,
+                                onAddAlbumClick = onAddAlbumClick,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 80.dp)
+                            )
+                        } else {
+                            AlbumChipsEmpty(
+                                onAddAlbumClick = onAddAlbumClick,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 80.dp)
+                            )
+                        }
+                    }
+                }
+                
+                // 归类模式：显示标签选择器
+                // 使用 alpha 而不是 AnimatedVisibility，确保组件始终存在以收集位置数据
+                val dropTargetAlpha by androidx.compose.animation.core.animateFloatAsState(
+                    targetValue = if (isClassifyMode) 1f else 0f,
+                    animationSpec = androidx.compose.animation.core.tween(
+                        durationMillis = 200
+                    ),
+                    label = "dropTargetAlpha"
+                )
+                
+                // 始终渲染 AlbumDropTarget，但使用透明度控制可见性
+                // 这样可以确保标签位置数据始终可用
                 if (albums.isNotEmpty()) {
-                    AlbumChips(
-                        albums = albums,
-                        selectedAlbumIds = currentImageAlbumIds,
-                        onAlbumClick = onAlbumClick,
-                        onAddAlbumClick = onAddAlbumClick,
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(bottom = 80.dp) // 增加底部间距，避免遮挡
-                    )
-                } else {
-                    AlbumChipsEmpty(
-                        onAddAlbumClick = onAddAlbumClick,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 80.dp)
-                    )
+                            .graphicsLayer {
+                                alpha = dropTargetAlpha
+                            }
+                    ) {
+                        AlbumDropTarget(
+                            albums = albums,
+                            selectedIndex = selectedAlbumIndex,
+                        onTagPositionChanged = { index, bounds ->
+                            // 更新标签位置映射
+                            tagPositions = tagPositions + (index to bounds)
+                        },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
                 }
             }
         }
         
-        // 下滑归类模式下显示标签选择器
-        if (isClassifyMode) {
-            AlbumDropTarget(
-                albums = albums,
-                dragPosition = dragPosition,
-                isDragging = isClassifyMode,
-                onHoveredAlbumChange = { album ->
-                    hoveredAlbum = album
-                },
-                modifier = Modifier.align(Alignment.BottomCenter)
-            )
-        }
+        // 底部模式切换器已移至 DeckScreen 顶层，确保在图片和图集模式下都可见
     }
 }
 
