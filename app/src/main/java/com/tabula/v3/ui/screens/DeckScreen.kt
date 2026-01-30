@@ -13,6 +13,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -146,6 +147,7 @@ fun DeckScreen(
     playMotionSound: Boolean = true,
     motionSoundVolume: Int = 100,
     enableSwipeHaptics: Boolean = true,
+    isAdaptiveCardStyle: Boolean = false,
     // 推荐算法回调
     getRecommendedBatch: suspend (List<ImageFile>, Int) -> List<ImageFile> = { images, size -> 
         images.shuffled().take(size) 
@@ -184,6 +186,11 @@ fun DeckScreen(
     var showCreateAlbumDialog by remember { mutableStateOf(false) }
     var showUndoSnackbar by remember { mutableStateOf(false) }
     var undoMessage by remember { mutableStateOf("") }
+    
+    // 撤销所需的状态：记住最后一次归档操作的图片和位置
+    var lastClassifiedImage by remember { mutableStateOf<ImageFile?>(null) }
+    var lastClassifiedIndex by remember { mutableIntStateOf(-1) }
+    var lastClassifyWasSwipe by remember { mutableStateOf(false) }  // 是否是下滑归类
     
     // 下滑归类模式状态（用于隐藏底部切换按钮）
     var isClassifyMode by remember { mutableStateOf(false) }
@@ -309,6 +316,7 @@ fun DeckScreen(
                         showHdrBadges = showHdrBadges,
                         showMotionBadges = showMotionBadges,
                         enableSwipeHaptics = enableSwipeHaptics,
+                        isAdaptiveCardStyle = isAdaptiveCardStyle,
                         albums = albums,
                         currentImageAlbumIds = currentImageAlbumIds,
                         onIndexChange = { newIndex ->
@@ -345,6 +353,11 @@ fun DeckScreen(
                         onSettingsClick = onNavigateToSettings,
                         onAlbumClick = { album ->
                             currentImage?.let { image ->
+                                // 记录撤销信息
+                                lastClassifiedImage = image
+                                lastClassifiedIndex = currentIndex
+                                lastClassifyWasSwipe = false
+                                
                                 onAlbumSelect(image.id, image.uri.toString(), album.id)
                                 undoMessage = "已添加到「${album.name}」"
                                 showUndoSnackbar = true
@@ -362,6 +375,12 @@ fun DeckScreen(
                         // 下滑归类专用回调：使用回调传入的 image 而不是 currentImage
                         // 因为 Genie 动画的 onComplete 是异步的，currentImage 可能已经变化
                         onSwipeClassifyToAlbum = { image, album ->
+                            // 记录撤销信息（在移除前记录索引位置）
+                            val imageIndex = currentBatch.indexOf(image)
+                            lastClassifiedImage = image
+                            lastClassifiedIndex = imageIndex
+                            lastClassifyWasSwipe = true
+                            
                             onAlbumSelect(image.id, image.uri.toString(), album.id)
                             undoMessage = "已添加到「${album.name}」"
                             showUndoSnackbar = true
@@ -395,7 +414,7 @@ fun DeckScreen(
         // 底部模式切换器 (悬浮) - 在所有模式下都显示，但下滑归类时隐藏
         // 移到顶层，确保在图片模式和图集模式下都可见
         androidx.compose.animation.AnimatedVisibility(
-            visible = !isLoading && allImages.isNotEmpty() && !isClassifyMode,
+            visible = !isLoading && allImages.isNotEmpty() && !isClassifyMode && deckState != DeckState.COMPLETED,
             enter = androidx.compose.animation.fadeIn(),
             exit = androidx.compose.animation.fadeOut(),
             modifier = Modifier.align(Alignment.BottomCenter)
@@ -433,10 +452,41 @@ fun DeckScreen(
             visible = showUndoSnackbar,
             message = undoMessage,
             onUndo = {
+                // 执行数据层撤销
                 onUndoAlbumAction()
+                
+                // 恢复 UI 状态
+                lastClassifiedImage?.let { image ->
+                    if (lastClassifyWasSwipe) {
+                        // 下滑归类：将图片重新插入 batch
+                        val newBatch = currentBatch.toMutableList()
+                        val insertIndex = lastClassifiedIndex.coerceIn(0, newBatch.size)
+                        newBatch.add(insertIndex, image)
+                        currentBatch = newBatch
+                        currentIndex = insertIndex
+                        // 如果之前进入了完成状态，恢复浏览状态
+                        if (deckState == DeckState.COMPLETED) {
+                            deckState = DeckState.BROWSING
+                        }
+                    } else {
+                        // 点击 Chip 归类：回退索引
+                        if (currentIndex > 0 && currentIndex > lastClassifiedIndex) {
+                            currentIndex = lastClassifiedIndex
+                        }
+                    }
+                }
+                
+                // 清理撤销状态
+                lastClassifiedImage = null
+                lastClassifiedIndex = -1
                 showUndoSnackbar = false
             },
-            onDismiss = { showUndoSnackbar = false },
+            onDismiss = { 
+                // Snackbar 消失时清理撤销状态
+                lastClassifiedImage = null
+                lastClassifiedIndex = -1
+                showUndoSnackbar = false 
+            },
             modifier = Modifier.align(Alignment.BottomCenter)
         )
     }
@@ -465,6 +515,7 @@ private fun DeckContent(
     showHdrBadges: Boolean,
     showMotionBadges: Boolean,
     enableSwipeHaptics: Boolean,
+    isAdaptiveCardStyle: Boolean,
     albums: List<Album>,
     currentImageAlbumIds: Set<String>,
     onIndexChange: (Int) -> Unit,
@@ -541,6 +592,7 @@ private fun DeckContent(
                         showMotionBadges = showMotionBadges,
                         enableSwipeHaptics = enableSwipeHaptics,
                         modifier = Modifier.fillMaxSize(),
+                        isAdaptiveCardStyle = isAdaptiveCardStyle,
                         // 下滑归类相关参数
                         albums = albums,
                         onClassifyToAlbum = { image, album ->
@@ -770,8 +822,11 @@ private fun AlbumsGridContent(
     // TODO
     var selectedTab by remember { mutableIntStateOf(0) }
 
-    // TODO
+    // 内容层的滚动状态
     val listState = rememberLazyListState()
+    // 模糊层使用独立的 listState，固定在初始位置不滚动
+    // 这样模糊层只渲染顶部的几个项目，避免双重渲染导致的 ANR
+    val blurListState = rememberLazyListState()
     var topBarHeight by remember { mutableStateOf(0.dp) }
     
     // TODO
@@ -818,14 +873,17 @@ private fun AlbumsGridContent(
     // Tab切换器配置
     val tabSegmentWidth = 100.dp
     
-    // 滑块动画 - 使用Spring动画实现弹性效果
-    val tabSliderOffset by animateDpAsState(
-        targetValue = if (selectedTab == 0) 0.dp else tabSegmentWidth,
+    // 滑块动画偏移量（使用 Float + graphicsLayer，避免重新布局导致的闪烁）
+    // 使用弹簧动画，带有轻微弹跳效果
+    val tabSliderOffsetPx by animateFloatAsState(
+        targetValue = with(LocalDensity.current) { 
+            if (selectedTab == 0) 0f else tabSegmentWidth.toPx() 
+        },
         animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
+            dampingRatio = Spring.DampingRatioLowBouncy,
             stiffness = Spring.StiffnessMedium
         ),
-        label = "tab_slider_offset"
+        label = "tab_slider_offset_px"
     )
     
     val tabSwitcher: (@Composable () -> Unit)? = if (isTabbedView) {
@@ -842,19 +900,16 @@ private fun AlbumsGridContent(
                         .padding(2.dp),
                     contentAlignment = Alignment.CenterStart
                 ) {
-                    // 滑块背景 - 带弹性动画
+                    // 滑块背景 - 使用 graphicsLayer 进行动画，避免重新布局导致的闪烁
                     Box(
                         modifier = Modifier
-                            .offset(x = tabSliderOffset)
                             .width(tabSegmentWidth)
+                            .graphicsLayer {
+                                translationX = tabSliderOffsetPx
+                            }
                             .clip(RoundedCornerShape(100))
                             .background(
                                 if (isDarkTheme) Color(0xFF636366) else Color.White
-                            )
-                            .shadow(
-                                elevation = 2.dp,
-                                shape = RoundedCornerShape(100),
-                                spotColor = Color.Black.copy(alpha = 0.1f)
                             )
                             .padding(vertical = 6.dp)
                     ) {
@@ -862,14 +917,17 @@ private fun AlbumsGridContent(
                         Text(text = " ", fontSize = 14.sp)
                     }
                     
-                    // 按钮区域
+                    // 按钮区域 - 禁用 ripple 效果，避免点击时背景变深
                     Row {
                         // App图集按钮
                         Box(
                             modifier = Modifier
                                 .width(tabSegmentWidth)
                                 .clip(RoundedCornerShape(100))
-                                .clickable {
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null  // 禁用 ripple
+                                ) {
                                     com.tabula.v3.ui.util.HapticFeedback.lightTap(context)
                                     selectedTab = 0
                                 }
@@ -889,7 +947,10 @@ private fun AlbumsGridContent(
                             modifier = Modifier
                                 .width(tabSegmentWidth)
                                 .clip(RoundedCornerShape(100))
-                                .clickable {
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null  // 禁用 ripple
+                                ) {
                                     com.tabula.v3.ui.util.HapticFeedback.lightTap(context)
                                     selectedTab = 1
                                 }
@@ -917,6 +978,9 @@ private fun AlbumsGridContent(
             .background(backgroundColor)
     ) {
         // 1. Blurred backdrop (top bar region only)
+        // 注意：模糊层不传 headerContent，避免 Tab 切换器被模糊后与正常层叠加造成颜色异常
+        // 重要：模糊层使用独立的 blurListState，固定在初始位置不滚动
+        // 这样模糊层只渲染顶部的几个项目，避免与内容层双重渲染导致图片加载任务翻倍触发 ANR
         Box(
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -935,9 +999,9 @@ private fun AlbumsGridContent(
                 secondaryTextColor = secondaryTextColor,
                 isDarkTheme = isDarkTheme,
                 hideHeaders = isTabbedView,
-                listState = listState,
+                listState = blurListState,  // 使用独立的 listState，固定在顶部
                 topPadding = contentTopPadding,
-                headerContent = tabSwitcher,
+                headerContent = null,  // 模糊层不显示 Tab 切换器
                 userScrollEnabled = false,
                 modifier = Modifier
                     .fillMaxSize()

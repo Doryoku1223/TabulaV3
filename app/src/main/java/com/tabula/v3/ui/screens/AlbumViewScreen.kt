@@ -1,5 +1,6 @@
 package com.tabula.v3.ui.screens
 
+import android.graphics.Bitmap
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
@@ -30,10 +31,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -63,6 +66,9 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -70,10 +76,15 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import coil.request.CachePolicy
 import coil.request.ImageRequest
+import coil.size.Precision
+import coil.size.Size
+import com.tabula.v3.R
 import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.data.model.SyncMode
+import com.tabula.v3.di.CoilSetup
 import com.tabula.v3.ui.components.AlbumDeleteConfirmDialog
 import com.tabula.v3.ui.components.AlbumEditDialog
 import com.tabula.v3.ui.components.SourceRect
@@ -253,6 +264,7 @@ private fun AlbumContentView(
 ) {
     val context = LocalContext.current
     var showMenu by remember { mutableStateOf(false) }
+    val gridState = rememberLazyGridState()
 
     Column(
         modifier = Modifier
@@ -263,7 +275,8 @@ private fun AlbumContentView(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 8.dp),
+                .height(56.dp)  // 固定高度，防止触摸区域溢出
+                .padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onNavigateBack) {
@@ -304,7 +317,7 @@ private fun AlbumContentView(
                 )
             }
 
-            Box {
+            Box(modifier = Modifier.wrapContentSize(Alignment.TopEnd)) {
                 IconButton(onClick = { showMenu = true }) {
                     Icon(
                         imageVector = Icons.Rounded.MoreVert,
@@ -398,7 +411,7 @@ private fun AlbumContentView(
         }
 
         if (images.isEmpty()) {
-            // 空状态
+            // 空状态 - TaTa 占领相册
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -406,31 +419,68 @@ private fun AlbumContentView(
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        text = album.emoji ?: "📷",
-                        fontSize = 64.sp
+                    // TaTa 图片
+                    AsyncImage(
+                        model = ImageRequest.Builder(context)
+                            .data(R.drawable.zpcat1)
+                            .crossfade(true)
+                            .build(),
+                        contentDescription = "TaTa",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .size(160.dp)
+                            .clip(RoundedCornerShape(20.dp))
                     )
-                    Spacer(modifier = Modifier.height(16.dp))
+                    
+                    Spacer(modifier = Modifier.height(28.dp))
+                    
+                    // 主标题
                     Text(
-                        text = "相册是空的",
+                        text = "糟糕",
                         color = textColor,
-                        fontSize = 20.sp,
-                        fontWeight = FontWeight.SemiBold
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.Bold
                     )
+                    
                     Spacer(modifier = Modifier.height(8.dp))
+                    
+                    // 副标题 - TaTa 强调显示
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Text(
+                            text = "TaTa",
+                            color = Color(0xFF007AFF),
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = " 占领了你的相册",
+                            color = textColor.copy(alpha = 0.8f),
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                    
+                    Spacer(modifier = Modifier.height(20.dp))
+                    
+                    // 提示文字
                     Text(
-                        text = "在清理照片时点击相册名称添加照片",
+                        text = "在滑一滑中添加照片到这里",
                         color = secondaryTextColor,
-                        fontSize = 15.sp,
+                        fontSize = 14.sp,
                         textAlign = TextAlign.Center
                     )
                 }
             }
         } else {
             // 照片网格
+            val isScrolling = gridState.isScrollInProgress
             LazyVerticalGrid(
                 columns = GridCells.Fixed(3),
                 contentPadding = PaddingValues(4.dp),
+                state = gridState,
                 modifier = Modifier.navigationBarsPadding()
             ) {
                 items(images, key = { it.id }) { image ->
@@ -438,6 +488,7 @@ private fun AlbumContentView(
                         image = image,
                         showHdrBadge = showHdrBadges,
                         showMotionBadge = showMotionBadges,
+                        isScrolling = isScrolling,
                         onClick = { sourceRect ->
                             onImageClick(image, sourceRect)
                         },
@@ -462,11 +513,13 @@ private fun PhotoGridItem(
     image: ImageFile,
     showHdrBadge: Boolean = false,
     showMotionBadge: Boolean = false,
+    isScrolling: Boolean,
     onClick: (SourceRect) -> Unit,
     onSetCover: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
-    var bounds by remember { mutableStateOf(SourceRect(0f, 0f, 0f, 0f, 0f)) }
+    val imageLoader = remember { CoilSetup.getImageLoader(context) }
+    val coordinatesHolder = remember { AlbumLayoutCoordinatesHolder() }
     var showCoverMenu by remember { mutableStateOf(false) }
 
     Box(
@@ -474,10 +527,25 @@ private fun PhotoGridItem(
             .aspectRatio(1f)
             .padding(2.dp)
             .clip(RoundedCornerShape(4.dp))
+            .onGloballyPositioned { coordinates ->
+                coordinatesHolder.value = coordinates
+            }
             .combinedClickable(
                 onClick = {
                     HapticFeedback.lightTap(context)
-                    onClick(bounds)
+                    val rect = coordinatesHolder.value?.takeIf { it.isAttached }?.boundsInRoot()
+                    val sourceRect = if (rect != null) {
+                        SourceRect(
+                            x = rect.left,
+                            y = rect.top,
+                            width = rect.width,
+                            height = rect.height,
+                            cornerRadius = 4f  // 与 RoundedCornerShape 一致
+                        )
+                    } else {
+                        SourceRect()
+                    }
+                    onClick(sourceRect)
                 },
                 onLongClick = if (onSetCover != null) {
                     {
@@ -487,45 +555,66 @@ private fun PhotoGridItem(
                 } else null
             )
     ) {
-        AsyncImage(
-            model = ImageRequest.Builder(context)
-                .data(image.uri)
-                .crossfade(true)
-                .build(),
-            contentDescription = image.displayName,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize()
-        )
-        
-        // HDR / Live 标识
-        val badges = rememberPhotoGridBadges(
-            image = image,
-            showHdr = showHdrBadge,
-            showMotion = showMotionBadge
-        )
-        
-        if (badges.isNotEmpty()) {
-            Row(
+        if (isScrolling) {
+            // 快速滚动时不加载图片，避免解码风暴导致卡顿/ANR
+            Box(
                 modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(4.dp),
-                horizontalArrangement = Arrangement.spacedBy(2.dp)
-            ) {
-                badges.forEach { badge ->
-                    Box(
-                        modifier = Modifier
-                            .background(
-                                color = Color.Black.copy(alpha = 0.6f),
-                                shape = RoundedCornerShape(3.dp)
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.08f))
+            )
+        } else {
+            // 使用稳定的缓存键，基于图片 ID
+            val cacheKey = remember(image.id) { "album_grid_${image.id}" }
+            
+            AsyncImage(
+                model = ImageRequest.Builder(context)
+                    .data(image.uri)
+                    .size(Size(240, 240))  // 缩略图只需要小尺寸，大幅减少解码压力
+                    .precision(Precision.INEXACT)
+                    .bitmapConfig(Bitmap.Config.RGB_565)
+                    .allowHardware(false)
+                    .memoryCacheKey(cacheKey)
+                    .diskCacheKey(cacheKey)
+                    .memoryCachePolicy(CachePolicy.ENABLED)
+                    .diskCachePolicy(CachePolicy.ENABLED)
+                    .crossfade(false)
+                    .build(),
+                contentDescription = image.displayName,
+                imageLoader = imageLoader,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+            
+            // HDR / Live 标识
+            val badges = rememberPhotoGridBadges(
+                image = image,
+                showHdr = showHdrBadge,
+                showMotion = showMotionBadge
+            )
+            
+            if (badges.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    badges.forEach { badge ->
+                        Box(
+                            modifier = Modifier
+                                .background(
+                                    color = Color.Black.copy(alpha = 0.6f),
+                                    shape = RoundedCornerShape(3.dp)
+                                )
+                                .padding(horizontal = 4.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = badge,
+                                color = Color.White,
+                                fontSize = 8.sp,
+                                fontWeight = FontWeight.Bold
                             )
-                            .padding(horizontal = 4.dp, vertical = 2.dp)
-                    ) {
-                        Text(
-                            text = badge,
-                            color = Color.White,
-                            fontSize = 8.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+                        }
                     }
                 }
             }
@@ -548,6 +637,8 @@ private fun PhotoGridItem(
         }
     }
 }
+
+private class AlbumLayoutCoordinatesHolder(var value: LayoutCoordinates? = null)
 
 /**
  * 记住照片网格项的标识

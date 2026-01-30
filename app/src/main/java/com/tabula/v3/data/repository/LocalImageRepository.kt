@@ -33,7 +33,8 @@ class LocalImageRepository(private val context: Context) {
         MediaStore.Images.Media.SIZE,
         MediaStore.Images.Media.WIDTH,
         MediaStore.Images.Media.HEIGHT,
-        MediaStore.Images.Media.BUCKET_DISPLAY_NAME
+        MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
+        MediaStore.Images.Media.ORIENTATION
     )
 
     /**
@@ -185,6 +186,7 @@ class LocalImageRepository(private val context: Context) {
             val widthColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
             val heightColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
             val bucketColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
+            val orientationColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.ORIENTATION)
 
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idColumn)
@@ -202,7 +204,8 @@ class LocalImageRepository(private val context: Context) {
                         size = cursor.getLong(sizeColumn),
                         width = cursor.getInt(widthColumn),
                         height = cursor.getInt(heightColumn),
-                        bucketDisplayName = cursor.getString(bucketColumn)
+                        bucketDisplayName = cursor.getString(bucketColumn),
+                        orientation = cursor.getInt(orientationColumn)
                     )
                 )
             }
@@ -251,6 +254,7 @@ class LocalImageRepository(private val context: Context) {
             val widthColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.WIDTH)
             val heightColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.HEIGHT)
             val bucketColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.BUCKET_DISPLAY_NAME)
+            val orientationColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.ORIENTATION)
 
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idColumn)
@@ -268,7 +272,8 @@ class LocalImageRepository(private val context: Context) {
                         size = cursor.getLong(sizeColumn),
                         width = cursor.getInt(widthColumn),
                         height = cursor.getInt(heightColumn),
-                        bucketDisplayName = cursor.getString(bucketColumn)
+                        bucketDisplayName = cursor.getString(bucketColumn),
+                        orientation = cursor.getInt(orientationColumn)
                     )
                 )
             }

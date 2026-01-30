@@ -65,23 +65,119 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
 
     /**
      * 获取指定相册的文件夹
+     * 
+     * @param albumName 相册名称
+     * @param useExistingPath 如果存在同名系统相册，是否使用其路径
      */
-    private fun getAlbumFolder(albumName: String): File {
+    private fun getAlbumFolder(albumName: String, useExistingPath: Boolean = true): File {
+        // 如果启用融合模式，先检查是否存在同名系统相册
+        if (useExistingPath) {
+            val existingPath = findExistingSystemBucketPath(albumName)
+            if (existingPath != null) {
+                Log.d(TAG, "Found existing system album path for '$albumName': $existingPath")
+                return File(existingPath)
+            }
+        }
+        
+        // 不存在同名相册，使用默认 Tabula 目录
         val root = getTabulaAlbumsRoot()
         // 清理文件名中的非法字符
         val safeName = albumName.replace(Regex("[\\\\/:*?\"<>|]"), "_")
         return File(root, safeName)
     }
+    
+    /**
+     * 查找系统中是否存在同名的相册，返回其路径
+     * 
+     * 当 App 图集名称与手机相册名称相同时，返回现有相册的路径，
+     * 用于将图片同步到现有相册而不是创建新的 Tabula 子目录。
+     * 
+     * @param albumName 相册名称
+     * @return 现有相册的绝对路径，不存在则返回 null
+     */
+    private fun findExistingSystemBucketPath(albumName: String): String? {
+        try {
+            val projection = arrayOf(
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.DATA,
+                MediaStore.Images.Media.RELATIVE_PATH
+            )
+            
+            val selection = "${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} = ?"
+            val selectionArgs = arrayOf(albumName)
+            
+            contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                selection,
+                selectionArgs,
+                "${MediaStore.Images.Media.DATE_MODIFIED} DESC"
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    // 优先使用 DATA 字段获取完整路径
+                    val dataIndex = cursor.getColumnIndex(MediaStore.Images.Media.DATA)
+                    if (dataIndex >= 0) {
+                        val dataPath = cursor.getString(dataIndex)
+                        if (!dataPath.isNullOrBlank()) {
+                            val parentDir = File(dataPath).parentFile
+                            if (parentDir != null && parentDir.exists()) {
+                                // 检查是否是 Tabula 创建的目录，如果是则不视为"现有系统相册"
+                                val tabulaRoot = getTabulaAlbumsRoot().absolutePath
+                                if (!parentDir.absolutePath.startsWith(tabulaRoot)) {
+                                    return parentDir.absolutePath
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error finding existing system bucket path for: $albumName", e)
+        }
+        return null
+    }
+    
+    /**
+     * 获取相册的相对路径（用于 MediaStore）
+     * 
+     * @param albumName 相册名称
+     * @return 相对路径，如 "DCIM/Camera" 或 "Pictures/Tabula/MyAlbum"
+     */
+    private fun getAlbumRelativePath(albumName: String): String {
+        val existingPath = findExistingSystemBucketPath(albumName)
+        if (existingPath != null) {
+            // 从绝对路径提取相对路径
+            val externalStorage = Environment.getExternalStorageDirectory().absolutePath
+            val relativePath = existingPath.removePrefix(externalStorage).removePrefix("/")
+            Log.d(TAG, "Using existing relative path for '$albumName': $relativePath")
+            return relativePath
+        }
+        
+        // 使用默认 Tabula 路径
+        val safeName = albumName.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+        return "${Environment.DIRECTORY_PICTURES}/$TABULA_ALBUMS_FOLDER/$safeName"
+    }
 
     /**
      * 创建系统相册（文件夹）
+     *
+     * 如果系统中已存在同名相册，则不创建新文件夹，直接返回现有路径。
+     * 这样可以实现 App 图集与同名手机相册的融合。
      *
      * @param albumName 相册名称
      * @return 相册文件夹路径，失败返回 null
      */
     suspend fun createSystemAlbum(albumName: String): String? = withContext(Dispatchers.IO) {
         try {
-            val albumFolder = getAlbumFolder(albumName)
+            // 先检查是否存在同名系统相册
+            val existingPath = findExistingSystemBucketPath(albumName)
+            if (existingPath != null) {
+                Log.d(TAG, "Using existing system album: $existingPath (album: $albumName)")
+                return@withContext existingPath
+            }
+            
+            // 不存在同名相册，创建新的 Tabula 子目录
+            val albumFolder = getAlbumFolder(albumName, useExistingPath = false)
             if (!albumFolder.exists()) {
                 val created = albumFolder.mkdirs()
                 if (!created) {
@@ -224,30 +320,38 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
 
     /**
      * 使用 MediaStore API 移动图片 (Android 10+)
+     * 
+     * 支持移动到现有系统相册（如 DCIM/Camera）或 Tabula 创建的相册。
+     * 
+     * @param sourceUri 源图片 URI
+     * @param albumName 相册名称
+     * @param fileName 文件名
      */
     private fun moveImageUsingMediaStore(
         sourceUri: Uri,
-        relativePath: String,
+        albumName: String,
         fileName: String
     ): Uri? {
         try {
+            // 获取目标相对路径（可能是现有系统相册路径或 Tabula 路径）
+            val targetRelativePath = getAlbumRelativePath(albumName)
+            
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 // 方法1：尝试通过更新 RELATIVE_PATH 来移动
                 val updateValues = ContentValues().apply {
-                    put(MediaStore.Images.Media.RELATIVE_PATH, 
-                        "${Environment.DIRECTORY_PICTURES}/$TABULA_ALBUMS_FOLDER/$relativePath")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, targetRelativePath)
                     put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
                 }
                 
                 val updated = contentResolver.update(sourceUri, updateValues, null, null)
                 if (updated > 0) {
-                    Log.d(TAG, "Moved image using MediaStore update: $fileName")
+                    Log.d(TAG, "Moved image using MediaStore update: $fileName -> $targetRelativePath")
                     return sourceUri
                 }
             }
 
             // 方法2：如果更新失败，则复制后删除
-            val newUri = copyImageUsingMediaStore(sourceUri, relativePath, fileName)
+            val newUri = copyImageUsingMediaStore(sourceUri, albumName, fileName)
             if (newUri != null) {
                 deleteOriginalImage(sourceUri)
             }
@@ -255,7 +359,7 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "Error moving image using MediaStore", e)
             // 回退到复制+删除
-            val newUri = copyImageUsingMediaStore(sourceUri, relativePath, fileName)
+            val newUri = copyImageUsingMediaStore(sourceUri, albumName, fileName)
             if (newUri != null) {
                 deleteOriginalImage(sourceUri)
             }
@@ -285,58 +389,116 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
     /**
      * 检查目标相册中是否已存在同名文件
      * 
+     * 支持检查现有系统相册（如 DCIM/Camera）和 Tabula 创建的相册。
+     * 同时检查文件名和文件大小，避免同步重复照片。
+     * 
+     * @param albumName 相册名称
+     * @param fileName 文件名
+     * @param sourceSize 源文件大小（可选，用于更精确的重复检测）
      * @return 如果已存在，返回现有文件的 URI；否则返回 null
      */
     private fun findExistingImageInAlbum(
-        relativePath: String,
-        fileName: String
+        albumName: String,
+        fileName: String,
+        sourceSize: Long? = null
     ): Uri? {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val targetRelativePath = "${Environment.DIRECTORY_PICTURES}/$TABULA_ALBUMS_FOLDER/$relativePath"
-            val selection = "${MediaStore.Images.Media.RELATIVE_PATH} = ? AND ${MediaStore.Images.Media.DISPLAY_NAME} = ?"
-            val selectionArgs = arrayOf("$targetRelativePath/", fileName)
+        try {
+            // 使用 BUCKET_DISPLAY_NAME 查询，这样可以同时覆盖现有系统相册和 Tabula 相册
+            val selection = "${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} = ? AND ${MediaStore.Images.Media.DISPLAY_NAME} = ?"
+            val selectionArgs = arrayOf(albumName, fileName)
+            
+            val projection = arrayOf(
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.SIZE
+            )
             
             contentResolver.query(
                 MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                arrayOf(MediaStore.Images.Media._ID),
+                projection,
                 selection,
                 selectionArgs,
                 null
             )?.use { cursor ->
-                if (cursor.moveToFirst()) {
+                while (cursor.moveToNext()) {
                     val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID))
-                    return Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString())
+                    
+                    // 如果提供了源文件大小，进行额外验证
+                    if (sourceSize != null) {
+                        val sizeIndex = cursor.getColumnIndex(MediaStore.Images.Media.SIZE)
+                        if (sizeIndex >= 0) {
+                            val existingSize = cursor.getLong(sizeIndex)
+                            // 文件大小相同，认为是同一张照片
+                            if (existingSize == sourceSize) {
+                                return Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString())
+                            }
+                        }
+                    } else {
+                        // 没有提供大小，仅按文件名匹配
+                        return Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString())
+                    }
                 }
             }
-        } else {
-            // Android 9 及以下：检查文件是否存在
-            val albumFolder = getAlbumFolder(relativePath)
-            val targetFile = File(albumFolder, fileName)
-            if (targetFile.exists()) {
-                return Uri.fromFile(targetFile)
+            
+            // Android 9 及以下的额外检查：直接检查文件系统
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                val albumFolder = getAlbumFolder(albumName)
+                val targetFile = File(albumFolder, fileName)
+                if (targetFile.exists()) {
+                    if (sourceSize == null || targetFile.length() == sourceSize) {
+                        return Uri.fromFile(targetFile)
+                    }
+                }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error finding existing image in album: $albumName/$fileName", e)
         }
         return null
     }
 
     /**
      * 使用 MediaStore API 复制图片 (Android 10+)
+     * 
+     * 支持复制到现有系统相册（如 DCIM/Camera）或 Tabula 创建的相册。
+     * 
+     * @param sourceUri 源图片 URI
+     * @param albumName 相册名称（用于查找现有路径或创建新路径）
+     * @param fileName 目标文件名
      */
     private fun copyImageUsingMediaStore(
         sourceUri: Uri,
-        relativePath: String,
+        albumName: String,
         fileName: String
     ): Uri? {
         try {
+            // 获取目标相对路径（可能是现有系统相册路径或 Tabula 路径）
+            val targetRelativePath = getAlbumRelativePath(albumName)
+            
             // #region agent log
-            Log.d("DEBUG_SYNC", "[B2] copyImageUsingMediaStore:entry | sourceUri=$sourceUri | relativePath=$relativePath | fileName=$fileName | targetPath=${Environment.DIRECTORY_PICTURES}/$TABULA_ALBUMS_FOLDER/$relativePath")
+            Log.d("DEBUG_SYNC", "[B2] copyImageUsingMediaStore:entry | sourceUri=$sourceUri | albumName=$albumName | fileName=$fileName | targetPath=$targetRelativePath")
             // #endregion
             
-            // 检查是否已存在同名文件，避免重复复制
-            val existingUri = findExistingImageInAlbum(relativePath, fileName)
+            // 获取源文件大小用于重复检测
+            var sourceSize: Long? = null
+            contentResolver.query(
+                sourceUri,
+                arrayOf(MediaStore.Images.Media.SIZE),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val sizeIndex = cursor.getColumnIndex(MediaStore.Images.Media.SIZE)
+                    if (sizeIndex >= 0) {
+                        sourceSize = cursor.getLong(sizeIndex)
+                    }
+                }
+            }
+            
+            // 检查是否已存在同名同大小文件，避免重复复制
+            val existingUri = findExistingImageInAlbum(albumName, fileName, sourceSize)
             if (existingUri != null) {
                 // #region agent log
-                Log.d("DEBUG_SYNC", "[B2] copyImageUsingMediaStore:skipped | fileName=$fileName already exists at $existingUri")
+                Log.d("DEBUG_SYNC", "[B2] copyImageUsingMediaStore:skipped | fileName=$fileName already exists at $existingUri (size match)")
                 // #endregion
                 Log.d(TAG, "Image already exists in album, skipping: $fileName")
                 return existingUri
@@ -365,8 +527,7 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
                 // 保留原始拍摄时间，帮助系统相册正确排序
                 dateTaken?.let { put(MediaStore.Images.Media.DATE_TAKEN, it) }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.Images.Media.RELATIVE_PATH, 
-                        "${Environment.DIRECTORY_PICTURES}/$TABULA_ALBUMS_FOLDER/$relativePath")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, targetRelativePath)
                     put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
             }
@@ -377,7 +538,7 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
             ) ?: return null
             
             // #region agent log
-            Log.d("DEBUG_SYNC", "[B2] copyImageUsingMediaStore:inserted | newUri=$newUri | fileName=$fileName")
+            Log.d("DEBUG_SYNC", "[B2] copyImageUsingMediaStore:inserted | newUri=$newUri | fileName=$fileName | targetPath=$targetRelativePath")
             // #endregion
 
             contentResolver.openInputStream(sourceUri)?.use { input ->
@@ -393,7 +554,7 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
                 contentResolver.update(newUri, updateValues, null, null)
             }
 
-            Log.d(TAG, "Copied image using MediaStore: $fileName")
+            Log.d(TAG, "Copied image using MediaStore: $fileName -> $targetRelativePath")
             return newUri
         } catch (e: Exception) {
             Log.e(TAG, "Error copying image using MediaStore", e)

@@ -101,6 +101,28 @@ private fun rememberImageBadges(
  * @param onCardClick 卡片点击回调（传递图片和源位置）
  * @param modifier 外部修饰符
  */
+/**
+ * 根据图片比例和卡片样式模式计算卡片宽高比
+ * 
+ * @param imageAspectRatio 图片的宽高比 (width / height)
+ * @param isAdaptive 是否为自适应模式
+ * @return 卡片的宽高比
+ */
+private fun calculateCardAspectRatio(imageAspectRatio: Float, isAdaptive: Boolean): Float {
+    if (!isAdaptive) return 3f / 4f  // 固定模式：3:4
+    
+    // 自适应模式：根据图片比例分档
+    // 分档原则：卡片比例尽量接近图片比例，减少裁剪
+    return when {
+        imageAspectRatio < 0.5f -> 9f / 16f    // 超长竖图（手机截屏）→ 9:16 卡片 (0.5625)
+        imageAspectRatio < 0.67f -> 2f / 3f    // 长竖图 → 2:3 卡片 (0.67)
+        imageAspectRatio < 0.9f -> 3f / 4f     // 标准竖图 → 3:4 卡片 (0.75)
+        imageAspectRatio < 1.1f -> 1f          // 接近正方形 → 1:1 卡片 (1.0)
+        imageAspectRatio < 1.4f -> 4f / 3f     // 标准横图 → 4:3 卡片 (1.33)
+        else -> 16f / 9f                        // 宽横图（横屏拍照）→ 16:9 卡片 (1.78)
+    }
+}
+
 @Composable
 fun SwipeableCardStack(
     images: List<ImageFile>,
@@ -113,6 +135,8 @@ fun SwipeableCardStack(
     enableSwipeHaptics: Boolean = true,
     modifier: Modifier = Modifier,
     cardAspectRatio: Float = 3f / 4f,
+    // 卡片样式模式（固定/自适应）
+    isAdaptiveCardStyle: Boolean = false,
     // 下滑归类相关参数
     albums: List<Album> = emptyList(),
     onClassifyToAlbum: ((ImageFile, Album) -> Unit)? = null,
@@ -217,6 +241,16 @@ fun SwipeableCardStack(
     // 检查边界
     val hasNext = currentIndex < images.lastIndex
     val hasPrev = currentIndex > 0
+    
+    // 计算实际卡片比例（自适应模式下根据当前图片比例计算，三层卡片统一使用）
+    // 当图片没有有效尺寸信息时，即使在自适应模式下也使用固定比例
+    val actualCardAspectRatio = remember(currentImage?.id, isAdaptiveCardStyle) {
+        if (isAdaptiveCardStyle && currentImage != null && currentImage.hasDimensionInfo) {
+            calculateCardAspectRatio(currentImage.aspectRatio, true)
+        } else {
+            cardAspectRatio
+        }
+    }
 
     /**
      * 重置拖拽状态
@@ -767,7 +801,7 @@ fun SwipeableCardStack(
                     modifier = Modifier
                         .zIndex(0f)
                         .fillMaxWidth(0.85f)
-                        .aspectRatio(cardAspectRatio)
+                        .aspectRatio(actualCardAspectRatio)
                         .graphicsLayer {
                             transformOrigin = TransformOrigin.Center
                             scaleX = 0.90f + breathScale * 0.01f
@@ -785,7 +819,7 @@ fun SwipeableCardStack(
                 modifier = Modifier
                     .zIndex(0f)
                     .fillMaxWidth(0.85f)
-                    .aspectRatio(cardAspectRatio)
+                    .aspectRatio(actualCardAspectRatio)
                     .graphicsLayer {
                         transformOrigin = TransformOrigin.Center
                         scaleX = 0.90f
@@ -806,7 +840,7 @@ fun SwipeableCardStack(
                     modifier = Modifier
                         .zIndex(1f)
                         .fillMaxWidth(0.85f)
-                        .aspectRatio(cardAspectRatio)
+                        .aspectRatio(actualCardAspectRatio)
                         .graphicsLayer {
                             transformOrigin = TransformOrigin.Center
                             scaleX = 0.95f + breathScale * 0.01f
@@ -824,7 +858,7 @@ fun SwipeableCardStack(
                 modifier = Modifier
                     .zIndex(1f)
                     .fillMaxWidth(0.85f)
-                    .aspectRatio(cardAspectRatio)
+                    .aspectRatio(actualCardAspectRatio)
                     .graphicsLayer {
                         transformOrigin = TransformOrigin.Center
                         scaleX = 0.95f
@@ -847,7 +881,7 @@ fun SwipeableCardStack(
                     modifier = Modifier
                         .zIndex(if (isTransitioning && pendingIndexChange != 0) -1f else 2f)
                         .fillMaxWidth(0.85f)
-                        .aspectRatio(cardAspectRatio)
+                        .aspectRatio(actualCardAspectRatio)
                         .onGloballyPositioned { coordinates ->
                             topCardBounds = coordinates.boundsInRoot()
                         }

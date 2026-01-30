@@ -86,6 +86,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import com.tabula.v3.R
 import com.tabula.v3.data.preferences.AppPreferences
+import com.tabula.v3.data.preferences.CardStyleMode
 import com.tabula.v3.data.preferences.RecommendMode
 import com.tabula.v3.data.preferences.ThemeMode
 import com.tabula.v3.data.preferences.TopBarDisplayMode
@@ -212,44 +213,58 @@ fun SettingsScreen(
             ) {
                 Spacer(modifier = Modifier.height(12.dp))
 
-            // ========== 外观 ==========
+            // ========== 外观 (带小黑猫彩蛋) ==========
             SectionHeader("外观", textColor)
             
-            SettingsGroup(cardColor) {
-                SettingsItem(
-                    icon = Icons.Outlined.DarkMode,
-                    iconTint = Color(0xFF5E5CE6), // Indigo
-                    title = "主题模式",
-                    value = when (currentTheme) {
-                        ThemeMode.SYSTEM -> "跟随系统"
-                        ThemeMode.LIGHT -> "浅色"
-                        ThemeMode.DARK -> "深色"
-                    },
-                    textColor = textColor,
-                    secondaryTextColor = secondaryTextColor,
-                    onClick = {
-                        HapticFeedback.lightTap(context)
-                        showThemeSheet = true
-                    }
+            Box(Modifier.fillMaxWidth()) {
+                // 小黑猫彩蛋 (趴在卡片上方)
+                Image(
+                    painter = painterResource(id = R.drawable.cat3),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(end = 24.dp)
+                        .offset(y = (-45).dp)
+                        .size(72.dp)
+                        .zIndex(1f)
                 )
-                
-                Divider(isDarkTheme)
-                
-                SettingsItem(
-                    icon = Icons.Outlined.TextFormat,
-                    iconTint = Color(0xFFFF9F0A), // Orange
-                    title = "顶部显示",
-                    value = when (currentTopBarMode) {
-                        TopBarDisplayMode.INDEX -> "索引"
-                        TopBarDisplayMode.DATE -> "日期"
-                    },
-                    textColor = textColor,
-                    secondaryTextColor = secondaryTextColor,
-                    onClick = {
-                        HapticFeedback.lightTap(context)
-                        showTopBarModeSheet = true
-                    }
-                )
+
+                SettingsGroup(cardColor) {
+                    SettingsItem(
+                        icon = Icons.Outlined.DarkMode,
+                        iconTint = Color(0xFF5E5CE6), // Indigo
+                        title = "主题模式",
+                        value = when (currentTheme) {
+                            ThemeMode.SYSTEM -> "跟随系统"
+                            ThemeMode.LIGHT -> "浅色"
+                            ThemeMode.DARK -> "深色"
+                        },
+                        textColor = textColor,
+                        secondaryTextColor = secondaryTextColor,
+                        onClick = {
+                            HapticFeedback.lightTap(context)
+                            showThemeSheet = true
+                        }
+                    )
+                    
+                    Divider(isDarkTheme)
+                    
+                    SettingsItem(
+                        icon = Icons.Outlined.TextFormat,
+                        iconTint = Color(0xFFFF9F0A), // Orange
+                        title = "顶部显示",
+                        value = when (currentTopBarMode) {
+                            TopBarDisplayMode.INDEX -> "索引"
+                            TopBarDisplayMode.DATE -> "日期"
+                        },
+                        textColor = textColor,
+                        secondaryTextColor = secondaryTextColor,
+                        onClick = {
+                            HapticFeedback.lightTap(context)
+                            showTopBarModeSheet = true
+                        }
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(28.dp))
@@ -311,7 +326,7 @@ fun SettingsScreen(
                 SettingsItem(
                     icon = Icons.Outlined.Image,
                     iconTint = Color(0xFF0A84FF), // Blue
-                    title = "图片显示",
+                    title = "卡片显示",
                     value = "",
                     textColor = textColor,
                     secondaryTextColor = secondaryTextColor,
@@ -730,11 +745,14 @@ fun ImageDisplayScreen(
     secondaryTextColor: Color,
     showHdrBadges: Boolean,
     showMotionBadges: Boolean,
+    cardStyleMode: CardStyleMode,
     onShowHdrBadgesChange: (Boolean) -> Unit,
     onShowMotionBadgesChange: (Boolean) -> Unit,
+    onCardStyleModeChange: (CardStyleMode) -> Unit,
     onNavigateBack: () -> Unit
 ) {
     val context = LocalContext.current
+    val isDarkTheme = LocalIsDarkTheme.current
     
     Column(
         modifier = Modifier
@@ -764,7 +782,7 @@ fun ImageDisplayScreen(
                 )
             }
             Text(
-                text = "图片显示",
+                text = "卡片显示",
                 style = MaterialTheme.typography.titleLarge.copy(
                     fontWeight = FontWeight.Bold,
                     fontSize = 20.sp
@@ -782,6 +800,38 @@ fun ImageDisplayScreen(
         ) {
             Spacer(modifier = Modifier.height(12.dp))
 
+            // 卡片样式选择
+            SectionHeader("卡片样式", textColor)
+            SettingsGroup(cardColor) {
+                CardStyleOptionItem(
+                    title = "固定样式",
+                    description = "所有卡片统一 3:4 比例",
+                    isSelected = cardStyleMode == CardStyleMode.FIXED,
+                    textColor = textColor,
+                    secondaryTextColor = secondaryTextColor,
+                    onClick = {
+                        HapticFeedback.lightTap(context)
+                        onCardStyleModeChange(CardStyleMode.FIXED)
+                    }
+                )
+                
+                Divider(isDarkTheme)
+                
+                CardStyleOptionItem(
+                    title = "自适应样式",
+                    description = "根据图片比例动态调整卡片大小",
+                    isSelected = cardStyleMode == CardStyleMode.ADAPTIVE,
+                    textColor = textColor,
+                    secondaryTextColor = secondaryTextColor,
+                    onClick = {
+                        HapticFeedback.lightTap(context)
+                        onCardStyleModeChange(CardStyleMode.ADAPTIVE)
+                    }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
             SectionHeader("标识显示", textColor)
             SettingsGroup(cardColor) {
                 SettingsSwitchItem(
@@ -796,7 +846,7 @@ fun ImageDisplayScreen(
                     }
                 )
 
-                Divider(LocalIsDarkTheme.current)
+                Divider(isDarkTheme)
 
                 SettingsSwitchItem(
                     icon = Icons.Outlined.Movie,
@@ -812,6 +862,52 @@ fun ImageDisplayScreen(
             }
 
             Spacer(modifier = Modifier.height(28.dp))
+        }
+    }
+}
+
+/**
+ * 卡片样式选项项
+ */
+@Composable
+private fun CardStyleOptionItem(
+    title: String,
+    description: String,
+    isSelected: Boolean,
+    textColor: Color,
+    secondaryTextColor: Color,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(
+            modifier = Modifier.weight(1f)
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyLarge,
+                color = textColor
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = description,
+                style = MaterialTheme.typography.bodySmall,
+                color = secondaryTextColor
+            )
+        }
+        
+        if (isSelected) {
+            Icon(
+                imageVector = Icons.Outlined.Check,
+                contentDescription = "已选择",
+                tint = Color(0xFF0A84FF),
+                modifier = Modifier.size(22.dp)
+            )
         }
     }
 }

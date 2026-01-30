@@ -1,5 +1,6 @@
 package com.tabula.v3.ui.screens
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
@@ -30,13 +32,20 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import coil.request.CachePolicy
 import coil.request.ImageRequest
+import coil.size.Precision
+import coil.size.Size
 import com.tabula.v3.data.model.ImageFile
+import com.tabula.v3.di.CoilSetup
 import com.tabula.v3.ui.components.SourceRect
 import com.tabula.v3.ui.components.ViewerOverlay
 import com.tabula.v3.ui.components.ViewerState
@@ -68,6 +77,7 @@ fun SystemAlbumViewScreen(
     val secondaryTextColor = if (isDarkTheme) Color(0xFF8E8E93) else Color(0xFF8E8E93)
 
     var viewerState by remember { mutableStateOf<ViewerState?>(null) }
+    val gridState = rememberLazyGridState()
 
     // 返回拦截
     BackHandler(enabled = viewerState != null) {
@@ -114,9 +124,11 @@ fun SystemAlbumViewScreen(
             }
 
             // 照片网格
+            val isScrolling = gridState.isScrollInProgress
             LazyVerticalGrid(
                 columns = GridCells.Fixed(3),
                 contentPadding = PaddingValues(4.dp),
+                state = gridState,
                 modifier = Modifier
                     .weight(1f)
                     .navigationBarsPadding()
@@ -126,6 +138,7 @@ fun SystemAlbumViewScreen(
                         image = image,
                         showHdrBadge = showHdrBadges,
                         showMotionBadge = showMotionBadges,
+                        isScrolling = isScrolling,
                         onClick = { sourceRect ->
                             viewerState = ViewerState(image, sourceRect)
                         }
@@ -157,66 +170,106 @@ private fun PhotoGridItem(
     image: ImageFile,
     showHdrBadge: Boolean,
     showMotionBadge: Boolean,
+    isScrolling: Boolean,
     onClick: (SourceRect) -> Unit
 ) {
     val context = LocalContext.current
-    var bounds by remember { mutableStateOf(SourceRect(0f, 0f, 0f, 0f, 0f)) }
+    val imageLoader = remember { CoilSetup.getImageLoader(context) }
+    val coordinatesHolder = remember { SystemLayoutCoordinatesHolder() }
 
     Box(
         modifier = Modifier
             .aspectRatio(1f)
             .padding(2.dp)
             .clip(RoundedCornerShape(4.dp))
+            .onGloballyPositioned { coordinates ->
+                coordinatesHolder.value = coordinates
+            }
             .clickable {
                 HapticFeedback.lightTap(context)
-                onClick(bounds)
+                val rect = coordinatesHolder.value?.takeIf { it.isAttached }?.boundsInRoot()
+                val sourceRect = if (rect != null) {
+                    SourceRect(
+                        x = rect.left,
+                        y = rect.top,
+                        width = rect.width,
+                        height = rect.height,
+                        cornerRadius = 4f  // 与 RoundedCornerShape 一致
+                    )
+                } else {
+                    SourceRect()
+                }
+                onClick(sourceRect)
             }
     ) {
-        AsyncImage(
-            model = ImageRequest.Builder(context)
-                .data(image.uri)
-                .crossfade(true)
-                .build(),
-            contentDescription = image.displayName,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize()
-        )
-        
-        // HDR / Live 标识
-        val badges = rememberImageBadges(
-            image = image, 
-            showHdr = showHdrBadge, 
-            showMotion = showMotionBadge
-        )
-        
-        if (badges.isNotEmpty()) {
-            Row(
+        if (isScrolling) {
+            // 快速滚动时不加载图片，避免解码风暴导致卡顿/ANR
+            Box(
                 modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(4.dp),
-                horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(2.dp)
-            ) {
-                badges.forEach { badge ->
-                    Box(
-                        modifier = Modifier
-                            .background(
-                                color = Color.Black.copy(alpha = 0.6f),
-                                shape = RoundedCornerShape(3.dp)
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.08f))
+            )
+        } else {
+            // 使用稳定的缓存键，基于图片 ID
+            val cacheKey = remember(image.id) { "sys_grid_${image.id}" }
+            
+            AsyncImage(
+                model = ImageRequest.Builder(context)
+                    .data(image.uri)
+                    .size(Size(240, 240))  // 缩略图只需要小尺寸，大幅减少解码压力
+                    .precision(Precision.INEXACT)
+                    .bitmapConfig(Bitmap.Config.RGB_565)
+                    .allowHardware(false)
+                    .memoryCacheKey(cacheKey)
+                    .diskCacheKey(cacheKey)
+                    .memoryCachePolicy(CachePolicy.ENABLED)
+                    .diskCachePolicy(CachePolicy.ENABLED)
+                    .crossfade(false)
+                    .build(),
+                contentDescription = image.displayName,
+                imageLoader = imageLoader,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+            
+            // HDR / Live 标识
+            val badges = rememberImageBadges(
+                image = image, 
+                showHdr = showHdrBadge, 
+                showMotion = showMotionBadge
+            )
+            
+            if (badges.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(4.dp),
+                    horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(2.dp)
+                ) {
+                    badges.forEach { badge ->
+                        Box(
+                            modifier = Modifier
+                                .background(
+                                    color = Color.Black.copy(alpha = 0.6f),
+                                    shape = RoundedCornerShape(3.dp)
+                                )
+                                .padding(horizontal = 4.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = badge,
+                                color = Color.White,
+                                fontSize = 8.sp,
+                                fontWeight = FontWeight.Bold
                             )
-                            .padding(horizontal = 4.dp, vertical = 2.dp)
-                    ) {
-                        Text(
-                            text = badge,
-                            color = Color.White,
-                            fontSize = 8.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+                        }
                     }
                 }
             }
         }
     }
 }
+
+private class SystemLayoutCoordinatesHolder(var value: LayoutCoordinates? = null)
 
 // 辅助函数：根据文件名判断徽章
 @Composable

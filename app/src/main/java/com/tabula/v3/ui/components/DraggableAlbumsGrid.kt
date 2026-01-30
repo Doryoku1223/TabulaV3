@@ -51,6 +51,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import com.tabula.v3.R
 import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.ui.util.HapticFeedback
@@ -290,27 +291,16 @@ private fun AlbumGridItem(
                     modifier = Modifier.fillMaxSize()
                 )
             } else {
-                // 没有图片时的背景色
-                val albumColor = album.color?.let { Color(it) } ?: Color(0xFF7986CB)
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(albumColor.copy(alpha = 0.2f)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (album.emoji != null) {
-                        Text(
-                            text = album.emoji,
-                            fontSize = 32.sp
-                        )
-                    } else {
-                        Box(
-                            modifier = Modifier
-                                .size(32.dp)
-                                .background(albumColor, RoundedCornerShape(8.dp))
-                        )
-                    }
-                }
+                // 没有封面时显示小猫咪图片
+                AsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(R.drawable.zpcat1)
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = "空图集封面",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
             }
         }
         

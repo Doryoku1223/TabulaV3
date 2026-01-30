@@ -24,9 +24,11 @@ import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.di.CoilSetup
 
 /**
- * 图片卡片组件 - Crop 填充模式
+ * 图片卡片组件
  *
- * 图片完全填充卡片，不留黑边
+ * 支持两种显示模式：
+ * - Crop 模式：图片完全填充卡片，不留黑边（固定样式）
+ * - Fit 模式：完整显示图片内容，可能有黑边（自适应样式）
  * 
  * 性能优化：
  * - 使用固定的目标尺寸 (1080px)，避免加载原始 4K/HDR 图片
@@ -37,6 +39,7 @@ import com.tabula.v3.di.CoilSetup
  * @param modifier 外部修饰符
  * @param cornerRadius 圆角半径
  * @param elevation 阴影高度
+ * @param contentScaleMode 内容缩放模式（Crop 或 Fit）
  */
 @Composable
 fun ImageCard(
@@ -44,15 +47,35 @@ fun ImageCard(
     modifier: Modifier = Modifier,
     cornerRadius: Dp = 16.dp,
     elevation: Dp = 8.dp,
-    badges: List<String> = emptyList()
+    badges: List<String> = emptyList(),
+    contentScaleMode: ContentScale = ContentScale.Crop
 ) {
     val context = LocalContext.current
     val imageLoader = CoilSetup.getImageLoader(context)
     val shape = RoundedCornerShape(cornerRadius)
     
-    // 使用固定尺寸，避免因尺寸变化导致的重复加载
-    // 1080px 对于大部分手机屏幕足够清晰，同时避免加载过大的图片
-    val targetSize = remember { Size(1080, 1440) }
+    // 根据图片比例计算合适的加载尺寸
+    // 保持图片原始比例，避免 Coil 加载时预先裁剪
+    // 当图片没有有效尺寸信息时，使用默认的 3:4 加载尺寸
+    val targetSize = remember(imageFile.id, imageFile.aspectRatio, imageFile.hasDimensionInfo) {
+        if (!imageFile.hasDimensionInfo) {
+            // 无有效尺寸信息，使用默认的 3:4 尺寸
+            Size(1080, 1440)
+        } else {
+            val maxDimension = 1440
+            if (imageFile.aspectRatio < 1f) {
+                // 竖图：高度为主
+                val height = maxDimension
+                val width = (height * imageFile.aspectRatio).toInt().coerceAtLeast(540)
+                Size(width, height)
+            } else {
+                // 横图：宽度为主
+                val width = maxDimension
+                val height = (width / imageFile.aspectRatio).toInt().coerceAtLeast(540)
+                Size(width, height)
+            }
+        }
+    }
     
     // 使用稳定的缓存键，基于图片 ID
     val cacheKey = remember(imageFile.id) { "card_${imageFile.id}" }
@@ -70,11 +93,11 @@ fun ImageCard(
             .background(Color(0xFF1A1A1A)),
         contentAlignment = Alignment.Center
     ) {
-        // 单层图片 - Crop 填充，无黑边
+        // 图片显示
         AsyncImage(
             model = ImageRequest.Builder(context)
                 .data(imageFile.uri)
-                .size(targetSize)  // 固定尺寸，避免加载原始大图
+                .size(targetSize)  // 根据模式计算的尺寸
                 .memoryCacheKey(cacheKey)  // 稳定的缓存键
                 .diskCacheKey(cacheKey)
                 .memoryCachePolicy(CachePolicy.ENABLED)
@@ -83,7 +106,7 @@ fun ImageCard(
                 .build(),
             contentDescription = imageFile.displayName,
             imageLoader = imageLoader,
-            contentScale = ContentScale.Crop,  // 裁剪填充
+            contentScale = contentScaleMode,  // 根据模式选择缩放方式
             modifier = Modifier.fillMaxSize()
         )
 

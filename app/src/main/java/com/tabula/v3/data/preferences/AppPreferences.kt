@@ -178,6 +178,18 @@ class AppPreferences(context: Context) {
         get() = prefs.getInt(KEY_PENDING_BATCH_REMAINING, 0)
         set(value) = prefs.edit().putInt(KEY_PENDING_BATCH_REMAINING, value).apply()
 
+    /**
+     * 卡片样式模式（固定 / 自适应）
+     */
+    var cardStyleMode: CardStyleMode
+        get() {
+            val value = prefs.getString(KEY_CARD_STYLE_MODE, CardStyleMode.FIXED.name)
+            return CardStyleMode.valueOf(value ?: CardStyleMode.FIXED.name)
+        }
+        set(value) {
+            prefs.edit().putString(KEY_CARD_STYLE_MODE, value.name).apply()
+        }
+
     // 照片抽取时间戳和冷却天数记录（用于冷却期逻辑）
     private val pickTimestampsPrefs: SharedPreferences = context.getSharedPreferences(
         PICK_TIMESTAMPS_PREFS_NAME,
@@ -308,6 +320,7 @@ class AppPreferences(context: Context) {
         private const val KEY_LAST_KNOWN_IMAGE_COUNT = "last_known_image_count"
         private const val KEY_FLUID_CLOUD_ENABLED = "fluid_cloud_enabled"
         private const val KEY_PENDING_BATCH_REMAINING = "pending_batch_remaining"
+        private const val KEY_CARD_STYLE_MODE = "card_style_mode"
 
         private const val PICK_TIMESTAMPS_PREFS_NAME = "tabula_pick_timestamps"
 
@@ -360,6 +373,14 @@ enum class TopBarDisplayMode {
 enum class RecommendMode {
     RANDOM_WALK,    // 随机漫步 - 真正随机，带冷却期
     SIMILAR         // 相似推荐 - 优先推荐相似照片
+}
+
+/**
+ * 卡片样式模式枚举
+ */
+enum class CardStyleMode {
+    FIXED,      // 固定样式 - 3:4 比例，Crop 填充
+    ADAPTIVE    // 自适应样式 - 根据图片比例动态调整
 }
 
 /**

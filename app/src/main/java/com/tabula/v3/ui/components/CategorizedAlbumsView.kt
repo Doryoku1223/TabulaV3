@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import com.tabula.v3.R
 import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.data.repository.LocalImageRepository
@@ -309,18 +310,16 @@ private fun AppAlbumCard(
                     modifier = Modifier.fillMaxSize()
                 )
             } else {
-                val albumColor = album.color?.let { Color(it) } ?: Color(0xFF7986CB)
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(albumColor.copy(alpha = 0.2f)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = album.emoji ?: "📁",
-                        fontSize = 32.sp
-                    )
-                }
+                // 没有封面时显示小猫咪图片
+                AsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(R.drawable.zpcat1)
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = "空图集封面",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
             }
         }
 
@@ -387,18 +386,16 @@ private fun AppAlbumGridCard(
                     modifier = Modifier.fillMaxSize()
                 )
             } else {
-                val albumColor = album.color?.let { Color(it) } ?: Color(0xFF7986CB)
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(albumColor.copy(alpha = 0.2f)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = album.emoji ?: "📁",
-                        fontSize = 40.sp
-                    )
-                }
+                // 没有封面时显示小猫咪图片
+                AsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(R.drawable.zpcat1)
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = "空图集封面",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
             }
         }
 

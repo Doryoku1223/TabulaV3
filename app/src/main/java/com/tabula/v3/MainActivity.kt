@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.data.preferences.AppPreferences
+import com.tabula.v3.data.preferences.CardStyleMode
 import com.tabula.v3.data.preferences.ThemeMode
 import com.tabula.v3.data.preferences.TopBarDisplayMode
 import com.tabula.v3.data.repository.FileOperationManager
@@ -218,6 +219,7 @@ fun TabulaApp(
     var currentTopBarMode by remember { mutableStateOf(preferences.topBarDisplayMode) }
     var showHdrBadges by remember { mutableStateOf(preferences.showHdrBadges) }
     var showMotionBadges by remember { mutableStateOf(preferences.showMotionBadges) }
+    var cardStyleMode by remember { mutableStateOf(preferences.cardStyleMode) }
     var playMotionSound by remember { mutableStateOf(preferences.playMotionSound) }
     var motionSoundVolume by remember { mutableIntStateOf(preferences.motionSoundVolume) }
     var hapticEnabled by remember { mutableStateOf(preferences.hapticEnabled) }
@@ -453,6 +455,7 @@ fun TabulaApp(
             playMotionSound = playMotionSound,
             motionSoundVolume = motionSoundVolume,
             enableSwipeHaptics = swipeHapticsEnabled,
+            isAdaptiveCardStyle = cardStyleMode == CardStyleMode.ADAPTIVE,
             isAlbumMode = isAlbumMode,
             onModeChange = { isAlbumMode = it },
             onBatchRemainingChange = { remaining ->
@@ -640,6 +643,7 @@ fun TabulaApp(
             secondaryTextColor = Color(0xFF8E8E93),
             showHdrBadges = showHdrBadges,
             showMotionBadges = showMotionBadges,
+            cardStyleMode = cardStyleMode,
             onShowHdrBadgesChange = { enabled ->
                 showHdrBadges = enabled
                 preferences.showHdrBadges = enabled
@@ -647,6 +651,10 @@ fun TabulaApp(
             onShowMotionBadgesChange = { enabled ->
                 showMotionBadges = enabled
                 preferences.showMotionBadges = enabled
+            },
+            onCardStyleModeChange = { mode ->
+                cardStyleMode = mode
+                preferences.cardStyleMode = mode
             },
             onNavigateBack = { currentScreen = AppScreen.SETTINGS }
         )
