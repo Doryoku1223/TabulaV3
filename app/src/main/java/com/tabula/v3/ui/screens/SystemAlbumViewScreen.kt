@@ -88,10 +88,12 @@ fun SystemAlbumViewScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(backgroundColor)
-            .statusBarsPadding()
+        // 注意：statusBarsPadding 移到 Column 内部，确保 ViewerOverlay 的坐标系与 boundsInRoot() 一致
     ) {
         Column(
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
         ) {
             // 顶部栏
             Row(
@@ -124,7 +126,6 @@ fun SystemAlbumViewScreen(
             }
 
             // 照片网格
-            val isScrolling = gridState.isScrollInProgress
             LazyVerticalGrid(
                 columns = GridCells.Fixed(3),
                 contentPadding = PaddingValues(4.dp),
@@ -138,7 +139,6 @@ fun SystemAlbumViewScreen(
                         image = image,
                         showHdrBadge = showHdrBadges,
                         showMotionBadge = showMotionBadges,
-                        isScrolling = isScrolling,
                         onClick = { sourceRect ->
                             viewerState = ViewerState(image, sourceRect)
                         }
@@ -170,7 +170,6 @@ private fun PhotoGridItem(
     image: ImageFile,
     showHdrBadge: Boolean,
     showMotionBadge: Boolean,
-    isScrolling: Boolean,
     onClick: (SourceRect) -> Unit
 ) {
     val context = LocalContext.current
@@ -202,66 +201,59 @@ private fun PhotoGridItem(
                 onClick(sourceRect)
             }
     ) {
-        if (isScrolling) {
-            // 快速滚动时不加载图片，避免解码风暴导致卡顿/ANR
-            Box(
+        // 使用稳定的缓存键，基于图片 ID
+        // 移除 isScrolling 判断，避免滚动时闪黑屏
+        // Coil 的缓存机制会确保已加载的图片不会重复解码
+        val cacheKey = remember(image.id) { "sys_grid_${image.id}" }
+        
+        AsyncImage(
+            model = ImageRequest.Builder(context)
+                .data(image.uri)
+                .size(Size(240, 240))  // 缩略图只需要小尺寸，大幅减少解码压力
+                .precision(Precision.INEXACT)
+                .bitmapConfig(Bitmap.Config.RGB_565)
+                .allowHardware(false)
+                .memoryCacheKey(cacheKey)
+                .diskCacheKey(cacheKey)
+                .memoryCachePolicy(CachePolicy.ENABLED)
+                .diskCachePolicy(CachePolicy.ENABLED)
+                .crossfade(false)
+                .build(),
+            contentDescription = image.displayName,
+            imageLoader = imageLoader,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize()
+        )
+        
+        // HDR / Live 标识
+        val badges = rememberImageBadges(
+            image = image, 
+            showHdr = showHdrBadge, 
+            showMotion = showMotionBadge
+        )
+        
+        if (badges.isNotEmpty()) {
+            Row(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.08f))
-            )
-        } else {
-            // 使用稳定的缓存键，基于图片 ID
-            val cacheKey = remember(image.id) { "sys_grid_${image.id}" }
-            
-            AsyncImage(
-                model = ImageRequest.Builder(context)
-                    .data(image.uri)
-                    .size(Size(240, 240))  // 缩略图只需要小尺寸，大幅减少解码压力
-                    .precision(Precision.INEXACT)
-                    .bitmapConfig(Bitmap.Config.RGB_565)
-                    .allowHardware(false)
-                    .memoryCacheKey(cacheKey)
-                    .diskCacheKey(cacheKey)
-                    .memoryCachePolicy(CachePolicy.ENABLED)
-                    .diskCachePolicy(CachePolicy.ENABLED)
-                    .crossfade(false)
-                    .build(),
-                contentDescription = image.displayName,
-                imageLoader = imageLoader,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
-            )
-            
-            // HDR / Live 标识
-            val badges = rememberImageBadges(
-                image = image, 
-                showHdr = showHdrBadge, 
-                showMotion = showMotionBadge
-            )
-            
-            if (badges.isNotEmpty()) {
-                Row(
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(4.dp),
-                    horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(2.dp)
-                ) {
-                    badges.forEach { badge ->
-                        Box(
-                            modifier = Modifier
-                                .background(
-                                    color = Color.Black.copy(alpha = 0.6f),
-                                    shape = RoundedCornerShape(3.dp)
-                                )
-                                .padding(horizontal = 4.dp, vertical = 2.dp)
-                        ) {
-                            Text(
-                                text = badge,
-                                color = Color.White,
-                                fontSize = 8.sp,
-                                fontWeight = FontWeight.Bold
+                    .align(Alignment.TopEnd)
+                    .padding(4.dp),
+                horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(2.dp)
+            ) {
+                badges.forEach { badge ->
+                    Box(
+                        modifier = Modifier
+                            .background(
+                                color = Color.Black.copy(alpha = 0.6f),
+                                shape = RoundedCornerShape(3.dp)
                             )
-                        }
+                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = badge,
+                            color = Color.White,
+                            fontSize = 8.sp,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
             }

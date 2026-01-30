@@ -65,6 +65,7 @@ import androidx.compose.ui.draw.BlurredEdgeTreatment
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
@@ -85,14 +86,14 @@ import com.tabula.v3.data.preferences.TopBarDisplayMode
 import com.tabula.v3.data.repository.LocalImageRepository
 import androidx.compose.ui.geometry.Offset
 import com.tabula.v3.ui.components.ActionIconButton
-import com.tabula.v3.ui.components.AlbumChips
 import com.tabula.v3.ui.components.AlbumDropTarget
-import com.tabula.v3.ui.components.AlbumChipsEmpty
 import com.tabula.v3.ui.components.AlbumEditDialog
 import com.tabula.v3.ui.components.BatchCompletionScreen
 import com.tabula.v3.ui.components.CategorizedAlbumsView
 import com.tabula.v3.ui.components.DraggableAlbumsGrid
+import com.tabula.v3.ui.components.AdaptiveGlass
 import com.tabula.v3.ui.components.FrostedGlass
+import com.tabula.v3.ui.components.BackdropLiquidGlassConfig
 import com.tabula.v3.ui.components.ModeToggle
 import com.tabula.v3.ui.components.SourceRect
 import com.tabula.v3.ui.components.SwipeableCardStack
@@ -100,6 +101,7 @@ import com.tabula.v3.ui.components.TopBar
 import com.tabula.v3.ui.components.UndoSnackbar
 import com.tabula.v3.ui.components.ViewerOverlay
 import com.tabula.v3.ui.components.ViewerState
+import com.tabula.v3.ui.components.LocalLiquidGlassEnabled
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.theme.TabulaColors
 import com.tabula.v3.ui.util.HapticFeedback
@@ -171,6 +173,8 @@ fun DeckScreen(
 ) {
     val context = LocalContext.current
     val isDarkTheme = LocalIsDarkTheme.current
+    
+    // 背景颜色 - 纯白/纯黑，液态玻璃效果只在卡片上
     val backgroundColor = if (isDarkTheme) Color.Black else Color(0xFFF2F2F7)
 
     // ========== 批次状态 ==========
@@ -654,47 +658,22 @@ private fun DeckContent(
                             )
                         }
 
-                        // 相册归类 Chips
-                        if (albums.isNotEmpty()) {
-                            AlbumChips(
-                                albums = albums,
-                                selectedAlbumIds = currentImageAlbumIds,
-                                onAlbumClick = onAlbumClick,
-                                onAddAlbumClick = onAddAlbumClick,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(bottom = 80.dp)
-                            )
-                        } else {
-                            AlbumChipsEmpty(
-                                onAddAlbumClick = onAddAlbumClick,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(bottom = 80.dp)
-                            )
-                        }
+                        // 底部留白，为模式切换按钮预留空间
+                        Spacer(modifier = Modifier.height(80.dp))
                     }
                 }
                 
                 // 归类模式：显示标签选择器
-                // 使用 alpha 而不是 AnimatedVisibility，确保组件始终存在以收集位置数据
-                val dropTargetAlpha by androidx.compose.animation.core.animateFloatAsState(
-                    targetValue = if (isClassifyMode) 1f else 0f,
-                    animationSpec = androidx.compose.animation.core.tween(
-                        durationMillis = 200
-                    ),
-                    label = "dropTargetAlpha"
-                )
-                
-                // 始终渲染 AlbumDropTarget，但使用透明度控制可见性
-                // 这样可以确保标签位置数据始终可用
-                if (albums.isNotEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .graphicsLayer {
-                                alpha = dropTargetAlpha
-                            }
+                // 只在归类模式下渲染 AlbumDropTarget，避免 FrostedGlass 在 alpha=0 时的视觉残留
+                if (isClassifyMode && albums.isNotEmpty()) {
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = true,
+                        enter = androidx.compose.animation.fadeIn(
+                            animationSpec = androidx.compose.animation.core.tween(200)
+                        ),
+                        exit = androidx.compose.animation.fadeOut(
+                            animationSpec = androidx.compose.animation.core.tween(200)
+                        )
                     ) {
                         AlbumDropTarget(
                             albums = albums,
@@ -833,7 +812,7 @@ private fun AlbumsGridContent(
     val collapseThreshold = 40.dp
     val density = LocalDensity.current
     val collapseThresholdPx = with(density) { collapseThreshold.toPx() }
-    val blurRadius = 32.dp
+    val blurRadius = 40.dp  // 增加模糊半径，实现更柔和的毛玻璃效果
     
     // TODO
     val scrollOffset by remember {
@@ -850,13 +829,15 @@ private fun AlbumsGridContent(
         derivedStateOf { scrollOffset / collapseThresholdPx }
     }
     
-    // TODO
-    // TODO
+    // ========== 厚实毛玻璃质感参数 ==========
+    // 材质厚度（Opacity）：模拟 iOS 键盘的实体感
+    // - 浅色模式：0.70f，色值 Color(0xFFF5F5F7)
+    // - 深色模式：0.60f
     val glassAlpha by animateFloatAsState(
         targetValue = if (collapsedFraction > 0.15f) {
-            if (isDarkTheme) 0.42f else 0.18f
+            if (isDarkTheme) 0.65f else 0.75f  // 滚动后略微增强
         } else {
-            if (isDarkTheme) 0.16f else 0.08f
+            if (isDarkTheme) 0.60f else 0.70f  // 基础厚度
         },
         label = "TopBarGlassAlpha"
     )
@@ -1028,18 +1009,25 @@ private fun AlbumsGridContent(
             userScrollEnabled = true
         )
 
-        // 3. Top bar (floating glass)
-        val topBarTint = (if (isDarkTheme) Color(0xFF1C1C1E) else Color.White)
-            .copy(alpha = glassAlpha)
-        val topBarHighlight = androidx.compose.ui.graphics.Brush.verticalGradient(
-            colors = listOf(
-                Color.White.copy(alpha = if (isDarkTheme) 0.08f else 0.12f),
-                Color.White.copy(alpha = if (isDarkTheme) 0.03f else 0.05f),
-                Color.Transparent
+        // ========== 3. 浮动毛玻璃导航栏 ==========
+        // 简洁设计：从下到上的渐变 + 磨砂模糊质感
+        val frostedGradient = if (isDarkTheme) {
+            Brush.verticalGradient(
+                colors = listOf(
+                    Color(0xFF1C1C1E).copy(alpha = 0.50f),  // 顶部：较透
+                    Color(0xFF1C1C1E).copy(alpha = 0.75f)   // 底部：较实
+                )
             )
-        )
+        } else {
+            Brush.verticalGradient(
+                colors = listOf(
+                    Color.White.copy(alpha = 0.60f),  // 顶部：较透
+                    Color.White.copy(alpha = 0.85f)  // 底部：较实
+                )
+            )
+        }
 
-        FrostedGlass(
+        AdaptiveGlass(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
@@ -1047,11 +1035,10 @@ private fun AlbumsGridContent(
                     topBarHeight = with(density) { size.height.toDp() }
                 },
             shape = RoundedCornerShape(0.dp),
-            blurRadius = blurRadius,
-            tint = topBarTint,
-            borderWidth = 0.dp,
-            highlightBrush = topBarHighlight,
-            noiseAlpha = if (isDarkTheme) 0.03f else 0.05f,
+            blurRadius = 40.dp,  // 磨砂模糊
+            tintGradient = frostedGradient,  // 从下到上渐变
+            noiseAlpha = if (isDarkTheme) 0.02f else 0.03f,  // 轻微噪点增加质感
+            backdropConfig = BackdropLiquidGlassConfig.Bar.copy(cornerRadius = 0.dp),  // Backdrop 液态玻璃配置
             contentAlignment = Alignment.TopCenter
         ) {
             Column(

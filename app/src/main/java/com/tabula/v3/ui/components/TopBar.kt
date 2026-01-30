@@ -35,6 +35,9 @@ import androidx.compose.ui.unit.sp
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.data.preferences.TopBarDisplayMode
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
+import com.tabula.v3.ui.components.LocalLiquidGlassEnabled
+import com.tabula.v3.ui.components.PhysicalLiquidGlassBox
+import com.tabula.v3.ui.components.PhysicalLiquidGlassConfig
 import com.tabula.v3.ui.theme.TabulaColors
 import com.tabula.v3.ui.util.HapticFeedback
 import java.text.SimpleDateFormat
@@ -162,7 +165,7 @@ private fun formatDateForTopBar(timestamp: Long): String {
  * 操作图标按钮组件 - 统一的图标按钮样式
  * 
  * 用于顶部栏的操作按钮，带背景色和圆角。
- * 此组件可在多处复用以保持UI一致性。
+ * 自动适配液态玻璃主题。
  * 
  * @param icon 图标
  * @param contentDescription 无障碍描述
@@ -180,23 +183,51 @@ fun ActionIconButton(
     iconColor: Color,
     modifier: Modifier = Modifier
 ) {
-    IconButton(
-        onClick = onClick,
-        modifier = modifier
-            .size(44.dp)
-            .clip(RoundedCornerShape(12.dp))
-            .background(backgroundColor),
-        colors = IconButtonDefaults.iconButtonColors(
-            containerColor = backgroundColor,
-            contentColor = iconColor
-        )
-    ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = contentDescription,
-            modifier = Modifier.size(24.dp),
-            tint = iconColor
-        )
+    val isLiquidGlassEnabled = LocalLiquidGlassEnabled.current
+    
+    if (isLiquidGlassEnabled) {
+        // 液态玻璃模式：使用玻璃按钮
+        PhysicalLiquidGlassBox(
+            modifier = modifier.size(44.dp),
+            config = PhysicalLiquidGlassConfig.Button.copy(
+                cornerRadius = 12.dp,
+                surfaceAlpha = 0.18f,
+                tintStrength = 0.10f
+            ),
+            contentAlignment = Alignment.Center
+        ) {
+            IconButton(
+                onClick = onClick,
+                modifier = Modifier.size(44.dp)
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = contentDescription,
+                    modifier = Modifier.size(24.dp),
+                    tint = iconColor
+                )
+            }
+        }
+    } else {
+        // 普通模式
+        IconButton(
+            onClick = onClick,
+            modifier = modifier
+                .size(44.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(backgroundColor),
+            colors = IconButtonDefaults.iconButtonColors(
+                containerColor = backgroundColor,
+                contentColor = iconColor
+            )
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = contentDescription,
+                modifier = Modifier.size(24.dp),
+                tint = iconColor
+            )
+        }
     }
 }
 

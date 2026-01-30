@@ -92,6 +92,9 @@ class RecommendationEngine(
      * 4. 来自同一相册
      * 
      * 优先返回相似度最高的图片，确保用户看到的确实是相似的照片
+     * 
+     * 注意：与随机漫步模式一样，相似推荐也使用冷却期机制，
+     * 确保刷过的照片在冷却期内不会再被推荐
      */
     private suspend fun getSimilarBatch(
         allImages: List<ImageFile>,
@@ -100,19 +103,40 @@ class RecommendationEngine(
     ): List<ImageFile> {
         if (allImages.isEmpty()) return emptyList()
         
+        // 获取冷却期内的图片ID集合
+        val cooldownIds = preferences.getCooldownImageIds()
+        
+        // 分离可用照片和冷却中的照片
+        val (cooldownImages, availableImages) = allImages.partition { 
+            it.id in cooldownIds
+        }
+        
+        // 如果所有照片都在冷却期内，返回空列表（或从冷却期照片中补充）
+        if (availableImages.isEmpty()) {
+            // 从冷却期照片中选择最早被抽取的（即将结束冷却的）
+            val sortedCooldown = cooldownImages.sortedBy { 
+                preferences.getImagePickedTimestamp(it.id) 
+            }
+            val result = sortedCooldown.take(batchSize)
+            preferences.recordImagesPicked(result.map { it.id })
+            return result
+        }
+        
         // 相似度阈值 - 低于此分数认为不相似
         val similarityThreshold = 30f
         
-        // 如果没有锚点图片，随机选择一个作为起点
-        // 优先从最近拍摄的照片中选择（更可能有连拍和相似照片）
-        val anchor = anchorImage ?: run {
-            // 按时间排序，从最近的 100 张照片中随机选择一个
-            val recentImages = allImages.sortedByDescending { it.dateModified }.take(100)
-            recentImages.randomOrNull() ?: allImages.randomOrNull() ?: return emptyList()
+        // 如果没有锚点图片，从非冷却期的照片中随机选择一个作为起点
+        // 优先从最近拍摄的可用照片中选择（更可能有连拍和相似照片）
+        val anchor = anchorImage?.takeIf { it.id !in cooldownIds } ?: run {
+            // 按时间排序，从最近的可用照片中随机选择一个
+            val recentAvailable = availableImages.sortedByDescending { it.dateModified }.take(100)
+            recentAvailable.randomOrNull() ?: availableImages.randomOrNull() ?: return emptyList()
         }
+        
         // 为了性能，只对时间上接近锚点的图片计算相似度
         // 先按时间排序，找到锚点位置，然后取前后各 500 张
-        val sortedByTime = allImages.sortedBy { it.dateModified }
+        // 注意：这里使用 availableImages（非冷却期照片）来筛选候选
+        val sortedByTime = availableImages.sortedBy { it.dateModified }
         val anchorIndex = sortedByTime.indexOfFirst { it.id == anchor.id }
         val startIndex = maxOf(0, anchorIndex - 500)
         val endIndex = minOf(sortedByTime.size, anchorIndex + 500)
@@ -137,7 +161,7 @@ class RecommendationEngine(
             result.add(image)
         }
         
-        // 如果高相似度图片不够，从剩余图片中补充
+        // 如果高相似度图片不够，从剩余可用图片中补充
         if (result.size < batchSize) {
             val remaining = scoredImages
                 .map { it.first }
@@ -146,7 +170,20 @@ class RecommendationEngine(
             result.addAll(remaining)
         }
         
-        return result.take(batchSize)
+        // 如果还不够，从冷却期照片中补充（优先选择即将结束冷却的）
+        if (result.size < batchSize && cooldownImages.isNotEmpty()) {
+            val sortedCooldown = cooldownImages.sortedBy { 
+                preferences.getImagePickedTimestamp(it.id) 
+            }
+            result.addAll(sortedCooldown.take(batchSize - result.size))
+        }
+        
+        val finalResult = result.take(batchSize)
+        
+        // 记录这批照片被抽取（与随机漫步模式保持一致）
+        preferences.recordImagesPicked(finalResult.map { it.id })
+        
+        return finalResult
     }
     
     /**

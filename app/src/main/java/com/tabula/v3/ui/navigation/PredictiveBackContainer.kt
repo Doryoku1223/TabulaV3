@@ -175,6 +175,15 @@ fun PredictiveBackContainer(
                             clip = true
                         }
                     }
+                    // 拦截所有触摸事件，防止穿透到背景层
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                awaitPointerEvent()
+                                // 消费所有触摸事件，不做任何处理
+                            }
+                        }
+                    }
             ) {
                 foregroundContent()
             }

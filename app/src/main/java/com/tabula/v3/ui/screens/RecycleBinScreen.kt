@@ -13,6 +13,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -34,8 +35,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid
 import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells
 import androidx.compose.foundation.lazy.staggeredgrid.items
-import androidx.compose.foundation.pager.HorizontalPager
-import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -45,6 +44,7 @@ import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.DeleteForever
 import androidx.compose.material.icons.outlined.Restore
+import androidx.compose.material.icons.outlined.HelpOutline
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -88,6 +88,7 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.di.CoilSetup
+import com.tabula.v3.ui.components.LocalLiquidGlassEnabled
 import com.tabula.v3.ui.components.MediaBadgeRow
 import com.tabula.v3.ui.components.MotionPhotoPlayer
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
@@ -140,6 +141,9 @@ fun RecycleBinScreen(
     
     // 单项删除确认
     var imageToDelete by remember { mutableStateOf<ImageFile?>(null) }
+    
+    // 帮助提示对话框
+    var showHelpDialog by remember { mutableStateOf(false) }
 
     // 返回键处理
     BackHandler(enabled = viewerState != null || isSelectionMode) {
@@ -193,6 +197,7 @@ fun RecycleBinScreen(
                     textColor = textColor,
                     secondaryTextColor = secondaryTextColor,
                     onBack = onNavigateBack,
+                    onHelp = { showHelpDialog = true },
                     onClearAll = {
                         if (deletedImages.isNotEmpty()) {
                             showClearDialog = true
@@ -286,6 +291,21 @@ fun RecycleBinScreen(
 
     // ========== 弹窗区域 ==========
     
+    // 0. 帮助提示对话框
+    if (showHelpDialog) {
+        TabulaDialog(
+            title = "关于删除",
+            text = "从回收站彻底删除的照片会进入系统相册的「最近删除」。\n\n" +
+                   "如果您开启了云同步（如 OPPO 云服务），系统相册中可能会显示灰色占位图，" +
+                   "这是因为本地文件已删除，但云端仍保留元数据。这属于正常现象，照片已被正确删除。",
+            confirmText = "知道了",
+            cancelText = "",
+            isDestructive = false,
+            onConfirm = { showHelpDialog = false },
+            onDismiss = { showHelpDialog = false }
+        )
+    }
+
     // 1. 清空回收站确认
     if (showClearDialog) {
         TabulaDialog(
@@ -328,6 +348,7 @@ fun RecycleBinScreen(
 
 /**
  * 优雅的自定义对话框
+ * 自动适配液态玻璃主题
  */
 @Composable
 fun TabulaDialog(
@@ -341,12 +362,19 @@ fun TabulaDialog(
 ) {
     Dialog(onDismissRequest = onDismiss) {
         val isDarkTheme = LocalIsDarkTheme.current
+        val isLiquidGlassEnabled = LocalLiquidGlassEnabled.current
         val backgroundColor = if (isDarkTheme) Color(0xFF1C1C1E) else Color.White
+        // 液态玻璃模式下使用更不透明的背景
+        val effectiveBgColor = if (isLiquidGlassEnabled) {
+            backgroundColor.copy(alpha = 0.98f)
+        } else {
+            backgroundColor
+        }
         val textColor = if (isDarkTheme) Color.White else Color.Black
         
         Surface(
             shape = RoundedCornerShape(28.dp),
-            color = backgroundColor,
+            color = effectiveBgColor,
             tonalElevation = 6.dp,
             modifier = Modifier
                 .width(320.dp)
@@ -382,28 +410,30 @@ fun TabulaDialog(
                 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
+                    horizontalArrangement = if (cancelText.isNotEmpty()) Arrangement.SpaceBetween else Arrangement.Center
                 ) {
-                    // 取消按钮
-                    Button(
-                        onClick = onDismiss,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isDarkTheme) Color(0xFF2C2C2E) else Color(0xFFF2F2F7),
-                            contentColor = if (isDarkTheme) Color.White else Color.Black
-                        ),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(48.dp),
-                        elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp)
-                    ) {
-                        Text(
-                            text = cancelText,
-                            fontWeight = FontWeight.SemiBold
-                        )
+                    // 取消按钮（仅当 cancelText 不为空时显示）
+                    if (cancelText.isNotEmpty()) {
+                        Button(
+                            onClick = onDismiss,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isDarkTheme) Color(0xFF2C2C2E) else Color(0xFFF2F2F7),
+                                contentColor = if (isDarkTheme) Color.White else Color.Black
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp),
+                            elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp)
+                        ) {
+                            Text(
+                                text = cancelText,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        
+                        Spacer(modifier = Modifier.width(12.dp))
                     }
-                    
-                    Spacer(modifier = Modifier.width(12.dp))
                     
                     // 确认按钮
                     Button(
@@ -414,7 +444,7 @@ fun TabulaDialog(
                         ),
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier
-                            .weight(1f)
+                            .then(if (cancelText.isNotEmpty()) Modifier.weight(1f) else Modifier.fillMaxWidth())
                             .height(48.dp),
                         elevation = ButtonDefaults.buttonElevation(0.dp, 0.dp)
                     ) {
@@ -617,28 +647,9 @@ private fun FullScreenViewer(
         zoomOffset = clampOffset(newOffset, clampedScale, size)
     }
     
-    val pagerState = rememberPagerState(
-        initialPage = initialIndex.coerceIn(0, images.lastIndex.coerceAtLeast(0)),
-        pageCount = { images.size }
-    )
-
-    LaunchedEffect(pagerState.currentPage) {
-        zoomScale = minScale
-        zoomOffset = Offset.Zero
-        zoomSize = Size.Zero
-    }
-
-    LaunchedEffect(zoomSize, zoomScale) {
-        if (zoomSize.width <= 0f || zoomSize.height <= 0f) return@LaunchedEffect
-        if (zoomScale <= minScale) {
-            zoomOffset = Offset.Zero
-        } else {
-            zoomOffset = clampOffset(zoomOffset, zoomScale, zoomSize)
-        }
-    }
-    
-    val currentImage = images.getOrNull(pagerState.currentPage)
-    val currentFeatures = currentImage?.let { image ->
+    // 获取当前显示的图片
+    val displayImage = images.getOrNull(initialIndex.coerceIn(0, images.lastIndex.coerceAtLeast(0)))
+    val currentFeatures = displayImage?.let { image ->
         rememberImageFeatures(
             image = image,
             enableHdr = showHdr,
@@ -652,7 +663,7 @@ private fun FullScreenViewer(
     var isPressing by remember { mutableStateOf(false) }
     val pressDelayMs = 80L
 
-    LaunchedEffect(isPressing, isHdr, currentMotionInfo, pagerState.currentPage) {
+    LaunchedEffect(isPressing, isHdr, currentMotionInfo) {
         if (!isPressing) {
             isHdrComparePressed = false
             isLivePressed = false
@@ -667,12 +678,6 @@ private fun FullScreenViewer(
                 isLivePressed = true
             }
         }
-    }
-
-    LaunchedEffect(pagerState.currentPage) {
-        isHdrComparePressed = false
-        isLivePressed = false
-        isPressing = false
     }
 
     val activity = context.findActivity()
@@ -699,139 +704,131 @@ private fun FullScreenViewer(
     }
 
 
-
-
-
-
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
     ) {
-        // 图片翻页器
-        HorizontalPager(
-            state = pagerState,
-            modifier = Modifier.fillMaxSize(),
-            userScrollEnabled = zoomScale <= minScale
-        ) { page ->
-            val image = images.getOrNull(page)
-            if (image != null) {
-                val features = rememberImageFeatures(
-                    image = image,
-                    enableHdr = showHdr,
-                    enableMotion = showMotionPhoto
-                )
-                val motionInfo = if (showMotionPhoto) features?.motionPhotoInfo else null
-                val isCurrentPage = page == pagerState.currentPage
+        // 单张图片显示（不需要翻页）
+        if (displayImage != null) {
+            BoxWithConstraints(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                val aspectRatio = if (displayImage.height > 0) {
+                    displayImage.width.toFloat() / displayImage.height
+                } else {
+                    1f
+                }
+                val containerRatio = maxWidth.value / maxHeight.value
+                val (targetWidth, targetHeight) = if (aspectRatio > containerRatio) {
+                    maxWidth to (maxWidth / aspectRatio)
+                } else {
+                    (maxHeight * aspectRatio) to maxHeight
+                }
 
-                BoxWithConstraints(
-                    modifier = Modifier.fillMaxSize(),
+                Box(
+                    modifier = Modifier
+                        .size(targetWidth, targetHeight)
+                        .onSizeChanged { size ->
+                            zoomSize = Size(size.width.toFloat(), size.height.toFloat())
+                        }
+                        .graphicsLayer {
+                            scaleX = zoomScale
+                            scaleY = zoomScale
+                            translationX = zoomOffset.x
+                            translationY = zoomOffset.y
+                            transformOrigin = TransformOrigin(0.5f, 0.5f)
+                        }
+                        // 双指缩放
+                        .pointerInput(Unit) {
+                            detectTransformGestures { _, _, zoom, _ ->
+                                val newScale = (zoomScale * zoom).coerceIn(minScale, maxScale)
+                                zoomScale = newScale
+                                if (newScale <= minScale) {
+                                    zoomOffset = Offset.Zero
+                                } else {
+                                    zoomOffset = clampOffset(zoomOffset, newScale, zoomSize)
+                                }
+                            }
+                        }
+                        // 单击/双击/长按 + 单指拖动（合并处理避免冲突）
+                        .pointerInput(Unit) {
+                            detectTapGestures(
+                                onTap = {
+                                    // 单击退出（未放大时）
+                                    if (zoomScale <= 1.2f) {
+                                        onDismiss()
+                                    }
+                                },
+                                onPress = {
+                                    isPressing = true
+                                    tryAwaitRelease()
+                                    isPressing = false
+                                },
+                                onDoubleTap = { tapOffset ->
+                                    val targetScale = if (zoomScale > 1.2f) minScale else doubleTapScale
+                                    if (zoomSize.width <= 0f || zoomSize.height <= 0f) {
+                                        zoomScale = targetScale
+                                        zoomOffset = Offset.Zero
+                                        return@detectTapGestures
+                                    }
+                                    if (targetScale <= minScale) {
+                                        zoomScale = minScale
+                                        zoomOffset = Offset.Zero
+                                    } else {
+                                        val center = Offset(zoomSize.width / 2f, zoomSize.height / 2f)
+                                        val scaleChange = targetScale / zoomScale
+                                        val newOffset = (zoomOffset + (tapOffset - center) * (1 - scaleChange))
+                                        zoomScale = targetScale
+                                        zoomOffset = clampOffset(newOffset, targetScale, zoomSize)
+                                    }
+                                }
+                            )
+                        }
+                        // 单指拖动（只在放大时生效，放在最后避免与点击冲突）
+                        .then(
+                            if (zoomScale > minScale) {
+                                Modifier.pointerInput(zoomScale) {
+                                    detectDragGestures { change, dragAmount ->
+                                        change.consume()
+                                        if (zoomSize.width > 0f && zoomSize.height > 0f) {
+                                            val panMultiplier = zoomScale.coerceIn(1f, maxScale)
+                                            val adjustedPan = Offset(dragAmount.x * panMultiplier, dragAmount.y * panMultiplier)
+                                            val newOffset = zoomOffset + adjustedPan
+                                            zoomOffset = clampOffset(newOffset, zoomScale, zoomSize)
+                                        }
+                                    }
+                                }
+                            } else {
+                                Modifier
+                            }
+                        ),
                     contentAlignment = Alignment.Center
                 ) {
-                    val aspectRatio = if (image.height > 0) {
-                        image.width.toFloat() / image.height
-                    } else {
-                        1f
-                    }
-                    val containerRatio = maxWidth.value / maxHeight.value
-                    val (targetWidth, targetHeight) = if (aspectRatio > containerRatio) {
-                        maxWidth to (maxWidth / aspectRatio)
-                    } else {
-                        (maxHeight * aspectRatio) to maxHeight
-                    }
+                    AsyncImage(
+                        model = ImageRequest.Builder(context)
+                            .data(displayImage.uri)
+                            .crossfade(200)
+                            .build(),
+                        contentDescription = displayImage.displayName,
+                        imageLoader = imageLoader,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize()
+                    )
 
-                    Box(
-                        modifier = Modifier
-                            .size(targetWidth, targetHeight)
-                            .onSizeChanged { size ->
-                                if (isCurrentPage) {
-                                    zoomSize = Size(size.width.toFloat(), size.height.toFloat())
-                                }
-                            }
-                            .graphicsLayer {
-                                val scale = if (isCurrentPage) zoomScale else 1f
-                                val offset = if (isCurrentPage) zoomOffset else Offset.Zero
-                                scaleX = scale
-                                scaleY = scale
-                                translationX = offset.x
-                                translationY = offset.y
-                                transformOrigin = TransformOrigin(0.5f, 0.5f)
-                            }
-                            .pointerInput(isCurrentPage) {
-                                if (!isCurrentPage) return@pointerInput
-                                detectTransformGestures { centroid, pan, zoom, _ ->
-                                    val oldScale = zoomScale
-                                    val newScale = (zoomScale * zoom).coerceIn(minScale, maxScale)
-                                    if (zoomSize.width <= 0f || zoomSize.height <= 0f) {
-                                        zoomScale = newScale
-                                        zoomOffset = Offset.Zero
-                                        return@detectTransformGestures
-                                    }
-                                    val center = Offset(zoomSize.width / 2f, zoomSize.height / 2f)
-                                    val scaleChange = if (oldScale == 0f) 1f else newScale / oldScale
-                                    val panMultiplier = oldScale.coerceIn(1f, 3f)
-                                    val adjustedPan = Offset(pan.x * panMultiplier, pan.y * panMultiplier)
-                                    val newOffset = (zoomOffset + adjustedPan) + (centroid - center) * (1 - scaleChange)
-                                    applyScaleAndOffset(newScale, newOffset, zoomSize)
-                                }
-                            }
-                            .pointerInput(isCurrentPage) {
-                                detectTapGestures(
-                                    onPress = {
-                                        if (!isCurrentPage) {
-                                            return@detectTapGestures
-                                        }
-                                        isPressing = true
-                                        tryAwaitRelease()
-                                        isPressing = false
-                                    },
-                                    onDoubleTap = { tapOffset ->
-                                        if (!isCurrentPage) {
-                                            return@detectTapGestures
-                                        }
-                                        val targetScale = if (zoomScale > 1.2f) minScale else doubleTapScale
-                                        if (zoomSize.width <= 0f || zoomSize.height <= 0f) {
-                                            zoomScale = targetScale
-                                            zoomOffset = Offset.Zero
-                                            return@detectTapGestures
-                                        }
-                                        val center = Offset(zoomSize.width / 2f, zoomSize.height / 2f)
-                                        val scaleChange = if (zoomScale == 0f) 1f else targetScale / zoomScale
-                                        val newOffset = if (targetScale <= minScale) {
-                                            Offset.Zero
-                                        } else {
-                                            (zoomOffset + (tapOffset - center) * (1 - scaleChange))
-                                        }
-                                        applyScaleAndOffset(targetScale, newOffset, zoomSize)
-                                    }
-                                )
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        AsyncImage(
-                            model = ImageRequest.Builder(context)
-                                .data(image.uri)
-                                .crossfade(200)
-                                .build(),
-                            contentDescription = image.displayName,
-                            imageLoader = imageLoader,
-                            contentScale = ContentScale.Fit,
-                            modifier = Modifier.fillMaxSize()
-                        )
-
-                        if (motionInfo != null && page == pagerState.currentPage) {
+                    if (currentMotionInfo != null) {
                         MotionPhotoPlayer(
-                            imageUri = image.uri,
-                            motionInfo = motionInfo,
+                            imageUri = displayImage.uri,
+                            motionInfo = currentMotionInfo,
                             modifier = Modifier.fillMaxSize(),
-                            playWhen = isLivePressed && isCurrentPage,
+                            playWhen = isLivePressed,
                             playAudio = playMotionSound,
                             volumePercent = motionSoundVolume
                         )
                     }
                 }
             }
-        }
         }
 
         // 顶部渐变遮罩 + 关闭按钮 + 页码
@@ -858,7 +855,7 @@ private fun FullScreenViewer(
             }
             
             Text(
-                text = "${pagerState.currentPage + 1} / ${images.size}",
+                text = "${initialIndex + 1} / ${images.size}",
                 color = Color.White,
                 style = MaterialTheme.typography.bodyLarge,
                 modifier = Modifier.align(Alignment.Center)
@@ -889,7 +886,7 @@ private fun FullScreenViewer(
                         .clip(RoundedCornerShape(12.dp))
                         .background(Color.White.copy(alpha = 0.15f))
                         .padding(horizontal = 24.dp, vertical = 12.dp)
-                        .combinedClickable(onClick = { currentImage?.let { onRestore(it) } })
+                        .combinedClickable(onClick = { displayImage?.let { onRestore(it) } })
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.Restore,
@@ -911,7 +908,7 @@ private fun FullScreenViewer(
                         .clip(RoundedCornerShape(12.dp))
                         .background(Color.White.copy(alpha = 0.15f))
                         .padding(horizontal = 24.dp, vertical = 12.dp)
-                        .combinedClickable(onClick = { currentImage?.let { onDelete(it) } })
+                        .combinedClickable(onClick = { displayImage?.let { onDelete(it) } })
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.DeleteForever,
@@ -998,6 +995,7 @@ private fun RecycleBinTopBar(
     textColor: Color,
     secondaryTextColor: Color,
     onBack: () -> Unit,
+    onHelp: () -> Unit,
     onClearAll: () -> Unit
 ) {
     Row(
@@ -1035,23 +1033,35 @@ private fun RecycleBinTopBar(
             }
         }
 
-        if (itemCount > 0) {
-            Button(
-                onClick = onClearAll,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = TabulaColors.DangerRed.copy(alpha = 0.1f),
-                    contentColor = TabulaColors.DangerRed
-                ),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                shape = RoundedCornerShape(20.dp),
-                elevation = ButtonDefaults.buttonElevation(0.dp)
-            ) {
-                Text(
-                    text = "清空",
-                    style = MaterialTheme.typography.labelLarge.copy(
-                        fontWeight = FontWeight.Bold
-                    )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // 帮助按钮
+            IconButton(onClick = onHelp) {
+                Icon(
+                    imageVector = Icons.Outlined.HelpOutline,
+                    contentDescription = "帮助",
+                    tint = secondaryTextColor,
+                    modifier = Modifier.size(22.dp)
                 )
+            }
+            
+            if (itemCount > 0) {
+                Button(
+                    onClick = onClearAll,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = TabulaColors.DangerRed.copy(alpha = 0.1f),
+                        contentColor = TabulaColors.DangerRed
+                    ),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                    shape = RoundedCornerShape(20.dp),
+                    elevation = ButtonDefaults.buttonElevation(0.dp)
+                ) {
+                    Text(
+                        text = "清空",
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            fontWeight = FontWeight.Bold
+                        )
+                    )
+                }
             }
         }
     }

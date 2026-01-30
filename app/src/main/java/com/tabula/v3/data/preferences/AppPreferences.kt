@@ -46,14 +46,23 @@ class AppPreferences(context: Context) {
 
     /**
      * 主题模式
+     * 注意：LIQUID_GLASS 已移至实验室，如果用户之前选择了此项，自动降级为 SYSTEM
      */
     var themeMode: ThemeMode
         get() {
             val value = prefs.getString(KEY_THEME_MODE, ThemeMode.SYSTEM.name)
-            return ThemeMode.valueOf(value ?: ThemeMode.SYSTEM.name)
+            val mode = try {
+                ThemeMode.valueOf(value ?: ThemeMode.SYSTEM.name)
+            } catch (e: Exception) {
+                ThemeMode.SYSTEM
+            }
+            // LIQUID_GLASS 已移至实验室，降级为 SYSTEM
+            return if (mode == ThemeMode.LIQUID_GLASS) ThemeMode.SYSTEM else mode
         }
         set(value) {
-            prefs.edit().putString(KEY_THEME_MODE, value.name).apply()
+            // 不允许直接设置 LIQUID_GLASS，使用 liquidGlassLabEnabled 代替
+            val safeValue = if (value == ThemeMode.LIQUID_GLASS) ThemeMode.SYSTEM else value
+            prefs.edit().putString(KEY_THEME_MODE, safeValue.name).apply()
         }
 
     /**
@@ -190,6 +199,17 @@ class AppPreferences(context: Context) {
             prefs.edit().putString(KEY_CARD_STYLE_MODE, value.name).apply()
         }
 
+    /**
+     * 液态玻璃实验室功能开关（仅在 Android 15+ 生效）
+     * 注意：该功能还未完善，暂时强制关闭
+     */
+    var liquidGlassLabEnabled: Boolean
+        get() = false // 功能未完善，强制返回 false
+        set(value) {
+            // 功能未完善，不保存启用状态
+            // prefs.edit().putBoolean(KEY_LIQUID_GLASS_LAB_ENABLED, value).apply()
+        }
+
     // 照片抽取时间戳和冷却天数记录（用于冷却期逻辑）
     private val pickTimestampsPrefs: SharedPreferences = context.getSharedPreferences(
         PICK_TIMESTAMPS_PREFS_NAME,
@@ -321,6 +341,7 @@ class AppPreferences(context: Context) {
         private const val KEY_FLUID_CLOUD_ENABLED = "fluid_cloud_enabled"
         private const val KEY_PENDING_BATCH_REMAINING = "pending_batch_remaining"
         private const val KEY_CARD_STYLE_MODE = "card_style_mode"
+        private const val KEY_LIQUID_GLASS_LAB_ENABLED = "liquid_glass_lab_enabled"
 
         private const val PICK_TIMESTAMPS_PREFS_NAME = "tabula_pick_timestamps"
 
@@ -354,9 +375,10 @@ class AppPreferences(context: Context) {
  * 主题模式枚举
  */
 enum class ThemeMode {
-    SYSTEM,  // 跟随系统
-    LIGHT,   // 浅色
-    DARK     // 深色
+    SYSTEM,       // 跟随系统
+    LIGHT,        // 浅色
+    DARK,         // 深色
+    LIQUID_GLASS  // 液态玻璃
 }
 
 /**

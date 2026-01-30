@@ -35,6 +35,8 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.foundation.ScrollState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -61,6 +63,7 @@ import com.tabula.v3.ui.screens.AboutScreen
 import com.tabula.v3.ui.screens.DeckScreen
 import com.tabula.v3.ui.screens.RecycleBinScreen
 import com.tabula.v3.ui.screens.SettingsScreen
+import com.tabula.v3.ui.screens.SupportScreen
 import com.tabula.v3.ui.screens.VibrationSoundScreen
 import com.tabula.v3.ui.screens.LabScreen
 import com.tabula.v3.ui.screens.ImageDisplayScreen
@@ -74,8 +77,10 @@ import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.theme.TabulaColors
 import com.tabula.v3.ui.util.HapticFeedback
 import com.tabula.v3.ui.theme.TabulaTheme
+import com.tabula.v3.ui.components.LocalLiquidGlassEnabled
 import com.tabula.v3.service.FluidCloudService
 import android.widget.Toast
+import com.tabula.v3.ui.components.isBackdropLiquidGlassSupported
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -109,13 +114,14 @@ class MainActivity : ComponentActivity() {
     private var onDeletePermissionResult: ((Boolean) -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // 使用完全透明的导航栏样式，避免底部小白条区域有背景色
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.auto(
                 lightScrim = AndroidColor.TRANSPARENT,
                 darkScrim = AndroidColor.TRANSPARENT
             ),
-            navigationBarStyle = SystemBarStyle.auto(
-                lightScrim = AndroidColor.TRANSPARENT,
+            navigationBarStyle = SystemBarStyle.light(
+                scrim = AndroidColor.TRANSPARENT,
                 darkScrim = AndroidColor.TRANSPARENT
             )
         )
@@ -136,15 +142,22 @@ class MainActivity : ComponentActivity() {
             val context = LocalContext.current
             val preferences = remember { AppPreferences(context) }
             var currentTheme by remember { mutableStateOf(preferences.themeMode) }
+            
+            // 液态玻璃实验室功能（独立于主题）
+            var liquidGlassLabEnabled by remember { mutableStateOf(preferences.liquidGlassLabEnabled) }
 
             // 根据设置决定深色模式
             val darkTheme = when (currentTheme) {
                 ThemeMode.SYSTEM -> isSystemInDarkTheme()
                 ThemeMode.LIGHT -> false
                 ThemeMode.DARK -> true
+                ThemeMode.LIQUID_GLASS -> false  // 兼容旧数据，降级为 SYSTEM 行为
             }
+            
+            // 是否启用液态玻璃效果（来自实验室设置，而非主题）
+            val liquidGlassEnabled = liquidGlassLabEnabled && android.os.Build.VERSION.SDK_INT >= 35
 
-            TabulaTheme(darkTheme = darkTheme) {
+            TabulaTheme(darkTheme = darkTheme, liquidGlassEnabled = liquidGlassEnabled) {
                 if (hasPermission) {
                     TabulaApp(
                         preferences = preferences,
@@ -154,6 +167,11 @@ class MainActivity : ComponentActivity() {
                             deletePermissionLauncher.launch(
                                 IntentSenderRequest.Builder(intentSender).build()
                             )
+                        },
+                        liquidGlassLabEnabled = liquidGlassLabEnabled,
+                        onLiquidGlassLabEnabledChange = { enabled ->
+                            liquidGlassLabEnabled = enabled
+                            preferences.liquidGlassLabEnabled = enabled
                         }
                     )
                 } else {
@@ -209,7 +227,9 @@ class MainActivity : ComponentActivity() {
 fun TabulaApp(
     preferences: AppPreferences,
     onThemeChange: (ThemeMode) -> Unit,
-    onRequestDeletePermission: (android.content.IntentSender, (Boolean) -> Unit) -> Unit
+    onRequestDeletePermission: (android.content.IntentSender, (Boolean) -> Unit) -> Unit,
+    liquidGlassLabEnabled: Boolean = false,
+    onLiquidGlassLabEnabledChange: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -253,6 +273,9 @@ fun TabulaApp(
     // ========== 推荐模式刷新触发器 ==========
     // 用于在设置中切换推荐模式后，返回主页时刷新批次
     var recommendModeRefreshKey by remember { mutableIntStateOf(0) }
+
+    // ========== 各页面的滚动状态（在 TabulaApp 级别保存，导航返回时保持位置） ==========
+    val settingsScrollState = rememberSaveable(saver = ScrollState.Saver) { ScrollState(0) }
 
     // 加载数据
     LaunchedEffect(Unit) {
@@ -574,7 +597,9 @@ fun TabulaApp(
             },
             onNavigateToVibrationSound = { currentScreen = AppScreen.VIBRATION_SOUND },
             onNavigateToImageDisplay = { currentScreen = AppScreen.IMAGE_DISPLAY },
-            onNavigateToLab = { currentScreen = AppScreen.LAB }
+            onNavigateToLab = { currentScreen = AppScreen.LAB },
+            onNavigateToSupport = { currentScreen = AppScreen.SUPPORT },
+            scrollState = settingsScrollState
         )
     }
 
@@ -630,6 +655,8 @@ fun TabulaApp(
                 fluidCloudEnabled = enabled
                 preferences.fluidCloudEnabled = enabled
             },
+            liquidGlassLabEnabled = liquidGlassLabEnabled,
+            onLiquidGlassLabEnabledChange = onLiquidGlassLabEnabledChange,
             onNavigateBack = { currentScreen = AppScreen.SETTINGS }
         )
     }
@@ -662,6 +689,12 @@ fun TabulaApp(
 
     val aboutContent: @Composable () -> Unit = {
         AboutScreen(
+            onNavigateBack = { currentScreen = AppScreen.SETTINGS }
+        )
+    }
+
+    val supportContent: @Composable () -> Unit = {
+        SupportScreen(
             onNavigateBack = { currentScreen = AppScreen.SETTINGS }
         )
     }
@@ -707,7 +740,14 @@ fun TabulaApp(
             showHdrBadges = showHdrBadges,
             showMotionBadges = showMotionBadges,
             playMotionSound = playMotionSound,
-            motionSoundVolume = motionSoundVolume
+            motionSoundVolume = motionSoundVolume,
+            onMoveToAlbum = { imageIds, targetAlbumId ->
+                scope.launch {
+                    selectedAlbumId?.let { currentAlbumId ->
+                        albumManager.moveImagesToAlbum(imageIds, currentAlbumId, targetAlbumId)
+                    }
+                }
+            }
         )
     }
 
@@ -738,6 +778,7 @@ fun TabulaApp(
         AppScreen.RECYCLE_BIN -> deckContent to recycleBinContent
         AppScreen.SETTINGS -> deckContent to settingsContent
         AppScreen.ABOUT -> settingsContent to aboutContent
+        AppScreen.SUPPORT -> settingsContent to supportContent
         AppScreen.STATISTICS -> settingsContent to statisticsContent
         AppScreen.ALBUM_VIEW -> deckContent to albumViewContent
         AppScreen.SYSTEM_ALBUM_VIEW -> deckContent to systemAlbumViewContent
@@ -746,7 +787,9 @@ fun TabulaApp(
         AppScreen.LAB -> settingsContent to labContent
     }
     
-    // 渲染容器
+    // ========== 渲染容器 ==========
+    // 液态玻璃效果现在由 AGSL 着色器在各个组件内部处理
+    // 不再需要全局的 Backdrop Provider
     PredictiveBackContainer(
         currentScreen = currentScreen,
         onNavigateBack = {
@@ -754,6 +797,7 @@ fun TabulaApp(
                 AppScreen.RECYCLE_BIN -> AppScreen.DECK
                 AppScreen.SETTINGS -> AppScreen.DECK
                 AppScreen.ABOUT -> AppScreen.SETTINGS
+                AppScreen.SUPPORT -> AppScreen.SETTINGS
                 AppScreen.STATISTICS -> AppScreen.SETTINGS
                 AppScreen.ALBUM_VIEW -> AppScreen.DECK
                 AppScreen.SYSTEM_ALBUM_VIEW -> AppScreen.DECK

@@ -6,10 +6,12 @@ import android.os.SystemClock
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -34,12 +36,14 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import coil.compose.AsyncImagePainter
+import coil.request.CachePolicy
 import coil.request.ImageRequest
+import coil.size.Precision
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.di.CoilSetup
 import com.tabula.v3.ui.util.findActivity
@@ -90,13 +94,12 @@ fun ViewerOverlay(
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
-    val configuration = LocalConfiguration.current
     val scope = rememberCoroutineScope()
     val imageLoader = CoilSetup.getImageLoader(context)
 
-    // 屏幕尺寸 (像素)
-    val screenWidthPx = with(density) { configuration.screenWidthDp.dp.toPx() }
-    val screenHeightPx = with(density) { configuration.screenHeightDp.dp.toPx() }
+    // 容器尺寸（由 BoxWithConstraints 提供，在下方计算）
+    var containerWidthPx by remember { mutableFloatStateOf(0f) }
+    var containerHeightPx by remember { mutableFloatStateOf(0f) }
 
     // 源位置信息 - 使用remember保存初始值，确保退出动画时使用正确的位置
     val initialSourceRect = remember { viewerState.sourceRect }
@@ -105,14 +108,14 @@ fun ViewerOverlay(
     // 检查源位置是否有效（宽高大于0）
     val isSourceValid = initialSourceRect.width > 0f && initialSourceRect.height > 0f
     
-    // 如果源位置无效，使用屏幕中心作为fallback
+    // 如果源位置无效，使用屏幕中心作为fallback（在容器尺寸确定后计算）
     val source = if (isSourceValid) {
         initialSourceRect
     } else {
         // 无效时使用屏幕中心作为源位置（会产生居中缩放效果）
         SourceRect(
-            x = screenWidthPx / 2f - 100f,
-            y = screenHeightPx / 2f - 150f,
+            x = containerWidthPx / 2f - 100f,
+            y = containerHeightPx / 2f - 150f,
             width = 200f,
             height = 300f,
             cornerRadius = 16f
@@ -127,44 +130,68 @@ fun ViewerOverlay(
     val motionInfo = if (showMotionPhoto) features?.motionPhotoInfo else null
     var isHdrComparePressed by remember { mutableStateOf(false) }
     var isLivePressed by remember { mutableStateOf(false) }
-    var suppressTapUntil by remember { mutableLongStateOf(0L) }
     var isPressing by remember { mutableStateOf(false) }
     var pressStartedAt by remember { mutableLongStateOf(0L) }
     val pressDelayMs = 80L
+    
+    // 高清图加载状态
+    var isHdImageLoaded by remember { mutableStateOf(false) }
+    
+    // 超高清图加载状态（用于放大时）
+    var isUltraHdLoaded by remember { mutableStateOf(false) }
+    var shouldLoadUltraHd by remember { mutableStateOf(false) }
+    
+    // 缩略图缓存键（与网格一致，确保立即显示）
+    val thumbnailCacheKey = remember(image.id) { "album_grid_${image.id}" }
+    val sysThumbnailCacheKey = remember(image.id) { "sys_grid_${image.id}" }
 
     // 计算目标位置（居中显示，保持原比例）
-    val imageAspectRatio = if (image.height > 0) image.width.toFloat() / image.height else 1f
+    // 使用 actualWidth/actualHeight 考虑 EXIF 旋转，确保收缩动画位置正确
+    val imageAspectRatio = if (image.actualHeight > 0) image.actualWidth.toFloat() / image.actualHeight else 1f
 
-    // 计算适配屏幕的目标尺寸（保持原比例，留出边距）
-    val maxWidth = screenWidthPx * 0.95f
-    val maxHeight = screenHeightPx * 0.80f
+    // 计算适配屏幕的目标尺寸（保持原比例，在容器内留出边距）
+    val maxWidth = containerWidthPx * 0.95f
+    val maxHeight = containerHeightPx * 0.90f  // 在容器内留出边距
 
-    val (targetWidth, targetHeight) = if (imageAspectRatio > maxWidth / maxHeight) {
-        // 宽图：以宽度为准
-        maxWidth to (maxWidth / imageAspectRatio)
+    val (targetWidth, targetHeight) = if (containerWidthPx > 0f && containerHeightPx > 0f && maxHeight > 0f) {
+        if (imageAspectRatio > maxWidth / maxHeight) {
+            // 宽图：以宽度为准
+            maxWidth to (maxWidth / imageAspectRatio)
+        } else {
+            // 高图：以高度为准
+            (maxHeight * imageAspectRatio) to maxHeight
+        }
     } else {
-        // 高图：以高度为准
-        (maxHeight * imageAspectRatio) to maxHeight
+        0f to 0f
     }
 
-    // 目标位置（屏幕中心）
-    val targetX = (screenWidthPx - targetWidth) / 2
-    val targetY = (screenHeightPx - targetHeight) / 2
+    // 目标位置（在整个容器内居中）
+    val targetX = (containerWidthPx - targetWidth) / 2
+    val targetY = (containerHeightPx - targetHeight) / 2
 
     // ========== 动画状态 ==========
     // 0 = 卡片位置，1 = 展开位置
     val animProgress = remember { Animatable(0f) }
     var isExiting by remember { mutableStateOf(false) }
 
-    // 用户缩放 + 拖拽
+    // 用户缩放 + 拖拽（使用普通状态，保证即时响应）
     var userScale by remember { mutableFloatStateOf(1f) }
     var userOffset by remember { mutableStateOf(Offset.Zero) }
     var contentSize by remember { mutableStateOf(Size.Zero) }
+    
+    // 跟踪最近的缩放/拖动时间，防止缩放结束后误触发单击退出
+    var lastTransformTime by remember { mutableLongStateOf(0L) }
+    
+    // 当用户放大超过 1.5x 时，触发加载原图
+    LaunchedEffect(userScale) {
+        if (userScale > 1.5f && !shouldLoadUltraHd) {
+            shouldLoadUltraHd = true
+        }
+    }
 
     val minScale = 1f
     val maxScale = 8f
     val doubleTapScale = 3f
-
 
     fun clampOffset(
         offset: Offset,
@@ -196,13 +223,13 @@ fun ViewerOverlay(
         userOffset = clampOffset(newOffset, clampedScale, size)
     }
 
-    // 入场动画 - 苹果级弹簧
+    // 入场动画 - 优化为更丝滑的参数
     LaunchedEffect(Unit) {
         animProgress.animateTo(
             targetValue = 1f,
             animationSpec = spring(
-                dampingRatio = 0.8f,  // 轻微弹性
-                stiffness = 300f      // 适中刚度
+                dampingRatio = 0.9f,  // 更高阻尼，减少弹跳
+                stiffness = 500f      // 更高刚度，响应更快
             )
         )
     }
@@ -248,23 +275,23 @@ fun ViewerOverlay(
     }
 
     /**
-     * 执行退出动画
+     * 执行退出动画 - 优化版本，并行动画更丝滑
      */
     fun exitViewer() {
         if (isExiting) return
         isExiting = true
 
+        // 重置缩放和偏移
+        userScale = 1f
+        userOffset = Offset.Zero
+        
         scope.launch {
-            // 先平滑重置缩放
-            userScale = 1f
-            userOffset = Offset.Zero
-
-            // 执行收缩动画
+            // 主收缩动画
             animProgress.animateTo(
                 targetValue = 0f,
                 animationSpec = spring(
-                    dampingRatio = 0.85f,
-                    stiffness = 350f
+                    dampingRatio = 0.92f,  // 更高阻尼，更平滑
+                    stiffness = 600f       // 更高刚度，响应更快
                 )
             )
             onDismiss()
@@ -292,7 +319,7 @@ fun ViewerOverlay(
     val currentWidthDp = with(density) { currentWidth.toDp() }
     val currentHeightDp = with(density) { currentHeight.toDp() }
 
-    LaunchedEffect(contentSize) {
+    LaunchedEffect(contentSize, userScale) {
         if (contentSize.width <= 0f || contentSize.height <= 0f) return@LaunchedEffect
         if (userScale <= minScale) {
             userOffset = Offset.Zero
@@ -301,7 +328,7 @@ fun ViewerOverlay(
         }
     }
 
-    Box(
+    BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
             .background(Color.Black.copy(alpha = backgroundAlpha))
@@ -311,6 +338,16 @@ fun ViewerOverlay(
             },
         contentAlignment = Alignment.TopStart
     ) {
+        // 获取实际容器尺寸（在整个屏幕内居中）
+        val actualWidth = constraints.maxWidth.toFloat()
+        val actualHeight = constraints.maxHeight.toFloat()
+        
+        // 更新容器尺寸
+        LaunchedEffect(actualWidth, actualHeight) {
+            containerWidthPx = actualWidth
+            containerHeightPx = actualHeight
+        }
+        
         // 图片容器
         Box(
             modifier = Modifier
@@ -331,6 +368,9 @@ fun ViewerOverlay(
                 .background(Color.Black)
                 .pointerInput(Unit) {
                     detectTransformGestures { centroid, pan, zoom, _ ->
+                        // 记录缩放/拖动时间，防止误触发单击退出
+                        lastTransformTime = SystemClock.uptimeMillis()
+                        
                         val size = contentSize
                         val oldScale = userScale
                         val newScale = (userScale * zoom).coerceIn(minScale, maxScale)
@@ -341,7 +381,8 @@ fun ViewerOverlay(
                         }
                         val center = Offset(size.width / 2f, size.height / 2f)
                         val scaleChange = if (oldScale == 0f) 1f else newScale / oldScale
-                        val panMultiplier = oldScale.coerceIn(1f, 3f)
+                        // 拖动倍率与缩放比例成正比，放大越多拖动越快
+                        val panMultiplier = oldScale.coerceIn(1f, maxScale)
                         val adjustedPan = Offset(pan.x * panMultiplier, pan.y * panMultiplier)
                         val newOffset = (userOffset + adjustedPan) + (centroid - center) * (1 - scaleChange)
                         applyScaleAndOffset(newScale, newOffset, size)
@@ -350,12 +391,14 @@ fun ViewerOverlay(
                 .pointerInput(isHdr, motionInfo) {
                     detectTapGestures(
                         onTap = {
-                            if (SystemClock.uptimeMillis() < suppressTapUntil) {
-                                return@detectTapGestures
+                            // 单击退出，但如果刚刚进行了缩放/拖动操作（300ms内），不触发退出
+                            val timeSinceTransform = SystemClock.uptimeMillis() - lastTransformTime
+                            if (timeSinceTransform > 300) {
+                                exitViewer()
                             }
-                            exitViewer()
                         },
                         onDoubleTap = { tapOffset ->
+                            // 双击缩放
                             val targetScale = if (userScale > 1.2f) minScale else doubleTapScale
                             val size = contentSize
                             if (size.width <= 0f || size.height <= 0f) {
@@ -372,32 +415,78 @@ fun ViewerOverlay(
                             }
                             applyScaleAndOffset(targetScale, newOffset, size)
                         },
-                        onPress = {
+                        onLongPress = {
+                            // 长按用于 HDR 对比和 Live Photo 触发
                             pressStartedAt = SystemClock.uptimeMillis()
                             isPressing = true
+                        },
+                        onPress = {
+                            // 任何触摸开始时记录
+                            pressStartedAt = SystemClock.uptimeMillis()
                             tryAwaitRelease()
+                            // 释放时结束 HDR/Live 播放
                             isPressing = false
-                            if (SystemClock.uptimeMillis() - pressStartedAt >= pressDelayMs) {
-                                suppressTapUntil = SystemClock.uptimeMillis() + 350L
-                            }
                         }
                     )
                 },
             contentAlignment = Alignment.Center
         ) {
-            // 高清图片 (ARGB_8888)
+            // 底层：缩略图（立即可见，避免黑屏）
+            // 使用与网格相同的缓存键，确保从内存缓存立即加载
+            AsyncImage(
+                model = ImageRequest.Builder(context)
+                    .data(image.uri)
+                    .size(coil.size.Size(240, 240))
+                    .precision(Precision.INEXACT)
+                    .bitmapConfig(Bitmap.Config.RGB_565)
+                    .memoryCacheKey(thumbnailCacheKey)
+                    .diskCacheKey(thumbnailCacheKey)
+                    .memoryCachePolicy(CachePolicy.ENABLED)
+                    .diskCachePolicy(CachePolicy.ENABLED)
+                    .crossfade(false)
+                    .allowHardware(false)
+                    .build(),
+                contentDescription = null,
+                imageLoader = imageLoader,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize()
+            )
+            
+            // 上层：高清图片 (ARGB_8888)，加载完成后淡入覆盖
+            // 计算高清图目标尺寸：普通查看时使用屏幕适配尺寸，放大时使用原图尺寸
+            val hdTargetSize = if (shouldLoadUltraHd) {
+                // 放大时加载原图尺寸（最大 4096，避免 OOM）
+                val maxDim = maxOf(image.actualWidth, image.actualHeight).coerceAtMost(4096).coerceAtLeast(1)
+                coil.size.Size(maxDim, maxDim)
+            } else {
+                // 普通查看时使用屏幕 2 倍尺寸（保证清晰度）
+                // 确保 targetDim 至少为 1，避免容器尺寸为 0 时崩溃
+                val targetDim = (maxOf(containerWidthPx, containerHeightPx) * 1.5f).toInt().coerceIn(1, 2048)
+                coil.size.Size(targetDim, targetDim)
+            }
+            
             if (motionInfo != null) {
                 Box(modifier = Modifier.fillMaxSize()) {
                     AsyncImage(
                         model = ImageRequest.Builder(context)
                             .data(image.uri)
-                            .crossfade(100)
+                            .size(hdTargetSize)
+                            .precision(Precision.INEXACT)
+                            .crossfade(200)
                             .bitmapConfig(Bitmap.Config.ARGB_8888)
                             .build(),
                         contentDescription = image.displayName,
                         imageLoader = imageLoader,
                         contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier.fillMaxSize(),
+                        onState = { state ->
+                            if (state is AsyncImagePainter.State.Success) {
+                                isHdImageLoaded = true
+                                if (shouldLoadUltraHd) {
+                                    isUltraHdLoaded = true
+                                }
+                            }
+                        }
                     )
                     MotionPhotoPlayer(
                         imageUri = image.uri,
@@ -412,13 +501,23 @@ fun ViewerOverlay(
                 AsyncImage(
                     model = ImageRequest.Builder(context)
                         .data(image.uri)
-                        .crossfade(100)
+                        .size(hdTargetSize)
+                        .precision(Precision.INEXACT)
+                        .crossfade(200)
                         .bitmapConfig(Bitmap.Config.ARGB_8888)
                         .build(),
                     contentDescription = image.displayName,
                     imageLoader = imageLoader,
                     contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier.fillMaxSize(),
+                    onState = { state ->
+                        if (state is AsyncImagePainter.State.Success) {
+                            isHdImageLoaded = true
+                            if (shouldLoadUltraHd) {
+                                isUltraHdLoaded = true
+                            }
+                        }
+                    }
                 )
             }
         }

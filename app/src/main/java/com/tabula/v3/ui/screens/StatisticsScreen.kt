@@ -4,6 +4,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import com.tabula.v3.ui.components.GlassDivider
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -68,7 +69,7 @@ fun StatisticsScreen(
     val context = LocalContext.current
     val isDarkTheme = LocalIsDarkTheme.current
     
-    // 配色
+    // 配色 - 纯白/纯黑背景，卡片使用玻璃效果
     val backgroundColor = if (isDarkTheme) Color.Black else Color(0xFFF2F2F7)
     val cardColor = if (isDarkTheme) Color(0xFF1C1C1E) else Color.White
     val textColor = if (isDarkTheme) Color.White else Color.Black
@@ -354,11 +355,8 @@ private fun StatRow(
 
 @Composable
 private fun StatDivider(isDarkTheme: Boolean) {
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(start = 76.dp, end = 24.dp)
-            .height(0.5.dp)
-            .background(if (isDarkTheme) Color(0xFF38383A) else Color(0xFFE5E5EA))
+    GlassDivider(
+        isDarkTheme = isDarkTheme,
+        startPadding = 76.dp
     )
 }

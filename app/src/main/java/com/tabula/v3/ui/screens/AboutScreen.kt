@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -48,6 +49,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,6 +65,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.tabula.v3.BuildConfig
 import com.tabula.v3.R
+import com.tabula.v3.ui.components.LocalLiquidGlassEnabled
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.theme.TabulaColors
 import com.tabula.v3.ui.util.HapticFeedback
@@ -311,10 +314,12 @@ fun AboutScreen(
             }
             
             // 内容
+            // 使用 rememberSaveable 保存滚动位置
+            val scrollState = rememberSaveable(saver = ScrollState.Saver) { ScrollState(0) }
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
+                    .verticalScroll(scrollState)
                     .padding(24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
@@ -349,7 +354,7 @@ fun AboutScreen(
                 )
 
                 Text(
-                    text = "2026.1.26",
+                    text = "2026.1.30",
                     style = MaterialTheme.typography.bodySmall,
                     color = secondaryTextColor.copy(alpha = 0.8f)
                 )
@@ -530,6 +535,45 @@ fun AboutScreen(
                             }
                         }
 
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // QQ 交流群
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                    clipboard.setPrimaryClip(
+                                        android.content.ClipData.newPlainText(
+                                            "QQ群号",
+                                            "1082340405"
+                                        )
+                                    )
+                                }
+                                .padding(vertical = 8.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.Info,
+                                contentDescription = "QQ群",
+                                tint = textColor,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column {
+                                Text(
+                                    text = "QQ 交流群",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = secondaryTextColor
+                                )
+                                Text(
+                                    text = "1082340405",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = textColor
+                                )
+                            }
+                        }
+
                         Spacer(modifier = Modifier.height(12.dp))
 
                         // 底部提示文字
@@ -611,7 +655,13 @@ private fun UpdateDialog(
     onConfirm: (UpdateDialogAction) -> Unit
 ) {
     val isDarkTheme = LocalIsDarkTheme.current
-    val backgroundColor = if (isDarkTheme) Color(0xFF1C1C1E) else Color.White
+    val isLiquidGlass = LocalLiquidGlassEnabled.current
+    // 液态玻璃模式下使用更不透明的背景
+    val backgroundColor = when {
+        isLiquidGlass -> if (isDarkTheme) Color(0xFF1C1C1E) else Color(0xFFF2F2F7).copy(alpha = 0.98f)
+        isDarkTheme -> Color(0xFF1C1C1E)
+        else -> Color.White
+    }
     val iconTint = when (state) {
         is UpdateDialogState.Error -> TabulaColors.DangerRed
         is UpdateDialogState.UpToDate -> TabulaColors.SuccessGreen

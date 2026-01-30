@@ -271,6 +271,41 @@ class AlbumManager(private val context: Context) {
             ?: emptySet()
     }
 
+    /**
+     * 批量将图片移动到另一个图集
+     * 会同时从当前图集移除并添加到目标图集
+     */
+    suspend fun moveImagesToAlbum(
+        imageIds: List<Long>,
+        fromAlbumId: String,
+        toAlbumId: String
+    ) = withContext(Dispatchers.IO) {
+        if (imageIds.isEmpty()) return@withContext
+        
+        val currentMappings = loadMappings()
+        val updatedMappings = currentMappings.map { mapping ->
+            if (mapping.imageId in imageIds) {
+                // 从源图集移除，添加到目标图集
+                val newAlbumIds = (mapping.albumIds - fromAlbumId + toAlbumId).distinct()
+                mapping.copy(
+                    albumIds = newAlbumIds,
+                    addedAt = System.currentTimeMillis()
+                )
+            } else {
+                mapping
+            }
+        }
+        
+        saveMappings(updatedMappings)
+        _mappings.value = updatedMappings
+        
+        // 更新两个图集的统计信息
+        updateAlbumStats(fromAlbumId)
+        updateAlbumStats(toAlbumId)
+        
+        Log.d(TAG, "Moved ${imageIds.size} images from $fromAlbumId to $toAlbumId")
+    }
+
     // ========== 撤销功能 ==========
 
     /**

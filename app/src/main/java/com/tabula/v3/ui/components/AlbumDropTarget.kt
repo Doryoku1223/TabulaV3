@@ -163,8 +163,8 @@ private fun DropTargetChip(
     // 圆角
     val cornerRadius = 14.dp
     
-    // 使用 FrostedGlass 组件实现玻璃效果
-    FrostedGlass(
+    // 使用 AdaptiveGlass 组件实现玻璃效果（自动适配液态玻璃/毛玻璃）
+    AdaptiveGlass(
         modifier = Modifier
             .scale(scale)
             .onGloballyPositioned { coordinates ->
@@ -192,6 +192,7 @@ private fun DropTargetChip(
             )
         ),
         noiseAlpha = 0f,  // 不使用噪点
+        backdropConfig = BackdropLiquidGlassConfig.Default.copy(cornerRadius = cornerRadius),
         contentAlignment = Alignment.Center
     ) {
         Text(

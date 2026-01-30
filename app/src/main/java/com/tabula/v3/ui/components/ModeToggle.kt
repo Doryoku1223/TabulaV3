@@ -99,9 +99,8 @@ fun ModeToggle(
         label = "toggle_offset"
     )
 
-    FrostedGlass(
+    AdaptiveGlass(
         modifier = modifier
- // TODO
             .shadow(
                 elevation = 12.dp,
                 shape = RoundedCornerShape(100),
@@ -115,6 +114,7 @@ fun ModeToggle(
         borderWidth = 1.dp,
         highlightBrush = highlightBrush,
         noiseAlpha = if (isDarkTheme) 0.04f else 0.06f,
+        backdropConfig = BackdropLiquidGlassConfig.Bar.copy(cornerRadius = 100.dp),
         contentAlignment = Alignment.CenterStart
     ) {
         Box(

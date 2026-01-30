@@ -16,6 +16,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // JitPack for AndroidLiquidGlassView
+        maven { url = uri("https://jitpack.io") }
     }
 }
 

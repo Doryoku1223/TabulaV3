@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -33,6 +34,7 @@ import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Collections
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Favorite
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Lock
@@ -65,6 +67,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -84,15 +87,20 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
+import com.tabula.v3.BuildConfig
 import com.tabula.v3.R
 import com.tabula.v3.data.preferences.AppPreferences
 import com.tabula.v3.data.preferences.CardStyleMode
 import com.tabula.v3.data.preferences.RecommendMode
 import com.tabula.v3.data.preferences.ThemeMode
 import com.tabula.v3.data.preferences.TopBarDisplayMode
+import com.tabula.v3.ui.components.GlassBottomSheet
+import com.tabula.v3.ui.components.GlassDivider
+import com.tabula.v3.ui.components.LocalLiquidGlassEnabled
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.theme.TabulaColors
 import com.tabula.v3.ui.util.HapticFeedback
+import androidx.compose.ui.graphics.Brush
 import kotlin.math.roundToInt
 
 /**
@@ -131,16 +139,35 @@ fun SettingsScreen(
     onFluidCloudEnabledChange: (Boolean) -> Unit = {},
     onNavigateToVibrationSound: () -> Unit = {},
     onNavigateToImageDisplay: () -> Unit = {},
-    onNavigateToLab: () -> Unit = {}
+    onNavigateToLab: () -> Unit = {},
+    onNavigateToSupport: () -> Unit = {},
+    scrollState: ScrollState? = null  // 外部传入的滚动状态，用于保持导航返回时的位置
 ) {
     val context = LocalContext.current
     val isDarkTheme = LocalIsDarkTheme.current
+    val isLiquidGlass = LocalLiquidGlassEnabled.current
     
-    // 主题色配置 - 极简灰白调
-    val backgroundColor = if (isDarkTheme) Color.Black else Color(0xFFF2F2F7) // iOS 风格背景灰
-    val cardColor = if (isDarkTheme) Color(0xFF1C1C1E) else Color.White
-    val textColor = if (isDarkTheme) Color.White else Color.Black
-    val secondaryTextColor = if (isDarkTheme) Color(0xFF8E8E93) else Color(0xFF8E8E93)
+    // 主题色配置 - 根据主题类型调整
+    // 液态玻璃主题使用纯白/纯黑背景，只有卡片有玻璃效果
+    val backgroundColor = when {
+        isDarkTheme -> Color.Black
+        else -> Color(0xFFF2F2F7) // iOS 风格背景灰
+    }
+    val cardColor = when {
+        isLiquidGlass -> TabulaColors.LiquidGlass.GlassSurface
+        isDarkTheme -> Color(0xFF1C1C1E)
+        else -> Color.White
+    }
+    val textColor = when {
+        isLiquidGlass -> TabulaColors.LiquidGlass.TextPrimary
+        isDarkTheme -> Color.White
+        else -> Color.Black
+    }
+    val secondaryTextColor = when {
+        isLiquidGlass -> TabulaColors.LiquidGlass.TextSecondary
+        isDarkTheme -> Color(0xFF8E8E93)
+        else -> Color(0xFF8E8E93)
+    }
     
     // 品牌强调色
     val accentColor = TabulaColors.EyeGold
@@ -205,10 +232,12 @@ fun SettingsScreen(
             }
 
             // ========== 内容滚动区 ==========
+            // 使用外部传入的滚动状态（如果有），否则使用本地状态
+            val effectiveScrollState = scrollState ?: rememberSaveable(saver = ScrollState.Saver) { ScrollState(0) }
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
+                    .verticalScroll(effectiveScrollState)
                     .padding(horizontal = 20.dp)
             ) {
                 Spacer(modifier = Modifier.height(12.dp))
@@ -238,6 +267,7 @@ fun SettingsScreen(
                             ThemeMode.SYSTEM -> "跟随系统"
                             ThemeMode.LIGHT -> "浅色"
                             ThemeMode.DARK -> "深色"
+                            ThemeMode.LIQUID_GLASS -> "跟随系统" // 已移至实验室，显示降级后的值
                         },
                         textColor = textColor,
                         secondaryTextColor = secondaryTextColor,
@@ -435,20 +465,35 @@ fun SettingsScreen(
 
             Spacer(modifier = Modifier.height(28.dp))
 
-            // ========== 关于 ==========
-            SectionHeader("关于", textColor)
+            // ========== 关于与支持 ==========
+            SectionHeader("关于与支持", textColor)
             
             SettingsGroup(cardColor) {
                 SettingsItem(
                     icon = Icons.Outlined.Info,
                     iconTint = accentColor,
                     title = "关于 Tabula",
-                    value = "v3.1.0",
+                    value = "v${BuildConfig.VERSION_NAME}",
                     textColor = textColor,
                     secondaryTextColor = secondaryTextColor,
                     onClick = {
                         HapticFeedback.lightTap(context)
                         onNavigateToAbout()
+                    }
+                )
+                
+                Divider(isDarkTheme)
+                
+                SettingsItem(
+                    icon = Icons.Outlined.Favorite,
+                    iconTint = Color(0xFFFF2D55), // 粉红色
+                    title = "支持开发者",
+                    value = "",
+                    textColor = textColor,
+                    secondaryTextColor = secondaryTextColor,
+                    onClick = {
+                        HapticFeedback.lightTap(context)
+                        onNavigateToSupport()
                     }
                 )
             }
@@ -512,6 +557,7 @@ fun SettingsScreen(
                     onThemeChange(mode)
                     showThemeSheet = false
                 }
+                // 液态玻璃已移至实验室
             }
         }
 
@@ -654,10 +700,12 @@ fun VibrationSoundScreen(
             )
         }
 
+        // 使用 rememberSaveable 保存滚动位置
+        val scrollState = rememberSaveable(saver = ScrollState.Saver) { ScrollState(0) }
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scrollState)
                 .padding(horizontal = 20.dp)
         ) {
             Spacer(modifier = Modifier.height(12.dp))
@@ -753,6 +801,7 @@ fun ImageDisplayScreen(
 ) {
     val context = LocalContext.current
     val isDarkTheme = LocalIsDarkTheme.current
+    val isLiquidGlass = LocalLiquidGlassEnabled.current
     
     Column(
         modifier = Modifier
@@ -792,10 +841,12 @@ fun ImageDisplayScreen(
             )
         }
 
+        // 使用 rememberSaveable 保存滚动位置
+        val scrollState = rememberSaveable(saver = ScrollState.Saver) { ScrollState(0) }
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scrollState)
                 .padding(horizontal = 20.dp)
         ) {
             Spacer(modifier = Modifier.height(12.dp))
@@ -920,6 +971,8 @@ fun LabScreen(
     secondaryTextColor: Color,
     fluidCloudEnabled: Boolean,
     onFluidCloudEnabledChange: (Boolean) -> Unit,
+    liquidGlassLabEnabled: Boolean = false,
+    onLiquidGlassLabEnabledChange: (Boolean) -> Unit = {},
     onNavigateBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -928,6 +981,9 @@ fun LabScreen(
     
     // 小组件引导对话框状态
     var showWidgetGuideSheet by remember { mutableStateOf(false) }
+    
+    // 检测是否为 Android 15+ (API 35+)
+    val isAndroid15OrAbove = Build.VERSION.SDK_INT >= 35
     
     Column(
         modifier = Modifier
@@ -967,10 +1023,12 @@ fun LabScreen(
             )
         }
 
+        // 使用 rememberSaveable 保存滚动位置
+        val scrollState = rememberSaveable(saver = ScrollState.Saver) { ScrollState(0) }
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scrollState)
                 .padding(horizontal = 20.dp)
         ) {
             Spacer(modifier = Modifier.height(12.dp))
@@ -985,12 +1043,48 @@ fun LabScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            SectionHeader("流体云", textColor)
+            // ========== 液态玻璃主题 (Android 15+) ==========
+            SectionHeader("液态玻璃", textColor)
+            SettingsGroup(cardColor) {
+                SettingsSwitchItem(
+                    icon = Icons.Outlined.DarkMode,
+                    iconTint = Color(0xFF667EEA), // 靛蓝紫
+                    title = "液态玻璃主题",
+                    textColor = textColor,
+                    checked = false, // 功能未完善，强制关闭
+                    onCheckedChange = { enabled ->
+                        if (enabled) {
+                            // 功能未完善，显示提示
+                            HapticFeedback.lightTap(context)
+                            Toast.makeText(context, "该功能还未完善", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    enabled = true // 允许点击以显示提示
+                )
+                
+                // 液态玻璃说明
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                        .padding(bottom = 12.dp)
+                ) {
+                    Text(
+                        text = "该功能还在开发中，敬请期待",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFFF9F0A).copy(alpha = 0.8f) // 警告色
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(28.dp))
+
+            SectionHeader("模拟流体云", textColor)
             SettingsGroup(cardColor) {
                 SettingsSwitchItem(
                     icon = Icons.Outlined.Cloud,
                     iconTint = Color(0xFF5E5CE6), // Indigo
-                    title = "启用流体云",
+                    title = "启用模拟流体云",
                     textColor = textColor,
                     checked = fluidCloudEnabled,
                     onCheckedChange = onFluidCloudEnabledChange
@@ -1004,7 +1098,7 @@ fun LabScreen(
                         .padding(bottom = 12.dp)
                 ) {
                     Text(
-                        text = "退出应用时在流体云/状态栏显示剩余照片数量，支持 ColorOS 流体云",
+                        text = "退出应用时在状态栏显示剩余照片数量（模拟流体云效果）",
                         style = MaterialTheme.typography.bodySmall,
                         color = secondaryTextColor.copy(alpha = 0.7f)
                     )
@@ -1085,10 +1179,20 @@ private fun WidgetGuideBottomSheet(
 ) {
     val context = LocalContext.current
     val isColorOSDevice = isColorOS()
+    val isDarkTheme = LocalIsDarkTheme.current
+    val isLiquidGlassEnabled = LocalLiquidGlassEnabled.current
+    
+    // 液态玻璃模式下使用更不透明的背景
+    val effectiveContainerColor = if (isLiquidGlassEnabled) {
+        if (isDarkTheme) Color(0xFF1C1C1E).copy(alpha = 0.95f)
+        else Color(0xFFF2F2F7).copy(alpha = 0.95f)
+    } else {
+        containerColor
+    }
     
     ModalBottomSheet(
         onDismissRequest = onDismiss,
-        containerColor = containerColor,
+        containerColor = effectiveContainerColor,
         shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
     ) {
         Column(
@@ -1470,13 +1574,28 @@ fun SettingsGroup(
     backgroundColor: Color,
     content: @Composable () -> Unit
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(backgroundColor)
-    ) {
-        content()
+    val isLiquidGlass = LocalLiquidGlassEnabled.current
+    
+    if (isLiquidGlass) {
+        // 液态玻璃模式下使用 Backdrop 液态玻璃效果
+        com.tabula.v3.ui.components.BackdropLiquidGlassSettings(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column {
+                content()
+            }
+        }
+    } else {
+        // 普通模式
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .background(backgroundColor)
+        ) {
+            content()
+        }
     }
 }
 
@@ -1778,17 +1897,21 @@ private fun StyledSlider(
     }
 }
 
+/**
+ * 玻璃风格分割线
+ * 使用 GlassDivider 组件，带两端淡出效果
+ */
 @Composable
 fun Divider(isDarkTheme: Boolean) {
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(start = 64.dp) // 图标宽度 + 间距
-            .height(0.5.dp)
-            .background(if (isDarkTheme) Color(0xFF38383A) else Color(0xFFE5E5EA))
+    GlassDivider(
+        isDarkTheme = isDarkTheme,
+        startPadding = 52.dp  // 图标宽度 + 间距
     )
 }
 
+/**
+ * 玻璃风格 BottomSheet（适配液态玻璃主题）
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CustomBottomSheet(
@@ -1798,27 +1921,16 @@ fun CustomBottomSheet(
     textColor: Color,
     content: @Composable () -> Unit
 ) {
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
+    val isDarkTheme = LocalIsDarkTheme.current
+    
+    GlassBottomSheet(
+        title = title,
+        onDismiss = onDismiss,
         containerColor = containerColor,
-        shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 32.dp)
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium.copy(
-                    fontWeight = FontWeight.Bold
-                ),
-                color = textColor,
-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp)
-            )
-            content()
-        }
-    }
+        textColor = textColor,
+        isDarkTheme = isDarkTheme,
+        content = content
+    )
 }
 
 @Composable

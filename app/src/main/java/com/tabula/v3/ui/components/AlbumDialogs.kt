@@ -97,6 +97,14 @@ fun AlbumEditDialog(
         focusRequester.requestFocus()
     }
 
+    val isLiquidGlassEnabled = LocalLiquidGlassEnabled.current
+    // 液态玻璃模式下使用更不透明的背景确保可读性
+    val effectiveBgColor = if (isLiquidGlassEnabled) {
+        backgroundColor.copy(alpha = 0.98f)
+    } else {
+        backgroundColor
+    }
+    
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -115,7 +123,7 @@ fun AlbumEditDialog(
                         shape = RoundedCornerShape(24.dp)
                     )
                     .clip(RoundedCornerShape(24.dp))
-                    .background(backgroundColor)
+                    .background(effectiveBgColor)
                     .padding(24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
@@ -191,8 +199,8 @@ fun AlbumEditDialog(
                         .padding(20.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    // 玻璃效果标签预览
-                    FrostedGlass(
+                    // 玻璃效果标签预览（自动适配液态玻璃/毛玻璃）
+                    AdaptiveGlass(
                         shape = RoundedCornerShape(14.dp),
                         blurRadius = 24.dp,
                         tint = if (isDarkTheme) {
@@ -214,6 +222,7 @@ fun AlbumEditDialog(
                             )
                         ),
                         noiseAlpha = 0f,
+                        backdropConfig = BackdropLiquidGlassConfig.Default.copy(cornerRadius = 14.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
@@ -397,8 +406,15 @@ fun AlbumDeleteConfirmDialog(
 ) {
     val isDarkTheme = LocalIsDarkTheme.current
     val context = LocalContext.current
+    val isLiquidGlassEnabled = LocalLiquidGlassEnabled.current
 
     val backgroundColor = if (isDarkTheme) Color(0xFF2C2C2E) else Color.White
+    // 液态玻璃模式下使用更不透明的背景
+    val effectiveBgColor = if (isLiquidGlassEnabled) {
+        backgroundColor.copy(alpha = 0.98f)
+    } else {
+        backgroundColor
+    }
     val textColor = if (isDarkTheme) Color.White else Color(0xFF1C1C1E)
     val secondaryColor = if (isDarkTheme) Color(0xFF8E8E93) else Color(0xFF8E8E93)
     val dangerColor = Color(0xFFFF3B30)
@@ -409,7 +425,7 @@ fun AlbumDeleteConfirmDialog(
                 .fillMaxWidth()
                 .shadow(24.dp, RoundedCornerShape(20.dp))
                 .clip(RoundedCornerShape(20.dp))
-                .background(backgroundColor)
+                .background(effectiveBgColor)
                 .padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {

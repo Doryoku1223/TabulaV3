@@ -8,6 +8,7 @@ enum class AppScreen {
     RECYCLE_BIN, // 回收站
     SETTINGS,    // 设置
     ABOUT,       // 关于
+    SUPPORT,     // 支持
     STATISTICS,  // 综合统计
     ALBUM_VIEW,  // 相册视图
     SYSTEM_ALBUM_VIEW, // 系统相册视图
