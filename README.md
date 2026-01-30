@@ -89,12 +89,12 @@
 <table align="center" style="border:none;">
   <tr>
     <td align="center" width="50%">
-      <img src="app\src\main\res\drawable\qr_wechat.png" width="200" alt="微信收款码">
+      <img src="app\src\main\res\drawable\qr_wechat.jpg" width="200" alt="微信收款码">
       <br>
       <b>微信支付</b>
     </td>
     <td align="center" width="50%">
-      <img src="app\src\main\res\drawable\qr_alipay.png" width="200" alt="支付宝收款码">
+      <img src="app\src\main\res\drawable\qr_alipay.jpg" width="200" alt="支付宝收款码">
       <br>
       <b>支付宝</b>
     </td>
