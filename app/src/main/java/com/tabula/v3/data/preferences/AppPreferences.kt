@@ -200,6 +200,22 @@ class AppPreferences(context: Context) {
         }
 
     /**
+     * 卡片切换样式（切牌 / 摸牌）
+     */
+    var swipeStyle: SwipeStyle
+        get() {
+            val value = prefs.getString(KEY_SWIPE_STYLE, SwipeStyle.SHUFFLE.name)
+            return try {
+                SwipeStyle.valueOf(value ?: SwipeStyle.SHUFFLE.name)
+            } catch (e: Exception) {
+                SwipeStyle.SHUFFLE
+            }
+        }
+        set(value) {
+            prefs.edit().putString(KEY_SWIPE_STYLE, value.name).apply()
+        }
+
+    /**
      * 液态玻璃实验室功能开关（仅在 Android 15+ 生效）
      * 注意：该功能还未完善，暂时强制关闭
      */
@@ -436,6 +452,7 @@ class AppPreferences(context: Context) {
         private const val KEY_FLUID_CLOUD_ENABLED = "fluid_cloud_enabled"
         private const val KEY_PENDING_BATCH_REMAINING = "pending_batch_remaining"
         private const val KEY_CARD_STYLE_MODE = "card_style_mode"
+        private const val KEY_SWIPE_STYLE = "swipe_style"
         private const val KEY_LIQUID_GLASS_LAB_ENABLED = "liquid_glass_lab_enabled"
         private const val KEY_HAS_COMPLETED_ONBOARDING = "has_completed_onboarding"
 
@@ -500,6 +517,14 @@ enum class RecommendMode {
 enum class CardStyleMode {
     FIXED,      // 固定样式 - 3:4 比例，Crop 填充
     ADAPTIVE    // 自适应样式 - 根据图片比例动态调整
+}
+
+/**
+ * 卡片切换样式枚举
+ */
+enum class SwipeStyle {
+    SHUFFLE,    // 切牌样式 - 左右滑动循环切换，牌插入底部
+    DRAW        // 摸牌样式 - 右滑发牌飞出，左滑收牌飞回
 }
 
 /**

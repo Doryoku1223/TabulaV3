@@ -10,6 +10,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 图片预加载管理器
@@ -29,10 +32,14 @@ class PreloadingManager(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val imageLoader = CoilSetup.getImageLoader(context)
 
-    // 记录已预加载的索引，避免重复加载
-    private val preloadedIndices = mutableSetOf<Int>()
+    // 记录已预加载的索引，避免重复加载（线程安全）
+    private val preloadedIndices: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+    
+    // 保护并发操作的锁
+    private val mutex = Mutex()
 
     // 上次预加载的中心索引
+    @Volatile
     private var lastPreloadCenter: Int = -1
 
     /**
@@ -52,22 +59,25 @@ class PreloadingManager(
         lastPreloadCenter = currentIndex
 
         scope.launch {
-            // 计算需要预加载的索引范围
-            val startIndex = (currentIndex - preloadRange).coerceAtLeast(0)
-            val endIndex = (currentIndex + preloadRange).coerceAtMost(images.lastIndex)
+            mutex.withLock {
+                // 计算需要预加载的索引范围
+                val startIndex = (currentIndex - preloadRange).coerceAtLeast(0)
+                val endIndex = (currentIndex + preloadRange).coerceAtMost(images.lastIndex)
 
-            for (index in startIndex..endIndex) {
-                // 跳过已预加载的
-                if (index in preloadedIndices) continue
+                for (index in startIndex..endIndex) {
+                    // 跳过已预加载的
+                    if (index in preloadedIndices) continue
 
-                val image = images.getOrNull(index) ?: continue
-                preloadImage(image, cardSize)
-                preloadedIndices.add(index)
+                    val image = images.getOrNull(index) ?: continue
+                    preloadImage(image, cardSize)
+                    preloadedIndices.add(index)
+                }
+
+                // 清理过期的预加载记录（保留最近的范围）
+                val keepRange = (currentIndex - preloadRange * 2)..(currentIndex + preloadRange * 2)
+                val toRemove = preloadedIndices.filter { it !in keepRange }
+                preloadedIndices.removeAll(toRemove.toSet())
             }
-
-            // 清理过期的预加载记录（保留最近的范围）
-            val keepRange = (currentIndex - preloadRange * 2)..(currentIndex + preloadRange * 2)
-            preloadedIndices.removeAll { it !in keepRange }
         }
     }
 
@@ -131,10 +141,12 @@ class PreloadingManager(
         cardSize: IntSize
     ) {
         scope.launch {
-            indices.forEach { index ->
-                val image = images.getOrNull(index) ?: return@forEach
-                preloadImage(image, cardSize)
-                preloadedIndices.add(index)
+            mutex.withLock {
+                indices.forEach { index ->
+                    val image = images.getOrNull(index) ?: return@forEach
+                    preloadImage(image, cardSize)
+                    preloadedIndices.add(index)
+                }
             }
         }
     }
@@ -143,8 +155,12 @@ class PreloadingManager(
      * 重置预加载状态（例如切换相册时）
      */
     fun reset() {
-        preloadedIndices.clear()
-        lastPreloadCenter = -1
+        scope.launch {
+            mutex.withLock {
+                preloadedIndices.clear()
+                lastPreloadCenter = -1
+            }
+        }
     }
 
     companion object {

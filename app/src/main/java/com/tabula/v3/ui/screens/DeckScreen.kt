@@ -80,6 +80,7 @@ import androidx.compose.ui.platform.LocalDensity
 import com.tabula.v3.R
 import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
+import com.tabula.v3.data.preferences.SwipeStyle
 import com.tabula.v3.data.preferences.TopBarDisplayMode
 import com.tabula.v3.data.repository.LocalImageRepository
 import androidx.compose.ui.geometry.Offset
@@ -148,6 +149,7 @@ fun DeckScreen(
     motionSoundVolume: Int = 100,
     enableSwipeHaptics: Boolean = true,
     isAdaptiveCardStyle: Boolean = false,
+    swipeStyle: SwipeStyle = SwipeStyle.SHUFFLE,
     // 推荐算法回调
     getRecommendedBatch: suspend (List<ImageFile>, Int) -> List<ImageFile> = { images, size -> 
         images.shuffled().take(size) 
@@ -346,6 +348,7 @@ fun DeckScreen(
                         showMotionBadges = showMotionBadges,
                         enableSwipeHaptics = enableSwipeHaptics,
                         isAdaptiveCardStyle = isAdaptiveCardStyle,
+                        swipeStyle = swipeStyle,
                         albums = albums,
                         currentImageAlbumIds = currentImageAlbumIds,
                         onIndexChange = { newIndex ->
@@ -576,6 +579,7 @@ private fun DeckContent(
     showMotionBadges: Boolean,
     enableSwipeHaptics: Boolean,
     isAdaptiveCardStyle: Boolean,
+    swipeStyle: SwipeStyle,
     albums: List<Album>,
     currentImageAlbumIds: Set<String>,
     onIndexChange: (Int) -> Unit,
@@ -638,7 +642,8 @@ private fun DeckContent(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f),
+                    .weight(1f)
+                    .padding(top = 16.dp),  // 卡片向下移动
                 contentAlignment = Alignment.Center
             ) {
                 if (images.isNotEmpty() && currentIndex < images.size) {
@@ -653,6 +658,7 @@ private fun DeckContent(
                         enableSwipeHaptics = enableSwipeHaptics,
                         modifier = Modifier.fillMaxSize(),
                         isAdaptiveCardStyle = isAdaptiveCardStyle,
+                        swipeStyle = swipeStyle,
                         // 下滑归类相关参数
                         albums = albums,
                         onClassifyToAlbum = { image, album ->
@@ -928,6 +934,7 @@ private fun AlbumsGridContent(
                 onAppAlbumClick = onAlbumClick,
                 onSystemBucketClick = onSystemBucketClick,
                 onReorderAlbums = onReorderAlbums,
+                onCreateAlbumClick = { showCreateDialog = true },
                 textColor = textColor,
                 secondaryTextColor = secondaryTextColor,
                 isDarkTheme = isDarkTheme,
@@ -951,6 +958,7 @@ private fun AlbumsGridContent(
             onAppAlbumClick = onAlbumClick,
             onSystemBucketClick = onSystemBucketClick,
             onReorderAlbums = onReorderAlbums,
+            onCreateAlbumClick = { showCreateDialog = true },
             textColor = textColor,
             secondaryTextColor = secondaryTextColor,
             isDarkTheme = isDarkTheme,

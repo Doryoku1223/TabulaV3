@@ -51,6 +51,7 @@ import androidx.core.content.ContextCompat
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.data.preferences.AppPreferences
 import com.tabula.v3.data.preferences.CardStyleMode
+import com.tabula.v3.data.preferences.SwipeStyle
 import com.tabula.v3.data.preferences.ThemeMode
 import com.tabula.v3.data.preferences.TopBarDisplayMode
 import com.tabula.v3.data.repository.FileOperationManager
@@ -244,6 +245,7 @@ fun TabulaApp(
     var showHdrBadges by remember { mutableStateOf(preferences.showHdrBadges) }
     var showMotionBadges by remember { mutableStateOf(preferences.showMotionBadges) }
     var cardStyleMode by remember { mutableStateOf(preferences.cardStyleMode) }
+    var swipeStyle by remember { mutableStateOf(preferences.swipeStyle) }
     var playMotionSound by remember { mutableStateOf(preferences.playMotionSound) }
     var motionSoundVolume by remember { mutableIntStateOf(preferences.motionSoundVolume) }
     var hapticEnabled by remember { mutableStateOf(preferences.hapticEnabled) }
@@ -494,6 +496,7 @@ fun TabulaApp(
             motionSoundVolume = motionSoundVolume,
             enableSwipeHaptics = swipeHapticsEnabled,
             isAdaptiveCardStyle = cardStyleMode == CardStyleMode.ADAPTIVE,
+            swipeStyle = swipeStyle,
             isAlbumMode = isAlbumMode,
             onModeChange = { isAlbumMode = it },
             onBatchRemainingChange = { remaining ->
@@ -686,6 +689,7 @@ fun TabulaApp(
             showHdrBadges = showHdrBadges,
             showMotionBadges = showMotionBadges,
             cardStyleMode = cardStyleMode,
+            swipeStyle = swipeStyle,
             onShowHdrBadgesChange = { enabled ->
                 showHdrBadges = enabled
                 preferences.showHdrBadges = enabled
@@ -697,6 +701,10 @@ fun TabulaApp(
             onCardStyleModeChange = { mode ->
                 cardStyleMode = mode
                 preferences.cardStyleMode = mode
+            },
+            onSwipeStyleChange = { style ->
+                swipeStyle = style
+                preferences.swipeStyle = style
             },
             onNavigateBack = { currentScreen = AppScreen.SETTINGS }
         )

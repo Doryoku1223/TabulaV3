@@ -92,6 +92,7 @@ import com.tabula.v3.R
 import com.tabula.v3.data.preferences.AppPreferences
 import com.tabula.v3.data.preferences.CardStyleMode
 import com.tabula.v3.data.preferences.RecommendMode
+import com.tabula.v3.data.preferences.SwipeStyle
 import com.tabula.v3.data.preferences.ThemeMode
 import com.tabula.v3.data.preferences.TopBarDisplayMode
 import com.tabula.v3.ui.components.GlassBottomSheet
@@ -794,9 +795,11 @@ fun ImageDisplayScreen(
     showHdrBadges: Boolean,
     showMotionBadges: Boolean,
     cardStyleMode: CardStyleMode,
+    swipeStyle: SwipeStyle,
     onShowHdrBadgesChange: (Boolean) -> Unit,
     onShowMotionBadgesChange: (Boolean) -> Unit,
     onCardStyleModeChange: (CardStyleMode) -> Unit,
+    onSwipeStyleChange: (SwipeStyle) -> Unit,
     onNavigateBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -877,6 +880,38 @@ fun ImageDisplayScreen(
                     onClick = {
                         HapticFeedback.lightTap(context)
                         onCardStyleModeChange(CardStyleMode.ADAPTIVE)
+                    }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // 切换样式选择
+            SectionHeader("切换样式", textColor)
+            SettingsGroup(cardColor) {
+                CardStyleOptionItem(
+                    title = "切牌样式",
+                    description = "左右滑动循环切换，卡片插入底部",
+                    isSelected = swipeStyle == SwipeStyle.SHUFFLE,
+                    textColor = textColor,
+                    secondaryTextColor = secondaryTextColor,
+                    onClick = {
+                        HapticFeedback.lightTap(context)
+                        onSwipeStyleChange(SwipeStyle.SHUFFLE)
+                    }
+                )
+                
+                Divider(isDarkTheme)
+                
+                CardStyleOptionItem(
+                    title = "摸牌样式",
+                    description = "右滑发牌飞出，左滑收牌飞回",
+                    isSelected = swipeStyle == SwipeStyle.DRAW,
+                    textColor = textColor,
+                    secondaryTextColor = secondaryTextColor,
+                    onClick = {
+                        HapticFeedback.lightTap(context)
+                        onSwipeStyleChange(SwipeStyle.DRAW)
                     }
                 )
             }

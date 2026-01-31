@@ -5,6 +5,7 @@ import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
@@ -45,8 +46,10 @@ import coil.imageLoader
 import coil.memory.MemoryCache
 import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
+import com.tabula.v3.data.preferences.SwipeStyle
 import com.tabula.v3.di.PreloadingManager
 import com.tabula.v3.ui.util.HapticFeedback
+import com.tabula.v3.ui.util.preloadImageFeatures
 import com.tabula.v3.ui.util.rememberImageFeatures
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -140,6 +143,8 @@ fun SwipeableCardStack(
     cardAspectRatio: Float = 3f / 4f,
     // 卡片样式模式（固定/自适应）
     isAdaptiveCardStyle: Boolean = false,
+    // 卡片切换样式（切牌/摸牌）
+    swipeStyle: SwipeStyle = SwipeStyle.SHUFFLE,
     // 下滑归类相关参数
     albums: List<Album> = emptyList(),
     onClassifyToAlbum: ((ImageFile, Album) -> Unit)? = null,
@@ -153,6 +158,33 @@ fun SwipeableCardStack(
     trashButtonBounds: Rect = Rect.Zero
 ) {
     if (images.isEmpty()) return
+    
+    // 根据切换样式分发到不同的实现
+    if (swipeStyle == SwipeStyle.DRAW) {
+        DrawModeCardStack(
+            images = images,
+            currentIndex = currentIndex,
+            onIndexChange = onIndexChange,
+            onRemove = onRemove,
+            onCardClick = onCardClick,
+            showHdrBadges = showHdrBadges,
+            showMotionBadges = showMotionBadges,
+            enableSwipeHaptics = enableSwipeHaptics,
+            modifier = modifier,
+            cardAspectRatio = cardAspectRatio,
+            isAdaptiveCardStyle = isAdaptiveCardStyle,
+            albums = albums,
+            onClassifyToAlbum = onClassifyToAlbum,
+            onCreateNewAlbum = onCreateNewAlbum,
+            onClassifyModeChange = onClassifyModeChange,
+            onSelectedIndexChange = onSelectedIndexChange,
+            tagPositions = tagPositions,
+            trashButtonBounds = trashButtonBounds
+        )
+        return
+    }
+    
+    // ========== 以下是切牌样式 (SHUFFLE) 的实现 ==========
 
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -172,7 +204,11 @@ fun SwipeableCardStack(
     val deleteThresholdPx = screenHeightPx * 0.08f  // 上滑删除阈值（与下滑归类接近）
     val classifyThresholdPx = screenHeightPx * 0.05f  // 下滑归类阈值（约40-50px）
     val classifyExitThresholdPx = screenHeightPx * 0.03f  // 退出归类模式的阈值
-    val tagSwitchDistancePx = with(density) { 18.dp.toPx() }  // 切换标签的拖动距离（更灵敏）
+    
+    // 2D 标签选择参数（支持斜向滑动选择任意标签）
+    val tagSwitchDistanceXPx = with(density) { 16.dp.toPx() }  // 水平方向切换列的距离（更灵敏）
+    val tagSwitchDistanceYPx = with(density) { 20.dp.toPx() }  // 垂直方向切换行的距离（更灵敏）
+    val totalTags = albums.size + 1  // 总标签数（+1 是新建按钮）
 
     // 动画时长
     val shuffleAnimDuration = 120
@@ -197,6 +233,7 @@ fun SwipeableCardStack(
     var isClassifyMode by remember { mutableStateOf(false) }
     var selectedAlbumIndex by remember { mutableIntStateOf(0) }
     var classifyStartX by remember { mutableFloatStateOf(0f) }  // 进入归类模式时的X位置
+    var classifyStartY by remember { mutableFloatStateOf(0f) }  // 进入归类模式时的Y位置（用于2D选择）
     var lastSelectedIndex by remember { mutableIntStateOf(-1) }  // 上次选中的索引，用于触发振动
     var lastSelectionChangeAt by remember { mutableStateOf(0L) }  // 记录上次切换标签的时间
     val latestTagPositions by rememberUpdatedState(tagPositions)
@@ -289,6 +326,7 @@ fun SwipeableCardStack(
         selectedAlbumIndex = if (albums.isNotEmpty()) 1 else 0
         lastSelectionChangeAt = SystemClock.uptimeMillis()
         classifyStartX = 0f
+        classifyStartY = 0f
         lastSelectedIndex = -1
         onClassifyModeChange?.invoke(false)
         
@@ -999,10 +1037,11 @@ fun SwipeableCardStack(
                                                     preloadBitmapForGenie()
                                                 }
                                                 
-                                                // 进入归类模式
+                                                // 进入归类模式（第一阈值）
                                                 if (newY > classifyThresholdPx && !isClassifyMode) {
                                                     isClassifyMode = true
                                                     classifyStartX = dragOffsetX.value  // 记录进入归类模式时的X位置
+                                                    classifyStartY = newY               // 记录进入归类模式时的Y位置
                                                     // 默认选中第一个相册（索引1），因为索引0是新建按钮
                                                     val defaultIndex = if (albums.isNotEmpty()) 1 else 0
                                                     selectedAlbumIndex = defaultIndex
@@ -1021,6 +1060,7 @@ fun SwipeableCardStack(
                                                     isClassifyMode = false
                                                     classifyThresholdHapticTriggered = false
                                                     selectedAlbumIndex = 0
+                                                    classifyStartY = 0f
                                                     lastSelectionChangeAt = SystemClock.uptimeMillis()
                                                     lastSelectedIndex = -1
                                                     onClassifyModeChange?.invoke(false)
@@ -1033,18 +1073,39 @@ fun SwipeableCardStack(
                                                     isPreloading = false
                                                 }
                                                 
-                                                // 归类模式下，根据X方向拖动切换标签
+                                                // 归类模式下：2D 自由选择逻辑
                                                 if (isClassifyMode) {
-                                                    // 计算相对于进入归类模式时的X偏移
+                                                    // 根据 X 偏移计算列偏移
                                                     val relativeX = dragOffsetX.value - classifyStartX
-                                                    // 每移动一定距离切换一个标签
-                                                    val indexOffset = (relativeX / tagSwitchDistancePx).toInt()
-                                                    // 计算新的选中索引
-                                                    // 索引0是新建，索引1到albums.size是相册
-                                                    // 默认从索引1（第一个相册）开始，没有图集时默认0（新建）
-                                                    val maxIndex = albums.size  // 最大索引（最后一个相册）
-                                                    val startIndex = if (albums.isNotEmpty()) 1 else 0
-                                                    val newIndex = (startIndex + indexOffset).coerceIn(0, maxIndex)
+                                                    val colOffset = (relativeX / tagSwitchDistanceXPx).toInt()
+                                                    
+                                                    // 根据 Y 偏移计算行偏移
+                                                    val relativeY = newY - classifyStartY
+                                                    val rowOffset = (relativeY / tagSwitchDistanceYPx).toInt()
+                                                    
+                                                    // 默认起始位置：第一个相册（索引1）
+                                                    val defaultIndex = if (albums.isNotEmpty()) 1 else 0
+                                                    val startRow = defaultIndex / TAGS_PER_ROW
+                                                    val startCol = defaultIndex % TAGS_PER_ROW
+                                                    
+                                                    // 计算新的行和列
+                                                    var newCol = startCol + colOffset
+                                                    var newRow = startRow + rowOffset
+                                                    
+                                                    // 计算总行数
+                                                    val totalRows = (totalTags + TAGS_PER_ROW - 1) / TAGS_PER_ROW
+                                                    
+                                                    // 限制行范围
+                                                    newRow = newRow.coerceIn(0, totalRows - 1)
+                                                    
+                                                    // 限制列范围
+                                                    newCol = newCol.coerceIn(0, TAGS_PER_ROW - 1)
+                                                    
+                                                    // 计算全局索引
+                                                    var newIndex = newRow * TAGS_PER_ROW + newCol
+                                                    
+                                                    // 确保不超过最后一个标签
+                                                    newIndex = newIndex.coerceIn(0, totalTags - 1)
                                                     
                                                     if (newIndex != selectedAlbumIndex) {
                                                         selectedAlbumIndex = newIndex
@@ -1153,6 +1214,1352 @@ fun SwipeableCardStack(
                     cornerRadius = 16.dp,
                     elevation = 8.dp,
                     badges = rememberImageBadges(currentImage, showHdrBadges, showMotionBadges)
+                )
+            }
+        }
+        
+        // ========== Genie Effect 覆盖层 ==========
+        if (genieController.isAnimating) {
+            GenieEffectOverlay(
+                bitmap = genieController.bitmap,
+                sourceBounds = genieController.sourceBounds,
+                targetX = genieController.targetX,
+                targetY = genieController.targetY,
+                progress = genieController.progress,
+                screenHeight = genieController.screenHeight,
+                direction = genieController.direction,
+                modifier = Modifier.zIndex(10f)
+            )
+        }
+    }
+}
+
+// ========== 摸牌样式组件 ==========
+
+/**
+ * 摸牌样式卡片堆叠组件
+ * 
+ * 显示映射：
+ * - 左卡 = deck[i+1] (下一张，预览露出，不可滑)
+ * - 中卡 = deck[i] (当前牌，唯一可滑)
+ * - 右卡 = deck[i+2] (下下张，预览露出，不可滑)
+ * 
+ * 交互：
+ * - 右滑发牌：中卡向右飞出屏幕
+ * - 左滑收牌：最后发出的牌从右侧飞回
+ */
+@Composable
+private fun DrawModeCardStack(
+    images: List<ImageFile>,
+    currentIndex: Int,
+    onIndexChange: (Int) -> Unit,
+    onRemove: (ImageFile) -> Unit,
+    onCardClick: ((ImageFile, SourceRect) -> Unit)? = null,
+    showHdrBadges: Boolean = false,
+    showMotionBadges: Boolean = false,
+    enableSwipeHaptics: Boolean = true,
+    modifier: Modifier = Modifier,
+    cardAspectRatio: Float = 3f / 4f,
+    isAdaptiveCardStyle: Boolean = false,
+    albums: List<Album> = emptyList(),
+    onClassifyToAlbum: ((ImageFile, Album) -> Unit)? = null,
+    onCreateNewAlbum: ((ImageFile) -> Unit)? = null,
+    onClassifyModeChange: ((Boolean) -> Unit)? = null,
+    onSelectedIndexChange: ((Int) -> Unit)? = null,
+    tagPositions: Map<Int, TagPosition> = emptyMap(),
+    trashButtonBounds: Rect = Rect.Zero
+) {
+    val context = LocalContext.current
+    val density = LocalDensity.current
+    val configuration = LocalConfiguration.current
+    val scope = rememberCoroutineScope()
+
+    // 屏幕尺寸
+    val screenWidthPx = with(density) { configuration.screenWidthDp.dp.toPx() }
+    val screenHeightPx = with(density) { configuration.screenHeightDp.dp.toPx() }
+
+    // 摸牌样式的偏移量（三张卡错开显示）
+    val sideCardOffsetPx = with(density) { 40.dp.toPx() }
+
+    // 阈值配置 - 更灵敏的触发
+    val swipeThresholdPx = screenWidthPx * 0.12f  // 发牌/收牌阈值（降低到12%）
+    val velocityThreshold = 350f  // 降低速度阈值，更容易触发
+    val deleteThresholdPx = screenHeightPx * 0.08f
+    val classifyThresholdPx = screenHeightPx * 0.05f
+    val classifyExitThresholdPx = screenHeightPx * 0.03f
+    
+    // 2D 标签选择参数
+    val tagSwitchDistanceXPx = with(density) { 16.dp.toPx() }
+    val tagSwitchDistanceYPx = with(density) { 20.dp.toPx() }
+    val totalTags = albums.size + 1
+
+    // 动画时长
+    val drawAnimDuration = 200  // 发牌动画时长
+    val recallAnimDuration = 250  // 收牌动画时长
+    val genieAnimDuration = 520
+
+    // ========== 摸牌样式状态 ==========
+    var drawState by remember { mutableStateOf(DrawCardState(currentIndex = currentIndex)) }
+    
+    // 当外部 currentIndex 变化时同步状态（如删除图片后）
+    LaunchedEffect(currentIndex, images.size) {
+        if (drawState.currentIndex != currentIndex) {
+            drawState = DrawCardState(currentIndex = currentIndex)
+        }
+    }
+    
+    // 预加载当前可见卡片的特征（避免 badge 闪烁）
+    LaunchedEffect(drawState.currentIndex, images.size, showHdrBadges, showMotionBadges) {
+        if (!showHdrBadges && !showMotionBadges) return@LaunchedEffect
+        
+        val idx = drawState.currentIndex
+        withContext(Dispatchers.IO) {
+            // 预加载中卡特征
+            if (idx in images.indices) {
+                preloadImageFeatures(context, images[idx], showHdrBadges, showMotionBadges)
+            }
+            // 预加载左卡特征
+            if (idx + 1 in images.indices) {
+                preloadImageFeatures(context, images[idx + 1], showHdrBadges, showMotionBadges)
+            }
+            // 预加载右卡特征
+            if (idx + 2 in images.indices) {
+                preloadImageFeatures(context, images[idx + 2], showHdrBadges, showMotionBadges)
+            }
+        }
+    }
+
+    // ========== 中卡拖拽状态 ==========
+    val centerDragOffsetX = remember { Animatable(0f) }
+    val centerDragOffsetY = remember { Animatable(0f) }
+    val centerDragRotation = remember { Animatable(0f) }
+    val centerDragAlpha = remember { Animatable(1f) }
+    val centerDragScale = remember { Animatable(1f) }
+    
+    // ========== 收牌动画状态（正在返回的牌）==========
+    val returningCardOffsetX = remember { Animatable(screenWidthPx) }  // 从右侧开始
+    val returningCardAlpha = remember { Animatable(0f) }
+    
+    // ========== 侧卡位置动画（用于层级重排）==========
+    val leftCardOffsetX = remember { Animatable(-sideCardOffsetPx) }
+    val leftCardScale = remember { Animatable(0.88f) }
+    val leftCardAlpha = remember { Animatable(1f) }  // 背景卡片不透明
+    val leftCardRotation = remember { Animatable(-5f) }  // 左卡旋转，初始 -5 度
+    val rightCardOffsetX = remember { Animatable(sideCardOffsetPx) }
+    val rightCardScale = remember { Animatable(0.88f) }
+    val rightCardAlpha = remember { Animatable(1f) }  // 背景卡片不透明
+    
+    // ========== 补位动画状态 ==========
+    // 发牌时：左卡需要滑入中间成为新中卡
+    var isDrawTransitioning by remember { mutableStateOf(false) }
+    val incomingCenterOffsetX = remember { Animatable(-sideCardOffsetPx) }  // 从左侧滑入
+    val incomingCenterScale = remember { Animatable(0.88f) }
+    val incomingCenterAlpha = remember { Animatable(1f) }  // 背景卡片不透明
+    
+    // 收牌时：当前中卡需要滑到左侧
+    var isRecallTransitioning by remember { mutableStateOf(false) }
+    val outgoingLeftOffsetX = remember { Animatable(0f) }  // 从中间滑到左侧
+    val outgoingLeftScale = remember { Animatable(1f) }
+    val outgoingLeftAlpha = remember { Animatable(1f) }
+
+    // 手势方向锁定
+    var lockedDirection by remember { mutableStateOf(SwipeDirection.NONE) }
+    var isDragging by remember { mutableStateOf(false) }
+    var hasDragged by remember { mutableStateOf(false) }
+    var swipeThresholdHapticTriggered by remember { mutableStateOf(false) }
+    var deleteThresholdHapticTriggered by remember { mutableStateOf(false) }
+    var classifyThresholdHapticTriggered by remember { mutableStateOf(false) }
+    
+    // 归类模式状态
+    var isClassifyMode by remember { mutableStateOf(false) }
+    var selectedAlbumIndex by remember { mutableIntStateOf(if (albums.isNotEmpty()) 1 else 0) }
+    var classifyStartX by remember { mutableFloatStateOf(0f) }
+    var classifyStartY by remember { mutableFloatStateOf(0f) }
+    var lastSelectedIndex by remember { mutableIntStateOf(-1) }
+    var lastSelectionChangeAt by remember { mutableStateOf(0L) }
+    val latestTagPositions by rememberUpdatedState(tagPositions)
+
+    // Genie 动画控制器
+    val genieController = rememberGenieAnimationController()
+    
+    // Bitmap 预加载状态
+    var preloadedBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var isPreloading by remember { mutableStateOf(false) }
+    var preloadedDeleteBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var isPreloadingDelete by remember { mutableStateOf(false) }
+    
+    // 清理
+    DisposableEffect(Unit) {
+        onDispose {
+            preloadedBitmap?.recycle()
+            preloadedDeleteBitmap?.recycle()
+        }
+    }
+    
+    // 图片预加载 - 扩大范围确保流畅
+    val preloadingManager = remember { PreloadingManager(context, preloadRange = 5) }
+    LaunchedEffect(drawState.currentIndex, images) {
+        preloadingManager.preloadAround(
+            images = images,
+            currentIndex = drawState.currentIndex,
+            cardSize = IntSize(1080, 1440)
+        )
+    }
+    
+    // 手动预加载函数 - 在动画开始前调用
+    fun preloadNextCards(fromIndex: Int) {
+        scope.launch {
+            // 预加载接下来的几张卡片
+            for (offset in 1..4) {
+                val index = fromIndex + offset
+                if (index < images.size) {
+                    preloadingManager.preloadAround(
+                        images = images,
+                        currentIndex = index,
+                        cardSize = IntSize(1080, 1440)
+                    )
+                }
+            }
+        }
+    }
+
+    // 卡片位置记录
+    var centerCardBounds by remember { mutableStateOf(Rect.Zero) }
+    var containerBounds by remember { mutableStateOf(Rect.Zero) }
+
+    // 获取三张卡的数据（摸牌样式映射：左=i+1, 中=i, 右=i+2）
+    val leftCard = drawState.getLeftCard(images)    // deck[i+1]
+    val centerCard = drawState.getCenterCard(images) // deck[i]
+    val rightCard = drawState.getRightCard(images)   // deck[i+2]
+    
+    // 预览返回牌（左滑收牌时显示）
+    val previewReturningCard = remember(drawState.dealtStack) {
+        if (drawState.canRecall()) {
+            drawState.dealtStack.lastOrNull()?.let { images.getOrNull(it.originalIndex) }
+        } else null
+    }
+    
+    // 计算卡片比例
+    val actualCardAspectRatio = remember(centerCard?.id, isAdaptiveCardStyle) {
+        if (isAdaptiveCardStyle && centerCard != null && centerCard.hasDimensionInfo) {
+            calculateCardAspectRatio(centerCard.aspectRatio, true)
+        } else {
+            cardAspectRatio
+        }
+    }
+
+    /**
+     * 重置拖拽状态
+     */
+    suspend fun resetDragState() {
+        scope.launch { centerDragOffsetX.animateTo(0f, spring(stiffness = Spring.StiffnessMedium)) }
+        scope.launch { centerDragOffsetY.animateTo(0f, spring(stiffness = Spring.StiffnessMedium)) }
+        scope.launch { centerDragRotation.animateTo(0f, spring(stiffness = Spring.StiffnessMedium)) }
+        scope.launch { centerDragAlpha.animateTo(1f, spring(stiffness = Spring.StiffnessMedium)) }
+        scope.launch { centerDragScale.animateTo(1f, spring(stiffness = Spring.StiffnessMedium)) }
+        
+        // 重置左卡跟手状态（带动画回弹）
+        scope.launch { leftCardOffsetX.animateTo(-sideCardOffsetPx, spring(stiffness = Spring.StiffnessMedium)) }
+        scope.launch { leftCardScale.animateTo(0.88f, spring(stiffness = Spring.StiffnessMedium)) }
+        scope.launch { leftCardAlpha.animateTo(1f, spring(stiffness = Spring.StiffnessMedium)) }  // 保持不透明
+        scope.launch { leftCardRotation.animateTo(-5f, spring(stiffness = Spring.StiffnessMedium)) }
+        
+        // 重置返回牌预览状态
+        scope.launch { returningCardOffsetX.animateTo(screenWidthPx, spring(stiffness = Spring.StiffnessMedium)) }
+        scope.launch { returningCardAlpha.animateTo(0f, spring(stiffness = Spring.StiffnessMedium)) }
+        
+        lockedDirection = SwipeDirection.NONE
+        swipeThresholdHapticTriggered = false
+        deleteThresholdHapticTriggered = false
+        classifyThresholdHapticTriggered = false
+        
+        // 重置归类模式
+        isClassifyMode = false
+        selectedAlbumIndex = if (albums.isNotEmpty()) 1 else 0
+        lastSelectionChangeAt = SystemClock.uptimeMillis()
+        classifyStartX = 0f
+        classifyStartY = 0f
+        lastSelectedIndex = -1
+        onClassifyModeChange?.invoke(false)
+        
+        // 清理预加载
+        preloadedBitmap?.recycle()
+        preloadedBitmap = null
+        isPreloading = false
+        preloadedDeleteBitmap?.recycle()
+        preloadedDeleteBitmap = null
+        isPreloadingDelete = false
+    }
+
+    // 保存动画期间需要显示的"旧卡片"
+    var exitingCenterCard by remember { mutableStateOf<ImageFile?>(null) }
+    var transitionLeftCard by remember { mutableStateOf<ImageFile?>(null) }
+    
+    /**
+     * 执行发牌动画（中卡向右飞出，左卡补位到中间）
+     * 
+     * 优化：先更新状态让新图片提前加载，同时播放旧卡片的退场动画
+     */
+    suspend fun executeDrawAnimation() {
+        if (!drawState.canDraw(images.size)) return
+        
+        // 注意：不在这里触发振动，因为 onDrag 中已经触发过了
+        
+        // 1. 保存当前卡片用于动画（必须在状态更新前）
+        exitingCenterCard = centerCard
+        transitionLeftCard = leftCard
+        
+        // 2. 初始化动画状态（从当前跟手位置开始，避免闪烁）
+        // centerDragOffsetX 保持当前值，从拖动位置继续动画
+        // centerDragAlpha 保持当前值
+        // centerDragRotation 保持当前值
+        // 左卡过渡动画从当前跟手位置开始
+        incomingCenterOffsetX.snapTo(leftCardOffsetX.value)
+        incomingCenterScale.snapTo(leftCardScale.value)
+        incomingCenterAlpha.snapTo(leftCardAlpha.value)
+        
+        // 3. 设置过渡标志（必须在状态更新前！避免闪烁）
+        isDrawTransitioning = true
+        
+        // 4. 预加载后续图片和特征（避免 badge 闪烁）
+        preloadNextCards(drawState.currentIndex + 1)
+        val nextIndex = drawState.currentIndex + 1
+        if (nextIndex < images.size) {
+            scope.launch(Dispatchers.IO) {
+                // 预加载新中卡的特征
+                preloadImageFeatures(context, images[nextIndex], showHdrBadges, showMotionBadges)
+                // 预加载新左卡的特征
+                if (nextIndex + 1 < images.size) {
+                    preloadImageFeatures(context, images[nextIndex + 1], showHdrBadges, showMotionBadges)
+                }
+            }
+        }
+        
+        // 5. 更新状态，让新图片开始加载
+        val newState = drawCardReducer(drawState, DrawCardAction.Draw, images)
+        drawState = newState
+        onIndexChange(newState.currentIndex)
+        
+        // 动画参数 - 更快更流畅
+        val animDuration = 160  // 缩短动画时间
+        val animSpec = tween<Float>(animDuration, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f))
+        val fastSpec = tween<Float>(animDuration * 2 / 3, easing = CubicBezierEasing(0.4f, 0f, 1f, 1f))
+        
+        // 并行执行动画
+        val targetX = screenWidthPx * 1.05f
+        scope.launch { centerDragOffsetX.animateTo(targetX, animSpec) }
+        scope.launch { centerDragRotation.animateTo(8f, animSpec) }
+        scope.launch { centerDragAlpha.animateTo(0f, fastSpec) }
+        
+        // 左卡补位动画（滑入中间）
+        scope.launch { incomingCenterOffsetX.animateTo(0f, animSpec) }
+        scope.launch { incomingCenterScale.animateTo(1f, animSpec) }
+        scope.launch { incomingCenterAlpha.animateTo(1f, animSpec) }
+        
+        kotlinx.coroutines.delay(animDuration.toLong())
+        
+        // 6. 动画完成，清理状态
+        isDrawTransitioning = false
+        exitingCenterCard = null
+        transitionLeftCard = null
+        
+        centerDragOffsetX.snapTo(0f)
+        centerDragOffsetY.snapTo(0f)
+        centerDragRotation.snapTo(0f)
+        centerDragAlpha.snapTo(1f)
+        centerDragScale.snapTo(1f)
+        incomingCenterOffsetX.snapTo(-sideCardOffsetPx)
+        incomingCenterScale.snapTo(0.88f)
+        incomingCenterAlpha.snapTo(1f)  // 背景卡片不透明
+        // 重置左卡跟手状态
+        leftCardOffsetX.snapTo(-sideCardOffsetPx)
+        leftCardScale.snapTo(0.88f)
+        leftCardAlpha.snapTo(1f)  // 保持不透明
+        leftCardRotation.snapTo(-5f)
+        lockedDirection = SwipeDirection.NONE
+        swipeThresholdHapticTriggered = false
+    }
+
+    // 收牌动画保存的卡片
+    var recallTransitionCenter by remember { mutableStateOf<ImageFile?>(null) }
+    var recallTransitionLeft by remember { mutableStateOf<ImageFile?>(null) }
+    var recallTransitionRight by remember { mutableStateOf<ImageFile?>(null) }
+    var recallReturningCard by remember { mutableStateOf<ImageFile?>(null) }
+    
+    /**
+     * 执行收牌动画（返回牌从右侧飞入，当前中卡滑到左侧）
+     */
+    suspend fun executeRecallAnimation() {
+        if (!drawState.canRecall()) return
+        
+        // 注意：不在这里触发振动，因为 onDrag 中已经触发过了
+        
+        // 1. 保存当前卡片用于动画（必须在状态更新前）
+        recallTransitionCenter = centerCard
+        recallTransitionLeft = leftCard
+        recallTransitionRight = rightCard
+        
+        // 获取返回的牌
+        val returningCardData = drawState.dealtStack.lastOrNull()
+        recallReturningCard = returningCardData?.let { images.getOrNull(it.originalIndex) }
+        
+        // 2. 初始化动画状态（必须在设置标志前）
+        outgoingLeftOffsetX.snapTo(0f)
+        outgoingLeftScale.snapTo(1f)
+        outgoingLeftAlpha.snapTo(1f)
+        returningCardOffsetX.snapTo(screenWidthPx * 1.05f)
+        returningCardAlpha.snapTo(1f)
+        leftCardAlpha.snapTo(1f)  // 新左卡保持不透明
+        rightCardAlpha.snapTo(1f)  // 新右卡保持不透明
+        
+        // 3. 设置过渡标志（必须在状态更新前！避免闪烁）
+        isRecallTransitioning = true
+        
+        // 4. 预加载返回牌的特征（避免 badge 闪烁）
+        if (recallReturningCard != null) {
+            scope.launch(Dispatchers.IO) {
+                preloadImageFeatures(context, recallReturningCard!!, showHdrBadges, showMotionBadges)
+            }
+        }
+        
+        // 5. 更新状态，让新图片开始加载
+        val newState = drawCardReducer(drawState, DrawCardAction.Recall, images)
+        drawState = newState
+        onIndexChange(newState.currentIndex)
+        
+        // 动画参数 - 更快更流畅
+        val animDuration = 180
+        val animSpec = tween<Float>(animDuration, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f))
+        val fastSpec = tween<Float>(animDuration / 2)
+        
+        // 并行执行动画
+        scope.launch { returningCardOffsetX.animateTo(0f, animSpec) }
+        scope.launch { outgoingLeftOffsetX.animateTo(-sideCardOffsetPx, animSpec) }
+        scope.launch { outgoingLeftScale.animateTo(0.88f, animSpec) }
+        scope.launch { outgoingLeftAlpha.animateTo(1f, animSpec) }  // 保持不透明
+        // leftCardAlpha 保持 1f，不需要动画
+        scope.launch { leftCardOffsetX.animateTo(-sideCardOffsetPx * 1.3f, animSpec) }
+        
+        // 右卡保持不透明，不需要淡出
+        
+        kotlinx.coroutines.delay(animDuration.toLong())
+        
+        // 5. 清除动画状态
+        val finalState = drawCardReducer(drawState, DrawCardAction.AnimationComplete, images)
+        drawState = finalState
+        
+        isRecallTransitioning = false
+        recallTransitionCenter = null
+        recallTransitionLeft = null
+        recallTransitionRight = null
+        recallReturningCard = null
+        
+        centerDragOffsetX.snapTo(0f)
+        centerDragOffsetY.snapTo(0f)
+        centerDragRotation.snapTo(0f)
+        centerDragAlpha.snapTo(1f)
+        centerDragScale.snapTo(1f)
+        returningCardOffsetX.snapTo(screenWidthPx)
+        returningCardAlpha.snapTo(0f)
+        outgoingLeftOffsetX.snapTo(0f)
+        outgoingLeftScale.snapTo(1f)
+        outgoingLeftAlpha.snapTo(1f)
+        leftCardOffsetX.snapTo(-sideCardOffsetPx)
+        leftCardAlpha.snapTo(1f)  // 保持不透明
+        leftCardScale.snapTo(0.88f)
+        leftCardRotation.snapTo(-5f)
+        rightCardAlpha.snapTo(1f)  // 保持不透明
+        lockedDirection = SwipeDirection.NONE
+        swipeThresholdHapticTriggered = false
+    }
+    
+    /**
+     * 预加载 Bitmap（用于 Genie 动画）
+     */
+    fun preloadBitmapForGenie() {
+        if (isPreloading || preloadedBitmap != null) return
+        val currentImg = centerCard ?: return
+        
+        isPreloading = true
+        scope.launch(Dispatchers.Default) {
+            try {
+                var bitmap: Bitmap? = null
+                val cacheKey = "card_${currentImg.id}"
+                val cachedBitmap = context.imageLoader.memoryCache?.get(
+                    MemoryCache.Key(cacheKey)
+                )?.bitmap
+                
+                if (cachedBitmap != null && !cachedBitmap.isRecycled) {
+                    val maxSize = 250
+                    val scale = minOf(
+                        maxSize.toFloat() / cachedBitmap.width,
+                        maxSize.toFloat() / cachedBitmap.height,
+                        1f
+                    )
+                    val targetWidth = (cachedBitmap.width * scale).toInt().coerceAtLeast(50)
+                    val targetHeight = (cachedBitmap.height * scale).toInt().coerceAtLeast(50)
+                    bitmap = Bitmap.createScaledBitmap(cachedBitmap, targetWidth, targetHeight, true)
+                }
+                
+                if (bitmap == null) {
+                    withContext(Dispatchers.IO) {
+                        bitmap = createGenieBitmapFast(context, currentImg.uri, 250, 250)
+                    }
+                }
+                
+                withContext(Dispatchers.Main) {
+                    if (lockedDirection == SwipeDirection.DOWN) {
+                        preloadedBitmap = bitmap
+                    } else {
+                        bitmap?.recycle()
+                    }
+                    isPreloading = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { isPreloading = false }
+            }
+        }
+    }
+
+    fun preloadBitmapForDelete() {
+        if (isPreloadingDelete || preloadedDeleteBitmap != null) return
+        val currentImg = centerCard ?: return
+        
+        isPreloadingDelete = true
+        scope.launch(Dispatchers.Default) {
+            try {
+                var bitmap: Bitmap? = null
+                val cacheKey = "card_${currentImg.id}"
+                val cachedBitmap = context.imageLoader.memoryCache?.get(
+                    MemoryCache.Key(cacheKey)
+                )?.bitmap
+                
+                if (cachedBitmap != null && !cachedBitmap.isRecycled) {
+                    val maxSize = 250
+                    val scale = minOf(
+                        maxSize.toFloat() / cachedBitmap.width,
+                        maxSize.toFloat() / cachedBitmap.height,
+                        1f
+                    )
+                    val targetWidth = (cachedBitmap.width * scale).toInt().coerceAtLeast(50)
+                    val targetHeight = (cachedBitmap.height * scale).toInt().coerceAtLeast(50)
+                    bitmap = Bitmap.createScaledBitmap(cachedBitmap, targetWidth, targetHeight, true)
+                }
+                
+                if (bitmap == null) {
+                    withContext(Dispatchers.IO) {
+                        bitmap = createGenieBitmapFast(context, currentImg.uri, 250, 250)
+                    }
+                }
+                
+                withContext(Dispatchers.Main) {
+                    if (lockedDirection == SwipeDirection.UP) {
+                        preloadedDeleteBitmap = bitmap
+                    } else {
+                        bitmap?.recycle()
+                    }
+                    isPreloadingDelete = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { isPreloadingDelete = false }
+            }
+        }
+    }
+
+    /**
+     * 执行删除动画（Genie 效果）
+     */
+    suspend fun executeDeleteAnimation(playHaptic: Boolean) {
+        val currentImg = centerCard ?: return
+        
+        if (enableSwipeHaptics && playHaptic) {
+            HapticFeedback.heavyTap(context)
+        }
+        
+        val targetCenterX: Float
+        val targetCenterY: Float
+        
+        if (trashButtonBounds != Rect.Zero && containerBounds != Rect.Zero) {
+            targetCenterX = trashButtonBounds.center.x - containerBounds.left
+            targetCenterY = trashButtonBounds.bottom - containerBounds.top
+        } else {
+            targetCenterX = containerBounds.width * 0.8f
+            targetCenterY = with(density) { 60.dp.toPx() }
+        }
+        
+        var bitmap = preloadedDeleteBitmap
+        if (bitmap == null && isPreloadingDelete) {
+            val startWait = SystemClock.uptimeMillis()
+            while (bitmap == null && isPreloadingDelete && SystemClock.uptimeMillis() - startWait < 100) {
+                kotlinx.coroutines.delay(10)
+                bitmap = preloadedDeleteBitmap
+            }
+        }
+        
+        if (bitmap == null) {
+            val maxSize = 300
+            val scale = minOf(maxSize / centerCardBounds.width.coerceAtLeast(1f), maxSize / centerCardBounds.height.coerceAtLeast(1f), 1f)
+            val bitmapWidth = (centerCardBounds.width * scale).toInt().coerceAtLeast(50)
+            val bitmapHeight = (centerCardBounds.height * scale).toInt().coerceAtLeast(50)
+            
+            bitmap = withContext(Dispatchers.IO) {
+                createGenieBitmapFast(context, currentImg.uri, bitmapWidth, bitmapHeight)
+            }
+        }
+        
+        preloadedDeleteBitmap = null
+        isPreloadingDelete = false
+        
+        val relativeSourceBounds = if (containerBounds != Rect.Zero) {
+            Rect(
+                left = centerCardBounds.left - containerBounds.left,
+                top = centerCardBounds.top - containerBounds.top,
+                right = centerCardBounds.right - containerBounds.left,
+                bottom = centerCardBounds.bottom - containerBounds.top
+            )
+        } else {
+            centerCardBounds
+        }
+        
+        if (bitmap != null) {
+            centerDragAlpha.snapTo(0f)
+            
+            genieController.startAnimation(
+                bitmap = bitmap,
+                sourceBounds = relativeSourceBounds,
+                targetX = targetCenterX,
+                targetY = targetCenterY,
+                screenHeight = screenHeightPx,
+                direction = GenieDirection.UP,
+                durationMs = genieAnimDuration,
+                onComplete = {
+                    onRemove(currentImg)
+                }
+            )
+        } else {
+            val animDuration = 400
+            val easeInOut = CubicBezierEasing(0.4f, 0f, 0.2f, 1f)
+            
+            val finalOffsetX = targetCenterX - centerCardBounds.center.x + containerBounds.left
+            val finalOffsetY = targetCenterY - centerCardBounds.center.y + containerBounds.top
+            
+            scope.launch { centerDragOffsetX.animateTo(finalOffsetX, tween(animDuration, easing = easeInOut)) }
+            scope.launch { centerDragOffsetY.animateTo(finalOffsetY, tween(animDuration, easing = easeInOut)) }
+            scope.launch { centerDragScale.animateTo(0.05f, tween(animDuration, easing = easeInOut)) }
+            scope.launch { centerDragAlpha.animateTo(0f, tween(animDuration, easing = easeInOut)) }
+            
+            kotlinx.coroutines.delay(animDuration.toLong())
+            onRemove(currentImg)
+        }
+        
+        centerDragOffsetX.snapTo(0f)
+        centerDragOffsetY.snapTo(0f)
+        centerDragRotation.snapTo(0f)
+        centerDragAlpha.snapTo(1f)
+        centerDragScale.snapTo(1f)
+        lockedDirection = SwipeDirection.NONE
+    }
+
+    /**
+     * 等待并获取选中标签的最新测量位置
+     */
+    suspend fun resolveTagBounds(targetIndex: Int, timeoutMs: Long): Rect? {
+        val start = SystemClock.uptimeMillis()
+        var lastRect: Rect? = null
+
+        while (SystemClock.uptimeMillis() - start < timeoutMs) {
+            val tagPosition = latestTagPositions[targetIndex]
+            if (tagPosition != null && tagPosition.coordinates.isAttached) {
+                val rect = tagPosition.coordinates.boundsInRoot()
+                lastRect = rect
+                val isFresh = tagPosition.updatedAt >= lastSelectionChangeAt
+                if (rect != Rect.Zero && isFresh) {
+                    return rect
+                }
+            }
+            kotlinx.coroutines.delay(16)
+        }
+        return lastRect
+    }
+
+    /**
+     * 执行归类动画
+     */
+    suspend fun executeGenieAnimation(targetIndex: Int) {
+        val currentImg = centerCard ?: return
+        
+        val isCreateNew = targetIndex == 0
+        val targetAlbum = if (!isCreateNew && targetIndex > 0 && targetIndex <= albums.size) {
+            albums[targetIndex - 1]
+        } else null
+        
+        if (enableSwipeHaptics) {
+            HapticFeedback.heavyTap(context)
+        }
+
+        val now = SystemClock.uptimeMillis()
+        val shouldWaitLonger = now - lastSelectionChangeAt < 250L
+        val tagBounds = resolveTagBounds(
+            targetIndex = targetIndex,
+            timeoutMs = if (shouldWaitLonger) 600L else 100L
+        )
+        
+        val targetCenterX: Float
+        val targetCenterY: Float
+        
+        if (tagBounds != null && tagBounds != Rect.Zero && containerBounds != Rect.Zero) {
+            val scaleCompensation = tagBounds.height * 0.05f
+            targetCenterX = tagBounds.center.x - containerBounds.left
+            targetCenterY = tagBounds.top - containerBounds.top - scaleCompensation
+        } else {
+            val tagEstimatedWidth = with(density) { 65.dp.toPx() }
+            val tagSpacing = with(density) { 12.dp.toPx() }
+            val listPadding = with(density) { 24.dp.toPx() }
+            val tagsStartX = listPadding
+            targetCenterX = tagsStartX + targetIndex * (tagEstimatedWidth + tagSpacing) + tagEstimatedWidth / 2f
+            targetCenterY = containerBounds.height - with(density) { 80.dp.toPx() }
+        }
+        
+        var bitmap = preloadedBitmap
+        if (bitmap == null && isPreloading) {
+            val startWait = SystemClock.uptimeMillis()
+            while (bitmap == null && isPreloading && SystemClock.uptimeMillis() - startWait < 100) {
+                kotlinx.coroutines.delay(10)
+                bitmap = preloadedBitmap
+            }
+        }
+        
+        if (bitmap == null) {
+            val maxSize = 300
+            val scale = minOf(maxSize / centerCardBounds.width.coerceAtLeast(1f), maxSize / centerCardBounds.height.coerceAtLeast(1f), 1f)
+            val bitmapWidth = (centerCardBounds.width * scale).toInt().coerceAtLeast(50)
+            val bitmapHeight = (centerCardBounds.height * scale).toInt().coerceAtLeast(50)
+            
+            bitmap = withContext(Dispatchers.IO) {
+                createGenieBitmapFast(context, currentImg.uri, bitmapWidth, bitmapHeight)
+            }
+        }
+        
+        preloadedBitmap = null
+        isPreloading = false
+        
+        val relativeSourceBounds = if (containerBounds != Rect.Zero) {
+            Rect(
+                left = centerCardBounds.left - containerBounds.left,
+                top = centerCardBounds.top - containerBounds.top,
+                right = centerCardBounds.right - containerBounds.left,
+                bottom = centerCardBounds.bottom - containerBounds.top
+            )
+        } else {
+            centerCardBounds
+        }
+        
+        if (bitmap != null) {
+            centerDragAlpha.snapTo(0f)
+            
+            genieController.startAnimation(
+                bitmap = bitmap,
+                sourceBounds = relativeSourceBounds,
+                targetX = targetCenterX,
+                targetY = targetCenterY,
+                screenHeight = screenHeightPx,
+                durationMs = genieAnimDuration,
+                onComplete = {
+                    if (!isCreateNew && targetAlbum != null) {
+                        onClassifyToAlbum?.invoke(currentImg, targetAlbum)
+                    } else {
+                        onCreateNewAlbum?.invoke(currentImg)
+                    }
+                }
+            )
+        } else {
+            val finalOffsetX = targetCenterX - centerCardBounds.center.x
+            val finalOffsetY = targetCenterY - centerCardBounds.center.y
+            
+            scope.launch { centerDragOffsetX.animateTo(finalOffsetX, tween(genieAnimDuration)) }
+            scope.launch { centerDragOffsetY.animateTo(finalOffsetY, tween(genieAnimDuration)) }
+            scope.launch { centerDragScale.animateTo(0.05f, tween(genieAnimDuration)) }
+            scope.launch { centerDragAlpha.animateTo(0f, tween(genieAnimDuration)) }
+            
+            kotlinx.coroutines.delay(genieAnimDuration.toLong())
+            
+            if (!isCreateNew && targetAlbum != null) {
+                onClassifyToAlbum?.invoke(currentImg, targetAlbum)
+            } else {
+                onCreateNewAlbum?.invoke(currentImg)
+            }
+        }
+        
+        centerDragOffsetX.snapTo(0f)
+        centerDragOffsetY.snapTo(0f)
+        centerDragRotation.snapTo(0f)
+        centerDragAlpha.snapTo(1f)
+        centerDragScale.snapTo(1f)
+        lockedDirection = SwipeDirection.NONE
+        isClassifyMode = false
+        selectedAlbumIndex = 0
+        lastSelectionChangeAt = SystemClock.uptimeMillis()
+        classifyStartX = 0f
+        lastSelectedIndex = -1
+        onClassifyModeChange?.invoke(false)
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 24.dp, vertical = 16.dp)
+            .onGloballyPositioned { coordinates ->
+                containerBounds = coordinates.boundsInRoot()
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        // ========== 左卡 (deck[i+1]) - 不可滑，消费 pointer 事件 ==========
+        // 发牌过渡时：左卡正在补位到中间，由 incomingCenter 动画控制
+        // 收牌过渡时：左卡正在滑出，使用 leftCardAlpha 控制淡出
+        if (leftCard != null && !isDrawTransitioning) {
+            key(leftCard.id) {
+                ImageCard(
+                    imageFile = leftCard,
+                    modifier = Modifier
+                        .zIndex(0.3f)  // 高于右卡(0f)，确保下一张在下下张上面
+                        .fillMaxWidth(0.85f)
+                        .aspectRatio(actualCardAspectRatio)
+                        .graphicsLayer {
+                            transformOrigin = TransformOrigin.Center
+                            scaleX = leftCardScale.value
+                            scaleY = leftCardScale.value
+                            translationX = leftCardOffsetX.value
+                            rotationZ = leftCardRotation.value  // 跟手旋转，从 -5° 到 0°
+                            alpha = leftCardAlpha.value
+                        }
+                        // 消费 pointer 事件，防止穿透到中卡
+                        .pointerInput(Unit) {
+                            awaitEachGesture {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    event.changes.forEach { it.consume() }
+                                }
+                            }
+                        },
+                    cornerRadius = 16.dp,
+                    elevation = 4.dp,
+                    badges = rememberImageBadges(leftCard, showHdrBadges, showMotionBadges)
+                )
+            }
+        } else if (leftCard == null && !isDrawTransitioning) {
+            ImageCardPlaceholder(
+                modifier = Modifier
+                    .zIndex(0.3f)  // 高于右卡(0f)，确保下一张在下下张上面
+                    .fillMaxWidth(0.85f)
+                    .aspectRatio(actualCardAspectRatio)
+                    .graphicsLayer {
+                        transformOrigin = TransformOrigin.Center
+                        scaleX = 0.88f
+                        scaleY = 0.88f
+                        translationX = -sideCardOffsetPx
+                        rotationZ = -5f
+                        alpha = 0.5f
+                    },
+                cornerRadius = 16.dp,
+                elevation = 4.dp
+            )
+        }
+        
+        // ========== 发牌过渡时：旧左卡正在补位到中间 ==========
+        if (isDrawTransitioning && transitionLeftCard != null) {
+            key("incoming_${transitionLeftCard!!.id}") {
+                ImageCard(
+                    imageFile = transitionLeftCard!!,
+                    modifier = Modifier
+                        .zIndex(1.5f)  // 高于左卡，低于飞出的中卡
+                        .fillMaxWidth(0.85f)
+                        .aspectRatio(actualCardAspectRatio)
+                        .graphicsLayer {
+                            transformOrigin = TransformOrigin.Center
+                            scaleX = incomingCenterScale.value
+                            scaleY = incomingCenterScale.value
+                            translationX = incomingCenterOffsetX.value
+                            rotationZ = -5f * (1f - (incomingCenterOffsetX.value + sideCardOffsetPx) / sideCardOffsetPx).coerceIn(0f, 1f)
+                            alpha = incomingCenterAlpha.value
+                        },
+                    cornerRadius = 16.dp,
+                    elevation = 6.dp,
+                    badges = rememberImageBadges(transitionLeftCard!!, showHdrBadges, showMotionBadges)
+                )
+            }
+        }
+        
+        // ========== 发牌过渡时：旧中卡正在飞出 ==========
+        if (isDrawTransitioning && exitingCenterCard != null) {
+            key("exiting_center_${exitingCenterCard!!.id}") {
+                ImageCard(
+                    imageFile = exitingCenterCard!!,
+                    modifier = Modifier
+                        .zIndex(2f)
+                        .fillMaxWidth(0.85f)
+                        .aspectRatio(actualCardAspectRatio)
+                        .graphicsLayer {
+                            transformOrigin = TransformOrigin.Center
+                            translationX = centerDragOffsetX.value
+                            rotationZ = centerDragRotation.value
+                            alpha = centerDragAlpha.value
+                        },
+                    cornerRadius = 16.dp,
+                    elevation = 8.dp,
+                    badges = rememberImageBadges(exitingCenterCard!!, showHdrBadges, showMotionBadges)
+                )
+            }
+        }
+        
+        // ========== 收牌过渡时：旧中卡正在滑到左侧 ==========
+        if (isRecallTransitioning && recallTransitionCenter != null) {
+            key("outgoing_${recallTransitionCenter!!.id}") {
+                ImageCard(
+                    imageFile = recallTransitionCenter!!,
+                    modifier = Modifier
+                        .zIndex(0.5f)  // 低于返回的牌
+                        .fillMaxWidth(0.85f)
+                        .aspectRatio(actualCardAspectRatio)
+                        .graphicsLayer {
+                            transformOrigin = TransformOrigin.Center
+                            scaleX = outgoingLeftScale.value
+                            scaleY = outgoingLeftScale.value
+                            translationX = outgoingLeftOffsetX.value
+                            rotationZ = -5f * (-outgoingLeftOffsetX.value / sideCardOffsetPx).coerceIn(0f, 1f)
+                            alpha = outgoingLeftAlpha.value
+                        },
+                    cornerRadius = 16.dp,
+                    elevation = 4.dp,
+                    badges = rememberImageBadges(recallTransitionCenter!!, showHdrBadges, showMotionBadges)
+                )
+            }
+        }
+
+        // ========== 右卡 (deck[i+2]) - 不可滑，消费 pointer 事件 ==========
+        if (rightCard != null && drawState.exitingRightCard != rightCard.id && !isRecallTransitioning) {
+            key(rightCard.id) {
+                ImageCard(
+                    imageFile = rightCard,
+                    modifier = Modifier
+                        .zIndex(0f)
+                        .fillMaxWidth(0.85f)
+                        .aspectRatio(actualCardAspectRatio)
+                        .graphicsLayer {
+                            transformOrigin = TransformOrigin.Center
+                            scaleX = rightCardScale.value
+                            scaleY = rightCardScale.value
+                            translationX = rightCardOffsetX.value
+                            rotationZ = 5f
+                            alpha = rightCardAlpha.value
+                        }
+                        .pointerInput(Unit) {
+                            awaitEachGesture {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    event.changes.forEach { it.consume() }
+                                }
+                            }
+                        },
+                    cornerRadius = 16.dp,
+                    elevation = 4.dp,
+                    badges = rememberImageBadges(rightCard, showHdrBadges, showMotionBadges)
+                )
+            }
+        } else if (rightCard == null && !isRecallTransitioning) {
+            ImageCardPlaceholder(
+                modifier = Modifier
+                    .zIndex(0f)
+                    .fillMaxWidth(0.85f)
+                    .aspectRatio(actualCardAspectRatio)
+                    .graphicsLayer {
+                        transformOrigin = TransformOrigin.Center
+                        scaleX = 0.88f
+                        scaleY = 0.88f
+                        translationX = sideCardOffsetPx
+                        rotationZ = 5f
+                        alpha = 0.5f
+                    },
+                cornerRadius = 16.dp,
+                elevation = 4.dp
+            )
+        }
+        
+        // ========== 正在消失的右卡（收牌时）淡出动画 ==========
+        if (isRecallTransitioning && recallTransitionRight != null) {
+            key("exiting_right_${recallTransitionRight!!.id}") {
+                ImageCard(
+                    imageFile = recallTransitionRight!!,
+                    modifier = Modifier
+                        .zIndex(-1f)
+                        .fillMaxWidth(0.85f)
+                        .aspectRatio(actualCardAspectRatio)
+                        .graphicsLayer {
+                            transformOrigin = TransformOrigin.Center
+                            scaleX = 0.88f
+                            scaleY = 0.88f
+                            translationX = sideCardOffsetPx
+                            rotationZ = 5f
+                            alpha = rightCardAlpha.value
+                        },
+                    cornerRadius = 16.dp,
+                    elevation = 4.dp,
+                    badges = emptyList()
+                )
+            }
+        }
+        
+        // ========== 收牌过渡时：旧左卡正在淡出 ==========
+        if (isRecallTransitioning && recallTransitionLeft != null) {
+            key("exiting_left_${recallTransitionLeft!!.id}") {
+                ImageCard(
+                    imageFile = recallTransitionLeft!!,
+                    modifier = Modifier
+                        .zIndex(-1f)
+                        .fillMaxWidth(0.85f)
+                        .aspectRatio(actualCardAspectRatio)
+                        .graphicsLayer {
+                            transformOrigin = TransformOrigin.Center
+                            scaleX = 0.88f
+                            scaleY = 0.88f
+                            translationX = leftCardOffsetX.value
+                            rotationZ = -5f
+                            alpha = leftCardAlpha.value
+                        },
+                    cornerRadius = 16.dp,
+                    elevation = 4.dp,
+                    badges = emptyList()
+                )
+            }
+        }
+
+        // ========== 收牌预览：拖动左滑时显示将要返回的牌 ==========
+        if (!isRecallTransitioning && previewReturningCard != null && returningCardAlpha.value > 0.01f) {
+            key("preview_returning_${previewReturningCard.id}") {
+                ImageCard(
+                    imageFile = previewReturningCard,
+                    modifier = Modifier
+                        .zIndex(1.8f)  // 略低于中卡动画时的层级
+                        .fillMaxWidth(0.85f)
+                        .aspectRatio(actualCardAspectRatio)
+                        .graphicsLayer {
+                            transformOrigin = TransformOrigin.Center
+                            translationX = returningCardOffsetX.value
+                            alpha = returningCardAlpha.value
+                        },
+                    cornerRadius = 16.dp,
+                    elevation = 6.dp,
+                    badges = rememberImageBadges(previewReturningCard, showHdrBadges, showMotionBadges)
+                )
+            }
+        }
+        
+        // ========== 正在返回的牌（收牌动画）==========
+        if (isRecallTransitioning && recallReturningCard != null) {
+            key("returning_${recallReturningCard!!.id}") {
+                ImageCard(
+                    imageFile = recallReturningCard!!,
+                    modifier = Modifier
+                        .zIndex(2f)
+                        .fillMaxWidth(0.85f)
+                        .aspectRatio(actualCardAspectRatio)
+                        .graphicsLayer {
+                            transformOrigin = TransformOrigin.Center
+                            translationX = returningCardOffsetX.value
+                            alpha = returningCardAlpha.value
+                        },
+                    cornerRadius = 16.dp,
+                    elevation = 8.dp,
+                    badges = rememberImageBadges(recallReturningCard!!, showHdrBadges, showMotionBadges)
+                )
+            }
+        }
+
+        // ========== 中卡 (deck[i]) - 唯一可交互 ==========
+        // 发牌过渡时：中卡由 exitingCenterCard 显示，这里不显示
+        // 收牌过渡时：中卡由 recallTransitionCenter 控制，不显示此卡
+        if (centerCard != null && !isDrawTransitioning && !isRecallTransitioning) {
+            key(centerCard.id) {
+                val velocityTracker = remember { VelocityTracker() }
+
+                ImageCard(
+                    imageFile = centerCard,
+                    modifier = Modifier
+                        .zIndex(1f)
+                        .fillMaxWidth(0.85f)
+                        .aspectRatio(actualCardAspectRatio)
+                        .onGloballyPositioned { coordinates ->
+                            centerCardBounds = coordinates.boundsInRoot()
+                        }
+                        .graphicsLayer {
+                            transformOrigin = TransformOrigin.Center
+                            translationX = centerDragOffsetX.value
+                            translationY = centerDragOffsetY.value
+                            rotationZ = centerDragRotation.value
+                            alpha = centerDragAlpha.value
+                            scaleX = centerDragScale.value
+                            scaleY = centerDragScale.value
+                        }
+                        .pointerInput(drawState.currentIndex) {
+                            detectTapGestures(
+                                onTap = {
+                                    if (!hasDragged && onCardClick != null) {
+                                        val sourceRect = SourceRect(
+                                            x = centerCardBounds.left,
+                                            y = centerCardBounds.top,
+                                            width = centerCardBounds.width,
+                                            height = centerCardBounds.height,
+                                            cornerRadius = 16f
+                                        )
+                                        onCardClick(centerCard, sourceRect)
+                                    }
+                                }
+                            )
+                        }
+                        .pointerInput(drawState.currentIndex, albums) {
+                            detectDragGestures(
+                                onDragStart = {
+                                    isDragging = true
+                                    hasDragged = false
+                                    velocityTracker.resetTracking()
+                                    swipeThresholdHapticTriggered = false
+                                    deleteThresholdHapticTriggered = false
+                                    classifyThresholdHapticTriggered = false
+                                },
+                                onDrag = { change, dragAmount ->
+                                    change.consume()
+                                    hasDragged = true
+                                    velocityTracker.addPosition(change.uptimeMillis, change.position)
+
+                                    if (lockedDirection == SwipeDirection.NONE) {
+                                        val totalDx = abs(centerDragOffsetX.value + dragAmount.x)
+                                        val totalDy = abs(centerDragOffsetY.value + dragAmount.y)
+
+                                        // 更早锁定方向，提高响应速度
+                                        if (totalDy > totalDx * 1.3f && dragAmount.y < 0) {
+                                            lockedDirection = SwipeDirection.UP
+                                        } else if (totalDy > totalDx * 1.3f && dragAmount.y > 0) {
+                                            lockedDirection = SwipeDirection.DOWN
+                                        } else if (totalDx > 12f || totalDy > 12f) {
+                                            lockedDirection = SwipeDirection.HORIZONTAL
+                                        }
+                                    }
+
+                                    scope.launch {
+                                        when (lockedDirection) {
+                                            SwipeDirection.UP -> {
+                                                val newY = (centerDragOffsetY.value + dragAmount.y).coerceAtMost(0f)
+                                                centerDragOffsetY.snapTo(newY)
+                                                centerDragOffsetX.snapTo(centerDragOffsetX.value + dragAmount.x * 0.3f)
+                                                
+                                                if (!isPreloadingDelete && preloadedDeleteBitmap == null) {
+                                                    preloadBitmapForDelete()
+                                                }
+                                                
+                                                if (enableSwipeHaptics && !deleteThresholdHapticTriggered && -newY > deleteThresholdPx) {
+                                                    deleteThresholdHapticTriggered = true
+                                                    HapticFeedback.heavyTap(context)
+                                                }
+                                                if (enableSwipeHaptics && deleteThresholdHapticTriggered && -newY <= deleteThresholdPx) {
+                                                    deleteThresholdHapticTriggered = false
+                                                    HapticFeedback.lightTap(context)
+                                                }
+                                            }
+                                            SwipeDirection.DOWN -> {
+                                                val newY = (centerDragOffsetY.value + dragAmount.y).coerceAtLeast(0f)
+                                                centerDragOffsetY.snapTo(newY)
+                                                centerDragOffsetX.snapTo(centerDragOffsetX.value + dragAmount.x * 0.7f)
+                                                
+                                                if (!isPreloading && preloadedBitmap == null) {
+                                                    preloadBitmapForGenie()
+                                                }
+                                                
+                                                if (newY > classifyThresholdPx && !isClassifyMode) {
+                                                    isClassifyMode = true
+                                                    classifyStartX = centerDragOffsetX.value
+                                                    classifyStartY = newY
+                                                    val defaultIndex = if (albums.isNotEmpty()) 1 else 0
+                                                    selectedAlbumIndex = defaultIndex
+                                                    lastSelectionChangeAt = SystemClock.uptimeMillis()
+                                                    lastSelectedIndex = defaultIndex
+                                                    onClassifyModeChange?.invoke(true)
+                                                    onSelectedIndexChange?.invoke(defaultIndex)
+                                                    if (enableSwipeHaptics) {
+                                                        classifyThresholdHapticTriggered = true
+                                                        HapticFeedback.mediumTap(context)
+                                                    }
+                                                }
+                                                
+                                                if (isClassifyMode && newY < classifyExitThresholdPx) {
+                                                    isClassifyMode = false
+                                                    classifyThresholdHapticTriggered = false
+                                                    selectedAlbumIndex = 0
+                                                    classifyStartY = 0f
+                                                    lastSelectionChangeAt = SystemClock.uptimeMillis()
+                                                    lastSelectedIndex = -1
+                                                    onClassifyModeChange?.invoke(false)
+                                                    if (enableSwipeHaptics) {
+                                                        HapticFeedback.lightTap(context)
+                                                    }
+                                                    preloadedBitmap?.recycle()
+                                                    preloadedBitmap = null
+                                                    isPreloading = false
+                                                }
+                                                
+                                                if (isClassifyMode) {
+                                                    val relativeX = centerDragOffsetX.value - classifyStartX
+                                                    val colOffset = (relativeX / tagSwitchDistanceXPx).toInt()
+                                                    
+                                                    val relativeY = newY - classifyStartY
+                                                    val rowOffset = (relativeY / tagSwitchDistanceYPx).toInt()
+                                                    
+                                                    val defaultIndex = if (albums.isNotEmpty()) 1 else 0
+                                                    val startRow = defaultIndex / TAGS_PER_ROW
+                                                    val startCol = defaultIndex % TAGS_PER_ROW
+                                                    
+                                                    var newCol = startCol + colOffset
+                                                    var newRow = startRow + rowOffset
+                                                    
+                                                    val totalRows = (totalTags + TAGS_PER_ROW - 1) / TAGS_PER_ROW
+                                                    newRow = newRow.coerceIn(0, totalRows - 1)
+                                                    newCol = newCol.coerceIn(0, TAGS_PER_ROW - 1)
+                                                    
+                                                    var newIndex = newRow * TAGS_PER_ROW + newCol
+                                                    newIndex = newIndex.coerceIn(0, totalTags - 1)
+                                                    
+                                                    if (newIndex != selectedAlbumIndex) {
+                                                        selectedAlbumIndex = newIndex
+                                                        lastSelectionChangeAt = SystemClock.uptimeMillis()
+                                                        onSelectedIndexChange?.invoke(newIndex)
+                                                        if (enableSwipeHaptics && newIndex != lastSelectedIndex) {
+                                                            lastSelectedIndex = newIndex
+                                                            HapticFeedback.lightTap(context)
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                val scaleProgress = (newY / (screenHeightPx * 0.2f)).coerceIn(0f, 1f)
+                                                centerDragScale.snapTo(1f - scaleProgress * 0.1f)
+                                            }
+                                            SwipeDirection.HORIZONTAL -> {
+                                                val newX = centerDragOffsetX.value + dragAmount.x
+                                                centerDragOffsetX.snapTo(newX)
+                                                centerDragOffsetY.snapTo(centerDragOffsetY.value + dragAmount.y * 0.2f)
+                                                
+                                                // 摸牌样式：右滑发牌，左滑收牌
+                                                // 跟手同步动画：根据拖动进度同步更新左卡/右卡状态
+                                                // 使用屏幕宽度的 50% 作为基准，使动画同步更自然
+                                                val syncDistance = screenWidthPx * 0.5f
+                                                if (newX > 0 && drawState.canDraw(images.size)) {
+                                                    // 右滑发牌：左卡跟手向中间移动，同时旋转归正
+                                                    val drawProgress = (newX / syncDistance).coerceIn(0f, 1f)
+                                                    leftCardOffsetX.snapTo(-sideCardOffsetPx + sideCardOffsetPx * drawProgress)
+                                                    leftCardScale.snapTo(0.88f + 0.12f * drawProgress)
+                                                    // leftCardAlpha 保持 1f，背景卡片不需要透明效果
+                                                    leftCardRotation.snapTo(-5f + 5f * drawProgress)  // 从 -5° 旋转到 0°
+                                                } else if (newX < 0 && drawState.canRecall()) {
+                                                    // 左滑收牌：返回牌跟手从右侧进入预览
+                                                    val recallProgress = (-newX / syncDistance).coerceIn(0f, 1f)
+                                                    returningCardOffsetX.snapTo(screenWidthPx * (1f - recallProgress * 0.3f))
+                                                    returningCardAlpha.snapTo(recallProgress * 0.5f)
+                                                } else {
+                                                    // 重置到初始状态
+                                                    leftCardOffsetX.snapTo(-sideCardOffsetPx)
+                                                    leftCardScale.snapTo(0.88f)
+                                                    leftCardAlpha.snapTo(1f)
+                                                    leftCardRotation.snapTo(-5f)
+                                                    returningCardOffsetX.snapTo(screenWidthPx)
+                                                    returningCardAlpha.snapTo(0f)
+                                                }
+                                                
+                                                // 发牌阈值触发振动
+                                                if (enableSwipeHaptics && !swipeThresholdHapticTriggered) {
+                                                    val canTrigger = if (newX > 0) {
+                                                        // 右滑发牌：检查是否可以发牌
+                                                        drawState.canDraw(images.size) && newX > swipeThresholdPx
+                                                    } else {
+                                                        // 左滑收牌：检查是否可以收牌
+                                                        drawState.canRecall() && -newX > swipeThresholdPx
+                                                    }
+                                                    if (canTrigger) {
+                                                        swipeThresholdHapticTriggered = true
+                                                        HapticFeedback.mediumTap(context)
+                                                    }
+                                                }
+                                            }
+                                            else -> {
+                                                centerDragOffsetX.snapTo(centerDragOffsetX.value + dragAmount.x)
+                                                centerDragOffsetY.snapTo(centerDragOffsetY.value + dragAmount.y)
+                                            }
+                                        }
+
+                                        // 旋转效果（归类模式下减弱）
+                                        val rotationFactor = if (lockedDirection == SwipeDirection.DOWN) 0.3f else 1f
+                                        val rotation = (centerDragOffsetX.value / screenWidthPx) * 15f * rotationFactor
+                                        centerDragRotation.snapTo(rotation.coerceIn(-20f, 20f))
+                                    }
+                                },
+                                onDragEnd = {
+                                    isDragging = false
+                                    val velocity = velocityTracker.calculateVelocity()
+
+                                    scope.launch {
+                                        when (lockedDirection) {
+                                            SwipeDirection.UP -> {
+                                                if (abs(centerDragOffsetY.value) > deleteThresholdPx ||
+                                                    abs(velocity.y) > velocityThreshold
+                                                ) {
+                                                    executeDeleteAnimation(playHaptic = !deleteThresholdHapticTriggered)
+                                                } else {
+                                                    resetDragState()
+                                                }
+                                            }
+                                            SwipeDirection.DOWN -> {
+                                                if (isClassifyMode) {
+                                                    executeGenieAnimation(selectedAlbumIndex)
+                                                } else {
+                                                    resetDragState()
+                                                }
+                                            }
+                                            SwipeDirection.HORIZONTAL -> {
+                                                val offsetX = centerDragOffsetX.value
+                                                val velocityX = velocity.x
+                                                
+                                                // 摸牌样式：右滑发牌，左滑收牌
+                                                if (offsetX > 0) {
+                                                    // 右滑 → 发牌
+                                                    val triggered = offsetX > swipeThresholdPx || velocityX > velocityThreshold
+                                                    if (triggered && drawState.canDraw(images.size)) {
+                                                        executeDrawAnimation()
+                                                    } else {
+                                                        resetDragState()
+                                                    }
+                                                } else {
+                                                    // 左滑 → 收牌
+                                                    val triggered = -offsetX > swipeThresholdPx || -velocityX > velocityThreshold
+                                                    if (triggered && drawState.canRecall()) {
+                                                        executeRecallAnimation()
+                                                    } else {
+                                                        resetDragState()
+                                                    }
+                                                }
+                                            }
+                                            else -> {
+                                                resetDragState()
+                                            }
+                                        }
+                                        hasDragged = false
+                                    }
+                                },
+                                onDragCancel = {
+                                    isDragging = false
+                                    hasDragged = false
+                                    scope.launch { resetDragState() }
+                                }
+                            )
+                        },
+                    cornerRadius = 16.dp,
+                    elevation = 8.dp,
+                    badges = rememberImageBadges(centerCard, showHdrBadges, showMotionBadges)
                 )
             }
         }
