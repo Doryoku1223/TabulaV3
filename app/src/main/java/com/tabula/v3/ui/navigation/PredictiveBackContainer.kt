@@ -3,6 +3,7 @@ package com.tabula.v3.ui.navigation
 import androidx.activity.BackEventCompat
 import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -33,10 +34,9 @@ import kotlinx.coroutines.flow.Flow
 /**
  * ColorOS 16 风格预测性返回容器
  *
- * 动画效果（更接近 OPPO/ColorOS）：
- * - 前景层：缩小 + 右滑 + 圆角化 + 阴影
- * - 背景层：视差放大 + 暗色遮罩渐隐
- * - 左侧返回指示器（箭头）
+ * 动画效果：
+ * - 进入动画：从右侧平滑推入 + 圆角渐变 + 背景遮罩
+ * - 返回动画：右滑 + 圆角化 + 阴影 + 背景遮罩渐隐
  *
  * @param currentScreen 当前屏幕
  * @param onNavigateBack 返回导航回调
@@ -57,15 +57,62 @@ fun PredictiveBackContainer(
     val screenWidthPx = with(density) { configuration.screenWidthDp.dp.toPx() }
     val shadowElevationPx = with(density) { 24.dp.toPx() }
     
-    // 动画状态
+    // ========== 返回手势动画状态 ==========
     val backProgress = remember { Animatable(0f) }
     var swipeEdge by remember { mutableStateOf(BackEventCompat.EDGE_LEFT) }
     var gestureScreen by remember { mutableStateOf<AppScreen?>(null) }
     val progress = backProgress.value.coerceIn(0f, 1f)
     val renderProgress = if (gestureScreen == currentScreen) progress else 0f
+    
+    // ========== 进入动画状态 ==========
+    // enterProgress: 1.0 = 完全在屏幕外（右侧），0.0 = 完全进入
+    val enterProgress = remember { Animatable(0f) }
+    var previousScreen by remember { mutableStateOf<AppScreen?>(null) }
+    
+    // 在 composition 阶段计算是否是前进导航（避免第一帧闪烁）
+    val isForwardNavigation = remember(currentScreen, previousScreen) {
+        previousScreen != null && when {
+            previousScreen == AppScreen.DECK && currentScreen != AppScreen.DECK -> true
+            previousScreen == AppScreen.SETTINGS && currentScreen in listOf(
+                AppScreen.ABOUT, AppScreen.SUPPORT, AppScreen.STATISTICS,
+                AppScreen.VIBRATION_SOUND, AppScreen.IMAGE_DISPLAY, AppScreen.LAB
+            ) -> true
+            else -> false
+        }
+    }
+    
+    // 标记是否正在等待进入动画开始（用于第一帧定位）
+    var pendingEnterAnimation by remember { mutableStateOf(false) }
+    
+    // 当检测到前进导航时，立即标记（在 composition 阶段）
+    if (isForwardNavigation && currentScreen != AppScreen.DECK && enterProgress.value == 0f && !enterProgress.isRunning) {
+        pendingEnterAnimation = true
+    }
 
+    // 检测屏幕变化，触发进入动画
     LaunchedEffect(currentScreen) {
+        // 重置返回动画状态
         backProgress.snapTo(0f)
+        
+        val shouldAnimate = isForwardNavigation && currentScreen != AppScreen.DECK
+        
+        // 更新 previousScreen
+        previousScreen = currentScreen
+        
+        if (shouldAnimate) {
+            // 触发进入动画
+            enterProgress.snapTo(1f)  // 从屏幕外开始
+            pendingEnterAnimation = false
+            enterProgress.animateTo(
+                targetValue = 0f,
+                animationSpec = tween(
+                    durationMillis = 280,  // 稍快一点
+                    easing = FastOutSlowInEasing
+                )
+            )
+        } else {
+            pendingEnterAnimation = false
+        }
     }
 
     // 颜色配置
@@ -118,6 +165,17 @@ fun PredictiveBackContainer(
         }
     }
 
+    // ========== 计算动画状态 ==========
+    val enterValue = enterProgress.value.coerceIn(0f, 1f)
+    
+    // 是否正在进行动画（包括等待动画开始的第一帧）
+    val isEnterAnimating = enterValue > 0.001f || pendingEnterAnimation
+    val isBackAnimating = renderProgress > 0.001f
+    val isAnimating = isEnterAnimating || isBackAnimating
+    
+    // 计算实际的进入动画进度（第一帧使用 1.0 确保在屏幕外）
+    val effectiveEnterValue = if (pendingEnterAnimation) 1f else enterValue
+
     // 根容器背景设为黑色（兜底）
     Box(
         modifier = Modifier
@@ -125,52 +183,57 @@ fun PredictiveBackContainer(
             .background(Color.Black) 
     ) {
         // ========== 背景层 ==========
-        // 始终渲染背景，移除所有动态缩放和遮罩
-        // 这样可以彻底避免"灰白色断层"和边缘漏光，同时大幅降低 GPU 负载
+        // 始终渲染背景内容，避免闪烁
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .zIndex(0f)
-                .drawWithContent {
-                    val shouldDraw = renderProgress > 0f || currentScreen == AppScreen.DECK
-                    if (shouldDraw) {
-                        drawContent()
-                    }
-                }
         ) {
+            // 背景内容始终渲染
             backgroundContent()
-            if (renderProgress > 0f && currentScreen != AppScreen.DECK) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(Color.Black.copy(alpha = lerp(0.15f, 0f, renderProgress)))
-                )
+            
+            // 背景遮罩：仅在动画期间显示
+            if (isAnimating && currentScreen != AppScreen.DECK) {
+                val maskAlpha = when {
+                    isEnterAnimating -> lerp(0.15f, 0.35f, effectiveEnterValue)  // 进入时遮罩
+                    isBackAnimating -> lerp(0.15f, 0f, renderProgress)  // 返回时遮罩渐隐
+                    else -> 0f
+                }
+                if (maskAlpha > 0.001f) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black.copy(alpha = maskAlpha))
+                    )
+                }
             }
         }
 
         // ========== 前景层 ==========
         if (currentScreen != AppScreen.DECK) {
-            // 圆角：随进度变大 (0 -> 48dp)
-            val cornerRadius = lerp(0f, 48f, renderProgress)
+            // 计算动画参数（使用 effectiveEnterValue 避免第一帧闪烁）
+            val animProgress = when {
+                isEnterAnimating -> effectiveEnterValue
+                isBackAnimating -> renderProgress
+                else -> 0f
+            }
             
-            // 位移：始终向右移动（无论左/右边缘触发）
-            val translationX = renderProgress * screenWidthPx
+            // 圆角：动画时显示圆角
+            val cornerRadius = lerp(0f, 40f, animProgress)
             
-            // 缩放：移除，始终为 1.0
-            val scale = 1f 
+            // 位移：进入从右侧滑入，返回向右侧滑出
+            val translationX = animProgress * screenWidthPx
 
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .zIndex(1f)
                     .graphicsLayer {
-                        this.scaleX = scale
-                        this.scaleY = scale
                         this.translationX = translationX
                         
-                        // 阴影：仅在移动时显示
-                        if (renderProgress > 0f) {
-                            shadowElevation = shadowElevationPx
+                        // 阴影和圆角：在动画进行中显示
+                        if (animProgress > 0.001f) {
+                            shadowElevation = shadowElevationPx * animProgress
                             shape = RoundedCornerShape(cornerRadius.dp)
                             clip = true
                         }
