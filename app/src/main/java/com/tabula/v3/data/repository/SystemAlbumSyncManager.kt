@@ -8,11 +8,20 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
+import com.tabula.v3.BuildConfig
+import com.tabula.v3.data.model.MediaItemKey
 import com.tabula.v3.data.model.SyncMode
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
+import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 系统相册同步管理器
@@ -41,6 +50,14 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
         private const val TAG = "SystemAlbumSyncManager"
         private const val TABULA_ALBUMS_FOLDER = "Tabula"
 
+        /**
+         * T01-UIFEEDBACK 探针接缝（仿 FileOperationManager.debugForceUnknownUris）：
+         * 强制 copyImageWithEvidence 失败，供设备断言归档失败 Toast 与源保留。
+         * 仅测试注入；默认 false，生产路径不读取。
+         */
+        @Volatile
+        internal var debugForceArchiveCopyFailure: Boolean = false
+
         @Volatile
         private var instance: SystemAlbumSyncManager? = null
 
@@ -54,6 +71,60 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
     }
 
     private val contentResolver: ContentResolver = context.contentResolver
+
+    /** Verifiable evidence of a copy the transaction published or proved already present. */
+    data class CopyResult(
+        val uri: Uri,
+        val byteCount: Long,
+        val sha256Hex: String
+    )
+
+    private sealed class CopyOutcome {
+        data class Created(val uri: Uri, val byteCount: Long, val sha256Hex: String) : CopyOutcome()
+        data class Reused(val uri: Uri, val byteCount: Long, val sha256Hex: String) : CopyOutcome()
+        object Failed : CopyOutcome()
+
+        fun uriOrNull(): Uri? = when (this) {
+            is Created -> uri
+            is Reused -> uri
+            Failed -> null
+        }
+
+        fun toCopyResultOrNull(): CopyResult? = when (this) {
+            is Created -> CopyResult(uri, byteCount, sha256Hex)
+            is Reused -> CopyResult(uri, byteCount, sha256Hex)
+            Failed -> null
+        }
+    }
+
+
+    private data class SourceCopyMetadata(
+        val key: MediaItemKey,
+        val size: Long?,
+        val dateTaken: Long?,
+        val dateAdded: Long?,
+        val dateModified: Long?
+    )
+
+    private data class ContentDigest(val byteCount: Long, val sha256: ByteArray)
+
+    private data class ExistingCopyCandidate(val uri: Uri, val key: MediaItemKey)
+
+    private class OwnedCopyTargetHolder {
+        private val target = AtomicReference<Uri?>(null)
+
+        fun set(uri: Uri) {
+            target.set(uri)
+        }
+
+        fun clear() {
+            target.set(null)
+        }
+
+        fun hasTarget(): Boolean = target.get() != null
+
+        fun take(): Uri? = target.getAndSet(null)
+    }
 
     /**
      * 获取 Tabula 相册根目录
@@ -131,6 +202,8 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
                     }
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error finding existing system bucket path for: $albumName", e)
         }
@@ -194,6 +267,8 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
 
             Log.d(TAG, "Created system album: ${albumFolder.absolutePath}")
             albumFolder.absolutePath
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error creating system album: $albumName", e)
             null
@@ -304,30 +379,102 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
         imageUri: Uri,
         albumName: String,
         displayName: String? = null
-    ): Uri? = withContext(Dispatchers.IO) {
+    ): Uri? = copyImageWithEvidence(imageUri, albumName, displayName)?.uri
+
+    /**
+     * 复制并返回可核验的副本证据（目标 URI、字节数与回读 SHA-256）。
+     * 失败返回 null；Reused 语义下证据来自验证通过的既有候选内容。
+     */
+    suspend fun copyImageWithEvidence(
+        imageUri: Uri,
+        albumName: String,
+        displayName: String? = null
+    ): CopyResult? {
+        if (BuildConfig.DEBUG && debugForceArchiveCopyFailure) {
+            Log.w(TAG, "debug: forced archive copy failure (T01-UIFEEDBACK probe)")
+            return null
+        }
+        return copyImageToSystemAlbum(imageUri, albumName, displayName).toCopyResultOrNull()
+    }
+
+    /**
+     * 轻量核验：两侧媒体项身份均可解析、分属不同项目且互非别名（零字节读取）。
+     * 任何失败（行缺失、身份未知、异常）都按"不独立"处理，交由调用方保守保留源。
+     */
+    suspend fun isIndependentExistingCopy(sourceUri: Uri, destinationUri: Uri): Boolean = withContext(Dispatchers.IO) {
         try {
-            val albumFolder = getAlbumFolder(albumName)
-            if (!albumFolder.exists()) {
-                albumFolder.mkdirs()
-            }
-
-            val fileName = displayName ?: getFileNameFromUri(imageUri) ?: "IMG_${System.currentTimeMillis()}.jpg"
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                return@withContext copyImageUsingMediaStore(imageUri, albumFolder.name, fileName)
-            } else {
-                return@withContext copyImageDirectly(imageUri, albumFolder, fileName)
-            }
+            val sourceKey = resolveMediaItemKey(sourceUri) ?: return@withContext false
+            val targetKey = resolveMediaItemKey(destinationUri) ?: return@withContext false
+            if (targetKey == sourceKey) return@withContext false
+            if (areCanonicalAliases(sourceUri, destinationUri)) return@withContext false
+            true
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
+            Log.w(TAG, "Lightweight copy verification failed for $sourceUri -> $destinationUri", e)
+            false
+        }
+    }
+
+    /**
+     * 深度复核：身份独立 + 源与目标全文 SHA-256 一致且非空，删除源之前的最后一道闸门。
+     * 任何失败（不可读、内容不一致、长度不符、异常）都按"未验证"处理；
+     * 取消不吞——CancellationException 向上抛。
+     */
+    suspend fun verifyCopyIntegrity(sourceUri: Uri, destinationUri: Uri): Boolean = withContext(Dispatchers.IO) {
+        try {
+            if (!isIndependentExistingCopy(sourceUri, destinationUri)) return@withContext false
+            val sourceDigest = readContentDigest(sourceUri, null) ?: return@withContext false
+            if (sourceDigest.byteCount == 0L) return@withContext false
+            val destinationDigest = readContentDigest(destinationUri, sourceDigest.byteCount)
+                ?: return@withContext false
+            sameDigest(sourceDigest, destinationDigest)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Deep copy verification failed for $sourceUri -> $destinationUri", e)
+            false
+        }
+    }
+
+    private suspend fun copyImageToSystemAlbum(
+        imageUri: Uri,
+        albumName: String,
+        displayName: String? = null
+    ): CopyOutcome {
+        val ownedTarget = OwnedCopyTargetHolder()
+        try {
+            val result = withContext(Dispatchers.IO) {
+                currentCoroutineContext().ensureActive()
+                val albumFolder = getAlbumFolder(albumName)
+                if (!albumFolder.exists()) {
+                    albumFolder.mkdirs()
+                }
+
+                val fileName = displayName ?: getFileNameFromUri(imageUri)
+                    ?: "IMG_${System.currentTimeMillis()}.jpg"
+
+                // minSdk 31 >= Q: every copy goes through the verified MediaStore transaction.
+                copyImageUsingMediaStore(imageUri, albumFolder.name, fileName, ownedTarget)
+            }
+            // Keep ownership until withContext has delivered its result. Cancellation while
+            // dispatching the result is handled by the outer catch below.
+            ownedTarget.clear()
+            return result
+        } catch (e: CancellationException) {
+            cleanupOwnedCopyTarget(ownedTarget)
+            throw e
+        } catch (e: Exception) {
+            cleanupOwnedCopyTarget(ownedTarget)
             Log.e(TAG, "Error adding image to system album", e)
-            null
+            return CopyOutcome.Failed
         }
     }
 
     /**
      * 将图片移动到系统相册（移动模式）
      *
-     * 移动后原图将被删除。
+     * 仅通过 MediaStore 成功更新源图片的 RELATIVE_PATH 完成移动；无法更新时保留原图并返回失败。
      *
      * @param imageUri 源图片 URI
      * @param albumName 目标相册名称
@@ -338,6 +485,11 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
         albumName: String
     ): Uri? = withContext(Dispatchers.IO) {
         try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                Log.w(TAG, "Cannot safely move image on Android versions below Q: $imageUri")
+                return@withContext null
+            }
+
             val albumFolder = getAlbumFolder(albumName)
             if (!albumFolder.exists()) {
                 albumFolder.mkdirs()
@@ -345,18 +497,9 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
 
             val fileName = getFileNameFromUri(imageUri) ?: "IMG_${System.currentTimeMillis()}.jpg"
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Android 10+ 使用 MediaStore 移动
-                return@withContext moveImageUsingMediaStore(imageUri, albumFolder.name, fileName)
-            } else {
-                // Android 9 及以下：先复制再删除原文件
-                val newUri = copyImageDirectly(imageUri, albumFolder, fileName)
-                if (newUri != null) {
-                    // 删除原文件
-                    deleteOriginalImage(imageUri)
-                }
-                return@withContext newUri
-            }
+            return@withContext moveImageUsingMediaStore(imageUri, albumFolder.name, fileName)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error moving image to system album", e)
             null
@@ -400,48 +543,14 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
                 Log.d(TAG, "✓ Moved image via update: $fileName -> $targetRelativePath (preserved all metadata, Live Photo safe)")
                 return sourceUri
             } else {
-                // 记录详细的失败原因
                 Log.w(TAG, "✗ Failed to move via update (returned 0): $fileName")
-                Log.w(TAG, "  Possible reasons: file locked, permission denied, or unsupported by device")
-                Log.w(TAG, "  ⚠️ Falling back to copy+delete, Live Photo metadata may be affected")
+                return null
             }
-
-            // 方法2：如果更新失败，则复制后删除（会创建新的 _id，可能影响 Live Photo）
-            Log.d(TAG, "Falling back to copy+delete for: $fileName (⚠️ may affect Live Photo)")
-            val newUri = copyImageUsingMediaStore(sourceUri, albumName, fileName)
-            if (newUri != null) {
-                deleteOriginalImage(sourceUri)
-                Log.d(TAG, "Moved image via copy+delete: $fileName -> $targetRelativePath (new _id created)")
-            }
-            return newUri
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error moving image: $fileName", e)
-            Log.w(TAG, "⚠️ Exception occurred, falling back to copy+delete (may affect Live Photo)")
-            // 回退到复制+删除
-            val newUri = copyImageUsingMediaStore(sourceUri, albumName, fileName)
-            if (newUri != null) {
-                deleteOriginalImage(sourceUri)
-            }
-            return newUri
-        }
-    }
-
-    /**
-     * 删除原始图片
-     */
-    private fun deleteOriginalImage(imageUri: Uri): Boolean {
-        return try {
-            val deleted = contentResolver.delete(imageUri, null, null)
-            if (deleted > 0) {
-                Log.d(TAG, "Deleted original image: $imageUri")
-                true
-            } else {
-                Log.w(TAG, "Failed to delete original image: $imageUri")
-                false
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error deleting original image: $imageUri", e)
-            false
+            return null
         }
     }
 
@@ -596,172 +705,374 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
      * @param albumName 相册名称（用于查找现有路径或创建新路径）
      * @param fileName 目标文件名
      */
-    private fun copyImageUsingMediaStore(
+    private suspend fun copyImageUsingMediaStore(
         sourceUri: Uri,
         albumName: String,
-        fileName: String
-    ): Uri? {
+        fileName: String,
+        ownedTarget: OwnedCopyTargetHolder
+    ): CopyOutcome {
+        var targetUri: Uri? = null
+        var insertAttempted = false
         try {
-            // 获取目标相对路径（可能是现有系统相册路径或 Tabula 路径）
-            val targetRelativePath = getAlbumRelativePath(albumName)
-            
-            // #region agent log
-            Log.d("DEBUG_SYNC", "[B2] copyImageUsingMediaStore:entry | sourceUri=$sourceUri | albumName=$albumName | fileName=$fileName | targetPath=$targetRelativePath")
-            // #endregion
-            
-            // 获取源文件大小用于重复检测
-            var sourceSize: Long? = null
-            contentResolver.query(
-                sourceUri,
-                arrayOf(MediaStore.Images.Media.SIZE),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val sizeIndex = cursor.getColumnIndex(MediaStore.Images.Media.SIZE)
-                    if (sizeIndex >= 0) {
-                        sourceSize = cursor.getLong(sizeIndex)
+            currentCoroutineContext().ensureActive()
+            val targetRelativePath = normalizeRelativePath(getAlbumRelativePath(albumName))
+            val sourceMetadata = readSourceCopyMetadata(sourceUri)
+                ?: return CopyOutcome.Failed.also { Log.w(TAG, "Cannot verify MediaStore source identity: $sourceUri") }
+
+            val candidates = findExistingCopyCandidates(targetRelativePath, fileName)
+            var sourceDigest: ContentDigest? = null
+            for (candidate in candidates) {
+                if (candidate.key == sourceMetadata.key || areCanonicalAliases(sourceUri, candidate.uri)) {
+                    Log.w(TAG, "Source already occupies the requested copy path; refusing self-copy: $sourceUri")
+                    return CopyOutcome.Failed
+                }
+            }
+
+            if (candidates.isNotEmpty()) {
+                val verifiedSourceDigest = readContentDigest(sourceUri, sourceMetadata.size)
+                    ?: return CopyOutcome.Failed.also { Log.w(TAG, "Cannot read source content for verified reuse: $sourceUri") }
+                sourceDigest = verifiedSourceDigest
+                for (candidate in candidates) {
+                    currentCoroutineContext().ensureActive()
+                    val candidateDigest = try {
+                        readContentDigest(candidate.uri, verifiedSourceDigest.byteCount)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Cannot verify existing copy candidate: ${candidate.uri}", e)
+                        null
+                    }
+                    if (candidateDigest != null && candidateDigest.byteCount == verifiedSourceDigest.byteCount &&
+                        candidateDigest.sha256.contentEquals(verifiedSourceDigest.sha256)
+                    ) {
+                        return CopyOutcome.Reused(
+                            candidate.uri,
+                            verifiedSourceDigest.byteCount,
+                            verifiedSourceDigest.sha256.toSha256Hex()
+                        )
                     }
                 }
             }
-            
-            // 检查是否已存在同名同大小文件，避免重复复制
-            val existingUri = findExistingImageInAlbum(albumName, fileName, sourceSize)
-            if (existingUri != null) {
-                // #region agent log
-                Log.d("DEBUG_SYNC", "[B2] copyImageUsingMediaStore:skipped | fileName=$fileName already exists at $existingUri (size match)")
-                // #endregion
-                Log.d(TAG, "Image already exists in album, skipping: $fileName")
-                return existingUri
+
+            currentCoroutineContext().ensureActive()
+            val effectiveDateTaken = when {
+                sourceMetadata.dateTaken != null && sourceMetadata.dateTaken > 0 -> sourceMetadata.dateTaken
+                sourceMetadata.dateModified != null && sourceMetadata.dateModified > 0 -> sourceMetadata.dateModified * 1000
+                else -> System.currentTimeMillis()
             }
-            
-            // 获取源图片的时间元数据，保持原始时间戳
-            var dateTaken: Long? = null
-            var dateAdded: Long? = null
-            var dateModified: Long? = null
-            contentResolver.query(
-                sourceUri,
-                arrayOf(
-                    MediaStore.Images.Media.DATE_TAKEN,
-                    MediaStore.Images.Media.DATE_ADDED,
-                    MediaStore.Images.Media.DATE_MODIFIED
-                ),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    cursor.getColumnIndex(MediaStore.Images.Media.DATE_TAKEN).takeIf { it >= 0 }?.let {
-                        dateTaken = cursor.getLong(it)
-                    }
-                    cursor.getColumnIndex(MediaStore.Images.Media.DATE_ADDED).takeIf { it >= 0 }?.let {
-                        dateAdded = cursor.getLong(it)
-                    }
-                    cursor.getColumnIndex(MediaStore.Images.Media.DATE_MODIFIED).takeIf { it >= 0 }?.let {
-                        dateModified = cursor.getLong(it)
-                    }
-                }
-            }
-            
-            // 修复：当 DATE_TAKEN 无效（为 0 或 null）时，使用 DATE_MODIFIED 作为替代
-            // 这样可以确保下载的照片、截屏等没有拍摄时间的图片也能保持正确的时间显示
-            // 注意：DATE_TAKEN 是毫秒，DATE_MODIFIED 是秒，需要转换
-            val effectiveDateTaken: Long = when {
-                dateTaken != null && dateTaken!! > 0 -> dateTaken!!
-                dateModified != null && dateModified!! > 0 -> dateModified!! * 1000  // 秒转毫秒
-                else -> System.currentTimeMillis()  // 最后的备选
-            }
-            
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
                 put(MediaStore.Images.Media.MIME_TYPE, getMimeType(fileName))
-                // 保留原始时间戳，使用有效的 DATE_TAKEN
                 put(MediaStore.Images.Media.DATE_TAKEN, effectiveDateTaken)
-                dateAdded?.let { put(MediaStore.Images.Media.DATE_ADDED, it) }
-                dateModified?.let { put(MediaStore.Images.Media.DATE_MODIFIED, it) }
+                sourceMetadata.dateAdded?.let { put(MediaStore.Images.Media.DATE_ADDED, it) }
+                sourceMetadata.dateModified?.let { put(MediaStore.Images.Media.DATE_MODIFIED, it) }
                 put(MediaStore.Images.Media.RELATIVE_PATH, targetRelativePath)
                 put(MediaStore.Images.Media.IS_PENDING, 1)
             }
 
-            val newUri = contentResolver.insert(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                values
-            ) ?: return null
-            
-            // #region agent log
-            Log.d("DEBUG_SYNC", "[B2] copyImageUsingMediaStore:inserted | newUri=$newUri | fileName=$fileName | targetPath=$targetRelativePath | sourceSize=$sourceSize")
-            // #endregion
-
-            // 使用较大的缓冲区复制文件，确保 Live Photo 等大文件完整复制
-            var bytesCopied: Long = 0
-            contentResolver.openInputStream(sourceUri)?.use { input ->
-                contentResolver.openOutputStream(newUri)?.use { output ->
-                    val buffer = ByteArray(64 * 1024)  // 64KB 缓冲区，比默认的 8KB 更高效
-                    var bytesRead: Int
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        output.write(buffer, 0, bytesRead)
-                        bytesCopied += bytesRead
-                    }
-                    output.flush()
-                }
+            insertAttempted = true
+            targetUri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            if (targetUri == null) {
+                Log.w(TAG, "MediaStore did not return a destination for copy: $fileName")
+                currentCoroutineContext().ensureActive()
+                return CopyOutcome.Failed
             }
 
-            // 验证复制的完整性（特别重要对于 Live Photo）
-            if (sourceSize != null && bytesCopied != sourceSize) {
-                Log.w(TAG, "⚠️ File size mismatch after copy: expected=$sourceSize, actual=$bytesCopied (file: $fileName)")
-                // 不删除已复制的文件，让用户自己检查
-            } else {
-                Log.d(TAG, "✓ File copied completely: $bytesCopied bytes (file: $fileName)")
+            // Resolve ownership before checking cancellation: insert may return a URI after
+            // the caller's Job was cancelled, and a proven new row must still be rolled back.
+            val targetKey = resolveMediaItemKey(targetUri!!)
+            if (targetKey == null) {
+                Log.w(TAG, "Inserted copy target has unknown identity; leaving it untouched: $targetUri")
+                currentCoroutineContext().ensureActive()
+                targetUri = null
+                return CopyOutcome.Failed
+            }
+            if (targetKey == sourceMetadata.key || areCanonicalAliases(sourceUri, targetUri!!)) {
+                Log.e(TAG, "MediaStore insert resolved to the source item; refusing to write or delete it: $targetUri")
+                currentCoroutineContext().ensureActive()
+                targetUri = null
+                return CopyOutcome.Failed
             }
 
-            // 完成 pending 状态，并再次设置原始时间戳（防止被系统覆盖）
-            val updateValues = ContentValues().apply {
+            ownedTarget.set(targetUri!!)
+            currentCoroutineContext().ensureActive()
+
+            val copyDigest = copySourceToOwnedTarget(
+                sourceUri = sourceUri,
+                targetUri = targetUri!!,
+                expectedSize = sourceMetadata.size
+            )
+            val verifiedSourceDigest = sourceDigest
+            if (verifiedSourceDigest != null && !sameDigest(verifiedSourceDigest, copyDigest)) {
+                throw IOException("Source content changed between duplicate check and copy")
+            }
+            if (copyDigest.byteCount == 0L) {
+                throw IOException("Refusing to publish an empty image copy")
+            }
+
+            currentCoroutineContext().ensureActive()
+            val readbackDigest = readContentDigest(targetUri!!, copyDigest.byteCount)
+                ?: throw IOException("Destination readback stream was unavailable")
+            if (!sameDigest(copyDigest, readbackDigest)) {
+                throw IOException("Destination content did not match source bytes")
+            }
+
+            currentCoroutineContext().ensureActive()
+            val publishValues = ContentValues().apply {
                 put(MediaStore.Images.Media.IS_PENDING, 0)
-                // 再次设置时间戳，确保不被覆盖
                 put(MediaStore.Images.Media.DATE_TAKEN, effectiveDateTaken)
-                dateModified?.let { put(MediaStore.Images.Media.DATE_MODIFIED, it) }
+                sourceMetadata.dateModified?.let { put(MediaStore.Images.Media.DATE_MODIFIED, it) }
             }
-            contentResolver.update(newUri, updateValues, null, null)
+            val published = contentResolver.update(targetUri!!, publishValues, null, null)
+            if (published != 1) {
+                throw IOException("Publishing copy affected $published rows; expected exactly one")
+            }
 
-            Log.d(TAG, "Copied image using MediaStore: $fileName -> $targetRelativePath")
-            return newUri
+            currentCoroutineContext().ensureActive()
+            Log.d(TAG, "Copied and verified image: $fileName -> $targetRelativePath (${copyDigest.byteCount} bytes)")
+            return CopyOutcome.Created(
+                targetUri!!,
+                readbackDigest.byteCount,
+                readbackDigest.sha256.toSha256Hex()
+            )
+        } catch (e: CancellationException) {
+            val hadOwnedTarget = ownedTarget.hasTarget()
+            cleanupOwnedCopyTarget(ownedTarget)
+            if (targetUri != null && !hadOwnedTarget) {
+                Log.d(TAG, "Copy cancelled before a destination could be proven owned: $targetUri")
+            } else if (insertAttempted && !hadOwnedTarget) {
+                Log.w(TAG, "Copy cancelled before insert returned a URI; any provider side effect cannot be safely identified")
+            }
+            throw e
         } catch (e: Exception) {
+            cleanupOwnedCopyTarget(ownedTarget)
             Log.e(TAG, "Error copying image using MediaStore", e)
-            return null
+            return CopyOutcome.Failed
         }
     }
 
-    /**
-     * 直接复制图片文件 (Android 9 及以下)
-     */
-    private fun copyImageDirectly(
-        sourceUri: Uri,
-        targetFolder: File,
-        fileName: String
-    ): Uri? {
-        try {
-            val targetFile = File(targetFolder, fileName)
-            
-            // 检查文件是否已存在，避免重复复制
-            if (targetFile.exists()) {
-                Log.d(TAG, "Image already exists, skipping: ${targetFile.absolutePath}")
-                return Uri.fromFile(targetFile)
+    private suspend fun readSourceCopyMetadata(sourceUri: Uri): SourceCopyMetadata? {
+        val projection = arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.MediaColumns.VOLUME_NAME,
+            MediaStore.Images.Media.SIZE,
+            MediaStore.Images.Media.DATE_TAKEN,
+            MediaStore.Images.Media.DATE_ADDED,
+            MediaStore.Images.Media.DATE_MODIFIED
+        )
+        for (queryUri in mediaStoreQueryUris(sourceUri)) {
+            currentCoroutineContext().ensureActive()
+            try {
+                val metadata = contentResolver.query(queryUri, projection, null, null, null)?.use { cursor ->
+                    if (!cursor.moveToFirst()) {
+                        null
+                    } else {
+                        val key = mediaStoreItemKey(cursor) ?: return@use null
+                        SourceCopyMetadata(
+                            key = key,
+                            size = nullableLong(cursor, MediaStore.Images.Media.SIZE)?.takeIf { it >= 0L },
+                            dateTaken = nullableLong(cursor, MediaStore.Images.Media.DATE_TAKEN),
+                            dateAdded = nullableLong(cursor, MediaStore.Images.Media.DATE_ADDED),
+                            dateModified = nullableLong(cursor, MediaStore.Images.Media.DATE_MODIFIED)
+                        )
+                    }
+                }
+                if (metadata != null) return metadata
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not resolve source MediaStore identity through $queryUri", e)
             }
+        }
+        return null
+    }
 
-            contentResolver.openInputStream(sourceUri)?.use { input ->
-                FileOutputStream(targetFile).use { output ->
-                    input.copyTo(output)
+    private fun resolveMediaItemKey(uri: Uri): MediaItemKey? {
+        val projection = arrayOf(MediaStore.Images.Media._ID, MediaStore.MediaColumns.VOLUME_NAME)
+        for (queryUri in mediaStoreQueryUris(uri)) {
+            try {
+                val key = contentResolver.query(queryUri, projection, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) mediaStoreItemKey(cursor) else null
+                }
+                if (key != null) return key
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not resolve MediaStore item identity through $queryUri", e)
+            }
+        }
+        return null
+    }
+
+    private fun mediaStoreItemKey(cursor: android.database.Cursor): MediaItemKey? {
+        val idIndex = cursor.getColumnIndex(MediaStore.Images.Media._ID)
+        val volumeIndex = cursor.getColumnIndex(MediaStore.MediaColumns.VOLUME_NAME)
+        if (idIndex < 0 || volumeIndex < 0 || cursor.isNull(idIndex) || cursor.isNull(volumeIndex)) return null
+        val id = cursor.getLong(idIndex)
+        val volumeName = cursor.getString(volumeIndex)?.takeIf { it.isNotBlank() } ?: return null
+        // "external" is an aggregate alias, not the actual storage volume identity.
+        if (id < 0L || volumeName.equals("external", ignoreCase = true)) return null
+        return MediaItemKey(volumeName, id)
+    }
+
+    private fun nullableLong(cursor: android.database.Cursor, column: String): Long? {
+        val index = cursor.getColumnIndex(column)
+        return if (index < 0 || cursor.isNull(index)) null else cursor.getLong(index)
+    }
+
+    private fun mediaStoreQueryUris(uri: Uri): List<Uri> {
+        if (uri.authority == "media") return listOf(uri)
+        val candidates = mutableListOf<Uri>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                MediaStore.getMediaUri(context, uri)
+                    ?.takeIf { it.authority == "media" }
+                    ?.let(candidates::add)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.d(TAG, "MediaStore could not map URI to a media item: $uri", e)
+            }
+        }
+        return candidates.distinct()
+    }
+
+    private fun areCanonicalAliases(first: Uri, second: Uri): Boolean {
+        if (first == second) return true
+        return try {
+            val canonicalFirst = contentResolver.canonicalize(first) ?: return false
+            val canonicalSecond = contentResolver.canonicalize(second) ?: return false
+            canonicalFirst == canonicalSecond
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.d(TAG, "Could not canonicalize MediaStore aliases", e)
+            false
+        }
+    }
+
+    private fun findExistingCopyCandidates(relativePath: String, fileName: String): List<ExistingCopyCandidate> {
+        val projection = arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.MediaColumns.VOLUME_NAME,
+            MediaStore.Images.Media.RELATIVE_PATH,
+            MediaStore.Images.Media.DISPLAY_NAME,
+            MediaStore.Images.Media.IS_PENDING
+        )
+        val selection = "${MediaStore.Images.Media.RELATIVE_PATH} = ? AND " +
+            "${MediaStore.Images.Media.DISPLAY_NAME} = ? AND ${MediaStore.Images.Media.IS_PENDING} = 0"
+        val candidates = mutableListOf<ExistingCopyCandidate>()
+        try {
+            contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                selection,
+                arrayOf(relativePath, fileName),
+                null
+            )?.use { cursor ->
+                val relativePathIndex = cursor.getColumnIndex(MediaStore.Images.Media.RELATIVE_PATH)
+                val displayNameIndex = cursor.getColumnIndex(MediaStore.Images.Media.DISPLAY_NAME)
+                val pendingIndex = cursor.getColumnIndex(MediaStore.Images.Media.IS_PENDING)
+                while (cursor.moveToNext()) {
+                    val key = mediaStoreItemKey(cursor) ?: continue
+                    if (relativePathIndex < 0 || displayNameIndex < 0 || pendingIndex < 0 ||
+                        cursor.isNull(relativePathIndex) || cursor.isNull(displayNameIndex) || cursor.isNull(pendingIndex)
+                    ) continue
+                    if (normalizeRelativePath(cursor.getString(relativePathIndex)) != relativePath ||
+                        cursor.getString(displayNameIndex) != fileName || cursor.getInt(pendingIndex) != 0
+                    ) continue
+                    val itemUri = Uri.withAppendedPath(
+                        MediaStore.Images.Media.getContentUri(key.volumeName),
+                        key.id.toString()
+                    )
+                    candidates += ExistingCopyCandidate(itemUri, key)
                 }
             }
-
-            scanMediaFile(targetFile)
-
-            Log.d(TAG, "Copied image directly: ${targetFile.absolutePath}")
-            return Uri.fromFile(targetFile)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            Log.e(TAG, "Error copying image directly", e)
-            return null
+            Log.w(TAG, "Could not inspect existing copies in $relativePath", e)
+        }
+        return candidates
+    }
+
+    private fun normalizeRelativePath(path: String): String = path.trim('/') + "/"
+
+    private suspend fun copySourceToOwnedTarget(
+        sourceUri: Uri,
+        targetUri: Uri,
+        expectedSize: Long?
+    ): ContentDigest {
+        val input = contentResolver.openInputStream(sourceUri)
+            ?: throw IOException("Source input stream was unavailable")
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(64 * 1024)
+        var byteCount = 0L
+        var copyDigest: ContentDigest? = null
+        input.use { source ->
+            val output = contentResolver.openOutputStream(targetUri)
+                ?: throw IOException("Destination output stream was unavailable")
+            output.use { destination ->
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    val count = source.read(buffer)
+                    if (count < 0) break
+                    if (count == 0) throw IOException("Source stream returned no data before EOF")
+                    destination.write(buffer, 0, count)
+                    digest.update(buffer, 0, count)
+                    byteCount += count
+                }
+                if (byteCount == 0L) throw IOException("Source image was empty")
+                if (expectedSize != null && byteCount != expectedSize) {
+                    throw IOException("Source size mismatch: expected=${expectedSize} actual=${byteCount}")
+                }
+                copyDigest = ContentDigest(byteCount, digest.digest())
+                destination.flush()
+            }
+        }
+        return copyDigest ?: throw IOException("Image copy did not produce content")
+    }
+
+    private suspend fun readContentDigest(uri: Uri, expectedSize: Long?): ContentDigest? {
+        val input = contentResolver.openInputStream(uri) ?: return null
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(64 * 1024)
+        var byteCount = 0L
+        input.use { stream ->
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val count = stream.read(buffer)
+                if (count < 0) break
+                if (count == 0) throw IOException("Content stream returned no data before EOF: $uri")
+                digest.update(buffer, 0, count)
+                byteCount += count
+            }
+        }
+        if (byteCount == 0L) return null
+        if (expectedSize != null && byteCount != expectedSize) {
+            throw IOException("Content size mismatch for $uri: expected=$expectedSize actual=$byteCount")
+        }
+        return ContentDigest(byteCount, digest.digest())
+    }
+
+    private fun sameDigest(first: ContentDigest, second: ContentDigest): Boolean =
+        first.byteCount == second.byteCount && first.sha256.contentEquals(second.sha256)
+
+    private fun ByteArray.toSha256Hex(): String = joinToString("") { "%02x".format(it) }
+
+    private suspend fun cleanupOwnedCopyTarget(ownedTarget: OwnedCopyTargetHolder) {
+        val uri = ownedTarget.take() ?: return
+        withContext(NonCancellable + Dispatchers.IO) {
+            try {
+                val deleted = contentResolver.delete(uri, null, null)
+                if (deleted == 1) {
+                    Log.d(TAG, "Rolled back owned copy target: $uri")
+                } else {
+                    Log.w(TAG, "Rollback deleted $deleted rows; the copy target may remain: $uri")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Rollback failed; the copy target may remain: $uri", e)
+            }
         }
     }
 
@@ -899,34 +1210,40 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
             Log.d("DEBUG_SYNC", "[B1,B2] Processing image | index=$index | fileName=$fileName | albumName=$albumName | uri=$uri")
             // #endregion
 
-            // 先检查是否已存在
-            val existingUri = fileName?.let { findExistingImageInAlbum(albumName, it) }
-            
-            if (existingUri != null) {
-                // 已存在，记录映射（原URI -> 已存在的URI）
-                alreadyExists++
-                uriMapping[uri.toString()] = existingUri
-                // #region agent log
-                Log.d("DEBUG_SYNC", "[B1,B2] Image sync result | index=$index | fileName=$fileName | status=skipped | existingUri=$existingUri")
-                // #endregion
-            } else {
-                // 不存在，执行同步
-                val result = when (syncMode) {
-                    SyncMode.COPY -> addImageToSystemAlbum(uri, albumName)
-                    SyncMode.MOVE -> moveImageToSystemAlbum(uri, albumName)
+            if (syncMode == SyncMode.COPY) {
+                when (val result = copyImageToSystemAlbum(uri, albumName)) {
+                    is CopyOutcome.Created -> {
+                        newlySynced++
+                        uriMapping[uri.toString()] = result.uri
+                        Log.d("DEBUG_SYNC", "[B1,B2] Image sync result | index=$index | fileName=$fileName | status=synced | resultUri=${result.uri}")
+                    }
+                    is CopyOutcome.Reused -> {
+                        alreadyExists++
+                        uriMapping[uri.toString()] = result.uri
+                        Log.d("DEBUG_SYNC", "[B1,B2] Image sync result | index=$index | fileName=$fileName | status=verified-existing | resultUri=${result.uri}")
+                    }
+                    CopyOutcome.Failed -> {
+                        failed++
+                        Log.d("DEBUG_SYNC", "[B1,B2] Image sync result | index=$index | fileName=$fileName | status=failed")
+                    }
                 }
-                
-                if (result != null) {
-                    newlySynced++
-                    uriMapping[uri.toString()] = result  // 记录映射（原URI -> 新URI）
-                    // #region agent log
-                    Log.d("DEBUG_SYNC", "[B1,B2] Image sync result | index=$index | fileName=$fileName | status=synced | resultUri=$result")
-                    // #endregion
+            } else {
+                // Keep the existing MOVE behavior; COPY must go through the transaction above.
+                val existingUri = fileName?.let { findExistingImageInAlbum(albumName, it) }
+                if (existingUri != null) {
+                    alreadyExists++
+                    uriMapping[uri.toString()] = existingUri
+                    Log.d("DEBUG_SYNC", "[B1,B2] Image sync result | index=$index | fileName=$fileName | status=skipped | existingUri=$existingUri")
                 } else {
-                    failed++
-                    // #region agent log
-                    Log.d("DEBUG_SYNC", "[B1,B2] Image sync result | index=$index | fileName=$fileName | status=failed")
-                    // #endregion
+                    val result = moveImageToSystemAlbum(uri, albumName)
+                    if (result != null) {
+                        newlySynced++
+                        uriMapping[uri.toString()] = result
+                        Log.d("DEBUG_SYNC", "[B1,B2] Image sync result | index=$index | fileName=$fileName | status=synced | resultUri=$result")
+                    } else {
+                        failed++
+                        Log.d("DEBUG_SYNC", "[B1,B2] Image sync result | index=$index | fileName=$fileName | status=failed")
+                    }
                 }
             }
         }
@@ -936,7 +1253,7 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
         
         // 更新最后一张图片（封面）的 DATE_MODIFIED，确保它在系统相册中显示为封面
         // 系统相册按 DATE_MODIFIED DESC 选择封面
-        if (imageUris.isNotEmpty()) {
+        if (syncMode == SyncMode.MOVE && imageUris.isNotEmpty()) {
             val lastFileName = getFileNameFromUri(imageUris.last())
             if (lastFileName != null) {
                 updateImageDateModified(albumName, lastFileName)
@@ -1004,6 +1321,11 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
         targetRelativePath: String? = null
     ): Uri? = withContext(Dispatchers.IO) {
         try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                Log.w(TAG, "Cannot safely move image to bucket on Android versions below Q: $imageUri")
+                return@withContext null
+            }
+
             val fileName = getFileNameFromUri(imageUri) ?: "IMG_${System.currentTimeMillis()}.jpg"
             
             // 确定目标路径
@@ -1012,124 +1334,24 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
             
             Log.d(TAG, "Moving image to bucket: $targetBucketName, path: $finalRelativePath")
             
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Android 10+：使用 MediaStore 更新 RELATIVE_PATH
-                val updateValues = ContentValues().apply {
-                    put(MediaStore.Images.Media.RELATIVE_PATH, finalRelativePath)
-                    put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                }
-                
-                val updated = contentResolver.update(imageUri, updateValues, null, null)
-                if (updated > 0) {
-                    Log.d(TAG, "Moved image using MediaStore update: $fileName -> $finalRelativePath")
-                    // 返回更新后的 URI（同一个 URI，但路径已变）
-                    return@withContext imageUri
-                }
-                
-                // 更新失败，尝试复制后删除
-                Log.w(TAG, "MediaStore update failed, trying copy+delete")
-                val newUri = copyImageToPath(imageUri, finalRelativePath, fileName)
-                if (newUri != null) {
-                    deleteOriginalImage(imageUri)
-                    return@withContext newUri
-                }
-            } else {
-                // Android 9 及以下：直接文件操作
-                val targetFolder = getAlbumFolder(targetBucketName)
-                val newUri = copyImageDirectly(imageUri, targetFolder, fileName)
-                if (newUri != null) {
-                    deleteOriginalImage(imageUri)
-                    return@withContext newUri
-                }
+            val updateValues = ContentValues().apply {
+                put(MediaStore.Images.Media.RELATIVE_PATH, finalRelativePath)
+                put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+            }
+
+            val updated = contentResolver.update(imageUri, updateValues, null, null)
+            if (updated > 0) {
+                Log.d(TAG, "Moved image using MediaStore update: $fileName -> $finalRelativePath")
+                return@withContext imageUri
             }
             
-            Log.e(TAG, "Failed to move image to bucket: $targetBucketName")
+            Log.w(TAG, "MediaStore update failed; retaining source image: $targetBucketName/$fileName")
             null
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error moving image to bucket: $targetBucketName", e)
             null
-        }
-    }
-
-    /**
-     * 复制图片到指定路径
-     */
-    private fun copyImageToPath(
-        sourceUri: Uri,
-        targetRelativePath: String,
-        fileName: String
-    ): Uri? {
-        try {
-            // 获取源图片的时间元数据，保持原始时间戳
-            var dateTaken: Long? = null
-            var dateAdded: Long? = null
-            var dateModified: Long? = null
-            contentResolver.query(
-                sourceUri,
-                arrayOf(
-                    MediaStore.Images.Media.DATE_TAKEN,
-                    MediaStore.Images.Media.DATE_ADDED,
-                    MediaStore.Images.Media.DATE_MODIFIED
-                ),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    cursor.getColumnIndex(MediaStore.Images.Media.DATE_TAKEN).takeIf { it >= 0 }?.let {
-                        dateTaken = cursor.getLong(it)
-                    }
-                    cursor.getColumnIndex(MediaStore.Images.Media.DATE_ADDED).takeIf { it >= 0 }?.let {
-                        dateAdded = cursor.getLong(it)
-                    }
-                    cursor.getColumnIndex(MediaStore.Images.Media.DATE_MODIFIED).takeIf { it >= 0 }?.let {
-                        dateModified = cursor.getLong(it)
-                    }
-                }
-            }
-            
-            // 当 DATE_TAKEN 无效时，使用 DATE_MODIFIED 作为替代
-            // DATE_TAKEN 是毫秒，DATE_MODIFIED 是秒
-            val effectiveDateTaken: Long = when {
-                dateTaken != null && dateTaken!! > 0 -> dateTaken!!
-                dateModified != null && dateModified!! > 0 -> dateModified!! * 1000
-                else -> System.currentTimeMillis()
-            }
-            
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                put(MediaStore.Images.Media.MIME_TYPE, getMimeType(fileName))
-                put(MediaStore.Images.Media.RELATIVE_PATH, targetRelativePath)
-                put(MediaStore.Images.Media.IS_PENDING, 1)
-                // 保留原始时间戳
-                put(MediaStore.Images.Media.DATE_TAKEN, effectiveDateTaken)
-                dateAdded?.let { put(MediaStore.Images.Media.DATE_ADDED, it) }
-                dateModified?.let { put(MediaStore.Images.Media.DATE_MODIFIED, it) }
-            }
-
-            val newUri = contentResolver.insert(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                values
-            ) ?: return null
-
-            contentResolver.openInputStream(sourceUri)?.use { input ->
-                contentResolver.openOutputStream(newUri)?.use { output ->
-                    input.copyTo(output)
-                }
-            }
-
-            // 完成 pending 状态，并再次设置时间戳（防止被系统覆盖）
-            val updateValues = ContentValues().apply {
-                put(MediaStore.Images.Media.IS_PENDING, 0)
-                put(MediaStore.Images.Media.DATE_TAKEN, effectiveDateTaken)
-                dateModified?.let { put(MediaStore.Images.Media.DATE_MODIFIED, it) }
-            }
-            contentResolver.update(newUri, updateValues, null, null)
-
-            return newUri
-        } catch (e: Exception) {
-            Log.e(TAG, "Error copying image to path: $targetRelativePath", e)
-            return null
         }
     }
 
@@ -1142,57 +1364,60 @@ class SystemAlbumSyncManager private constructor(private val context: Context) {
      * @param albumName 相册名称
      * @return 创建的相册相对路径（如 "Pictures/Tabula/旅行"）
      */
-    suspend fun createBucket(albumName: String): String? = withContext(Dispatchers.IO) {
+    suspend fun createBucket(albumName: String): String? {
+        val ownedTarget = OwnedCopyTargetHolder()
         try {
-            val relativePath = getAlbumRelativePath(albumName)
-            
-            // 使用 MediaStore API 创建占位文件来间接创建文件夹
-            // 文件夹会在创建第一个文件时自动生成
-            val placeholderName = ".tabula_placeholder_${System.currentTimeMillis()}.jpg"
-            
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, placeholderName)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                put(MediaStore.Images.Media.RELATIVE_PATH, relativePath)
-                put(MediaStore.Images.Media.IS_PENDING, 1)
-            }
-            
-            val placeholderUri = contentResolver.insert(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                values
-            )
-            
-            if (placeholderUri != null) {
-                // 写入最小的有效 JPEG 数据，防止 MediaStore 拒绝空文件
-                contentResolver.openOutputStream(placeholderUri)?.use { output ->
-                    // 最小的有效 JPEG 文件头
-                    val minimalJpeg = byteArrayOf(
-                        0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte(),
-                        0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
-                        0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
-                        0xFF.toByte(), 0xD9.toByte()
-                    )
-                    output.write(minimalJpeg)
+            val result = withContext(Dispatchers.IO) {
+                currentCoroutineContext().ensureActive()
+                val relativePath = getAlbumRelativePath(albumName)
+                // API 37 cannot delete the published dot-prefixed placeholder; use a normal name.
+                val values = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, "tabula_placeholder_${System.currentTimeMillis()}.jpg")
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, relativePath)
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
-                
-                // 完成 pending 状态
-                val updateValues = ContentValues().apply {
+                val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                    ?: throw IOException("Bucket placeholder insert returned null")
+                ownedTarget.set(uri)
+                currentCoroutineContext().ensureActive()
+                val minimalJpeg = byteArrayOf(
+                    0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte(),
+                    0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+                    0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+                    0xFF.toByte(), 0xD9.toByte()
+                )
+                val output = contentResolver.openOutputStream(uri)
+                    ?: throw IOException("Bucket placeholder output stream unavailable: $uri")
+                output.use { it.write(minimalJpeg); it.flush() }
+                currentCoroutineContext().ensureActive()
+                val input = contentResolver.openInputStream(uri)
+                    ?: throw IOException("Bucket placeholder readback unavailable: $uri")
+                val readback = input.use { it.readBytes() }
+                if (!readback.contentEquals(minimalJpeg)) {
+                    throw IOException("Bucket placeholder readback mismatch: $uri")
+                }
+                currentCoroutineContext().ensureActive()
+                val updated = contentResolver.update(uri, ContentValues().apply {
                     put(MediaStore.Images.Media.IS_PENDING, 0)
-                }
-                contentResolver.update(placeholderUri, updateValues, null, null)
-                
-                // 立即删除占位文件，文件夹会保留
-                contentResolver.delete(placeholderUri, null, null)
-                
+                }, null, null)
+                if (updated != 1) throw IOException("Bucket placeholder publish affected $updated rows: $uri")
+                currentCoroutineContext().ensureActive()
+                val deleted = contentResolver.delete(uri, null, null)
+                if (deleted != 1) throw IOException("Bucket placeholder delete affected $deleted rows: $uri")
                 Log.d(TAG, "Created bucket: $albumName at $relativePath")
-                return@withContext relativePath
-            } else {
-                Log.e(TAG, "Failed to create placeholder file for bucket: $albumName")
-                return@withContext null
+                relativePath
             }
+            // Retain ownership until withContext delivers the result, including cancellation on dispatch.
+            ownedTarget.clear()
+            return result
+        } catch (e: CancellationException) {
+            cleanupOwnedCopyTarget(ownedTarget)
+            throw e
         } catch (e: Exception) {
+            cleanupOwnedCopyTarget(ownedTarget)
             Log.e(TAG, "Error creating bucket: $albumName", e)
-            null
+            return null
         }
     }
 

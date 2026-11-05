@@ -58,6 +58,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.tabula.v3.data.model.ImageFile
+import com.tabula.v3.BuildConfig
 import com.tabula.v3.data.preferences.AppPreferences
 import com.tabula.v3.data.preferences.CardStyleMode
 import com.tabula.v3.data.preferences.SourceImageDeletionStrategy
@@ -65,13 +66,22 @@ import com.tabula.v3.data.preferences.SwipeStyle
 import com.tabula.v3.data.preferences.TagSelectionMode
 import com.tabula.v3.data.preferences.ThemeMode
 import com.tabula.v3.data.preferences.TopBarDisplayMode
+import com.tabula.v3.data.repository.DeletionVerification
 import com.tabula.v3.data.repository.FileOperationManager
 import com.tabula.v3.data.repository.LocalImageRepository
+import com.tabula.v3.data.repository.matchesSameMediaIdentity
+import com.tabula.v3.data.repository.partitionByConfirmedIdentity
+import com.tabula.v3.data.repository.projectSnapshot
 import com.tabula.v3.data.repository.RecycleBinManager
 import com.tabula.v3.data.repository.RecommendationEngine
 import com.tabula.v3.data.repository.AlbumCleanupEngine
 import com.tabula.v3.data.repository.AlbumCleanupInfo
 import com.tabula.v3.permission.MediaPermissionPolicy
+import com.tabula.v3.permission.DeletePermissionSession
+import com.tabula.v3.data.repository.RecycleBinPersistenceException
+import com.tabula.v3.data.repository.RecycleBinCommitException
+import com.tabula.v3.data.repository.deleteRecycleBinSelection
+import com.tabula.v3.data.repository.reconcileRecycleBinDeletion
 import com.tabula.v3.ui.navigation.AppScreen
 import com.tabula.v3.ui.navigation.PredictiveBackContainer
 import com.tabula.v3.ui.screens.AboutScreen
@@ -102,11 +112,35 @@ import com.tabula.v3.ui.util.HapticFeedback
 import com.tabula.v3.ui.theme.TabulaTheme
 import com.tabula.v3.ui.components.LocalLiquidGlassEnabled
 import com.tabula.v3.service.FluidCloudService
+import android.content.Context
+import android.net.Uri
+import android.provider.MediaStore
 import android.widget.Toast
 import com.tabula.v3.ui.components.isBackdropLiquidGlassSupported
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlin.coroutines.resume
+import com.tabula.v3.data.repository.BatchDeleteResult
+import com.tabula.v3.data.repository.deleteInBatches
+import com.tabula.v3.data.repository.deleteMediaUrisBatch
+import com.tabula.v3.data.repository.BatchDeleteSummary
+import com.tabula.v3.data.repository.mediaDeletionMessage
+import com.tabula.v3.data.repository.resolveImagesByIdentitySelection
+
+/**
+ * T02b 恢复核验决策：未知保留在回收站，缺失清除死记录且不入图库，仅 PRESENT 继续恢复。
+ */
+enum class RestoreDecision { PROCEED_RESTORE, KEEP_UNKNOWN, DROP_MISSING }
+
+fun decideRestoreAction(uri: Uri, verification: DeletionVerification): RestoreDecision = when {
+    uri in verification.unknown -> RestoreDecision.KEEP_UNKNOWN
+    uri in verification.deleted -> RestoreDecision.DROP_MISSING
+    else -> RestoreDecision.PROCEED_RESTORE
+}
 
 /**
  * MainActivity - Tabula 应用入口
@@ -117,9 +151,32 @@ import kotlinx.coroutines.withContext
  * 3. 简单路由管理
  * 4. ColorOS 16 风格预测性返回
  */
+/** T03 升级兼容：解析 URI 当前指向的卷。查询返回多行（跨卷同 ID 的聚合
+ *  二义）或失败时返回 null → 分区判为未确认（保留记录并停止）。 */
+private suspend fun resolveMediaVolumeName(context: Context, uri: Uri): String? =
+    withContext(Dispatchers.IO) {
+        runCatching {
+            context.contentResolver.query(
+                uri, arrayOf(MediaStore.MediaColumns.VOLUME_NAME), null, null, null
+            )?.use { c ->
+                when {
+                    c.count != 1 -> null
+                    c.moveToFirst() -> c.getString(0)?.takeIf { it.isNotBlank() }
+                    else -> null
+                }
+            }
+        }.getOrNull()
+    }
+
 class MainActivity : ComponentActivity() {
 
     private var hasPermission by mutableStateOf(false)
+
+    // C4/T07：前台权限/快照刷新触发器——访问级别变化或带权限回前台时递增，
+    // 作为 TabulaApp 加载 LaunchedEffect 的键（重启即取消在途扫描，晚到结果
+    // 不覆盖新权限态）。
+    private var mediaAccessRevision by mutableStateOf(0)
+    private var lastAccessLevel: MediaPermissionPolicy.MediaAccessLevel? = null
     
     // 流体云：跟踪当前批次剩余数量
     private var currentBatchRemaining = 0
@@ -130,10 +187,11 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grantResults ->
         val sdkInt = android.os.Build.VERSION.SDK_INT
-        hasPermission = MediaPermissionPolicy.hasMediaReadPermission(sdkInt) { permission ->
+        val level = MediaPermissionPolicy.mediaAccessLevel(sdkInt) { permission ->
             grantResults[permission] == true ||
                 ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
         }
+        applyAccessLevel(level, foregroundRefresh = false)
 
         if (!hasPermission) {
             val requestedPermissions = MediaPermissionPolicy.requiredPermissionsForSdk(sdkInt)
@@ -147,7 +205,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private lateinit var deletePermissionLauncher: ActivityResultLauncher<IntentSenderRequest>
-    private var onDeletePermissionResult: ((Boolean) -> Unit)? = null
+    private lateinit var deletePermissionSession: DeletePermissionSession
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        deletePermissionSession.save(outState)
+        super.onSaveInstanceState(outState)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // 使用完全透明的导航栏样式，实现沉浸式体验
@@ -162,6 +225,7 @@ class MainActivity : ComponentActivity() {
             )
         )
         super.onCreate(savedInstanceState)
+        deletePermissionSession = DeletePermissionSession(savedInstanceState)
 
         checkPermission()
 
@@ -170,8 +234,7 @@ class MainActivity : ComponentActivity() {
             ActivityResultContracts.StartIntentSenderForResult()
         ) { result ->
             val success = result.resultCode == Activity.RESULT_OK
-            onDeletePermissionResult?.invoke(success)
-            onDeletePermissionResult = null
+            deletePermissionSession.complete(success)
         }
 
         setContent {
@@ -197,13 +260,15 @@ class MainActivity : ComponentActivity() {
                 if (hasPermission) {
                     TabulaApp(
                         preferences = preferences,
+                        mediaAccessRevision = mediaAccessRevision,
                         onThemeChange = { theme -> currentTheme = theme },
                         onRequestDeletePermission = { intentSender, callback ->
-                            onDeletePermissionResult = callback
-                            deletePermissionLauncher.launch(
-                                IntentSenderRequest.Builder(intentSender).build()
-                            )
+                            deletePermissionSession.launch(callback) {
+                                deletePermissionLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
+                            }
                         },
+                        deletePermissionInFlight = deletePermissionSession.inFlight,
+                        deletionRecoveryRevision = deletePermissionSession.recoveryRevision,
                         liquidGlassLabEnabled = liquidGlassLabEnabled,
                         onLiquidGlassLabEnabledChange = { enabled ->
                             liquidGlassLabEnabled = enabled
@@ -221,8 +286,10 @@ class MainActivity : ComponentActivity() {
     
     override fun onResume() {
         super.onResume()
-        // 返回应用时重新检查权限（用户可能在系统设置中撤销了权限）
-        checkPermission()
+        // 返回应用时重新核对媒体访问权限（用户可能在系统设置中撤销了权限、
+        // 修改了允许访问的照片选择，或后台期间外部增删改了媒体）——级别变化
+        // 或带权限回前台都会触发按现有快照契约的刷新。
+        checkPermission(foregroundRefresh = true)
         // 返回应用时隐藏流体云
         FluidCloudService.hide(this)
     }
@@ -243,10 +310,44 @@ class MainActivity : ComponentActivity() {
         isFluidCloudEnabled = fluidCloudEnabled
     }
 
-    private fun checkPermission() {
+    private fun checkPermission(foregroundRefresh: Boolean = false) {
         val sdkInt = android.os.Build.VERSION.SDK_INT
-        hasPermission = MediaPermissionPolicy.hasMediaReadPermission(sdkInt) { permission ->
+        val level = MediaPermissionPolicy.mediaAccessLevel(sdkInt) { permission ->
             ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+        }
+        applyAccessLevel(level, foregroundRefresh)
+    }
+
+    /**
+     * C4/T07：应用新的访问级别并按需触发刷新。
+     *
+     * 状态转换约定：
+     * - 级别变化（NONE/PARTIAL/FULL 互切，含系统设置中的撤销与部分选择集
+     *   变更）：更新门控；新级别非 NONE 时递增 [mediaAccessRevision] 触发
+     *   按现有快照契约（loadAllData + projectSnapshot）的整表刷新——失去访问
+     *   权的旧条目随 MediaStore 重查自然消失，恢复/升级后重新加载。
+     * - 级别不变且带权限回前台（[foregroundRefresh]）：同样递增——后台期间
+     *   的外部删除/修改在返回时按快照契约刷新。
+     * - NONE：不加载（权限门控屏接管；重新授权后经本约定刷新/全新加载）。
+     * - 首次检查（previous == null，onCreate 路径）不触发：组合后的首次
+     *   加载已覆盖。
+     * - 在途扫描防护：revision 作为 LaunchedEffect 键，重启即取消旧协程，
+     *   较早启动的扫描结果不会写入较新的权限状态。
+     *
+     * 失败约定：刷新走既有加载路径的失败处理（回收站读取失败对话框 + 重试），
+     * 权限拒绝由门控屏呈现，本函数不新增失败通道。
+     */
+    private fun applyAccessLevel(
+        level: MediaPermissionPolicy.MediaAccessLevel,
+        foregroundRefresh: Boolean
+    ) {
+        val previous = lastAccessLevel
+        lastAccessLevel = level
+        hasPermission = level != MediaPermissionPolicy.MediaAccessLevel.NONE
+        if (level == MediaPermissionPolicy.MediaAccessLevel.NONE) return
+        if (previous == null) return
+        if (level != previous || foregroundRefresh) {
+            mediaAccessRevision++
         }
     }
 
@@ -265,8 +366,11 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun TabulaApp(
     preferences: AppPreferences,
+    mediaAccessRevision: Int = 0,
     onThemeChange: (ThemeMode) -> Unit,
     onRequestDeletePermission: (android.content.IntentSender, (Boolean) -> Unit) -> Unit,
+    deletePermissionInFlight: Boolean = false,
+    deletionRecoveryRevision: Int = 0,
     liquidGlassLabEnabled: Boolean = false,
     onLiquidGlassLabEnabledChange: (Boolean) -> Unit = {}
 ) {
@@ -336,6 +440,9 @@ fun TabulaApp(
     // 这样已归类的照片不会再次出现在待整理列表中
     var imagesForSorting by remember { mutableStateOf<List<ImageFile>>(emptyList()) }
     var deletedImages by remember { mutableStateOf<List<ImageFile>>(emptyList()) }
+    var isDeletingRecycleBin by remember { mutableStateOf(false) }
+    var recycleBinLoadError by remember { mutableStateOf(false) }
+    var recycleBinLoadRevision by remember { mutableIntStateOf(0) }
     var systemBuckets by remember { mutableStateOf<List<LocalImageRepository.SystemBucket>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
 
@@ -379,19 +486,24 @@ fun TabulaApp(
     // ========== 原图删除提醒状态 ==========
     var showSourceImageDeletionDialog by remember { mutableStateOf(false) }
     var pendingSourceImageUris by remember { mutableStateOf<List<android.net.Uri>>(emptyList()) }
+    var dialogSourceImageUris by remember { mutableStateOf<List<android.net.Uri>>(emptyList()) }
+    var unverifiedSourceImageCount by remember { mutableIntStateOf(0) }
     var sourceImageDeletionStrategy by remember { mutableStateOf(preferences.sourceImageDeletionStrategy) }
     
     // 监听图集模式切换，当切换到图集界面时检查是否需要提醒删除原图
     LaunchedEffect(isAlbumMode, sourceImageDeletionStrategy) {
         if (isAlbumMode) {
-            // 获取所有待删除的原图
             val cleanableResult = albumManager.getCleanableUrisForAllAlbums()
-            if (!cleanableResult.isEmpty && cleanableResult.sourceUris.isNotEmpty()) {
-                pendingSourceImageUris = cleanableResult.sourceUris
-                // 仅在开启归档提醒时弹出对话框，关闭时只更新清理按钮计数
-                if (sourceImageDeletionStrategy == SourceImageDeletionStrategy.ASK_EVERY_TIME) {
-                    showSourceImageDeletionDialog = true
-                }
+            pendingSourceImageUris = cleanableResult.sourceUris
+            unverifiedSourceImageCount = cleanableResult.unverifiedSourceCount
+            if (cleanableResult.sourceUris.isNotEmpty() &&
+                sourceImageDeletionStrategy == SourceImageDeletionStrategy.ASK_EVERY_TIME
+            ) {
+                dialogSourceImageUris = cleanableResult.sourceUris.toList()
+                showSourceImageDeletionDialog = true
+            } else if (cleanableResult.sourceUris.isEmpty()) {
+                // 清理候选变化后不能留下过期列表或确认框。
+                showSourceImageDeletionDialog = false
             }
         }
     }
@@ -399,101 +511,241 @@ fun TabulaApp(
     // ========== 各页面的滚动状态（在 TabulaApp 级别保存，导航返回时保持位置） ==========
     val settingsScrollState = rememberSaveable(saver = ScrollState.Saver) { ScrollState(0) }
 
-    // 加载数据
-    LaunchedEffect(Unit) {
-        val loadedData = withContext(Dispatchers.IO) {
-            val repository = LocalImageRepository(context)
-            // 单次 MediaStore 查询获取所有数据（优化：原来需要 3+2 次查询）
-            val loadResult = repository.loadAllData()
-            // 回收站加载（与图集初始化无依赖，可并行）
-            val deleted = recycleBinManager.loadRecycleBin()
-            // 传入预加载的 bucket 数据，避免 AlbumManager 重复查询 MediaStore
-            albumManager.initialize(preloadedBuckets = loadResult.systemBuckets)
-            Pair(loadResult, deleted)
-        }
-        // 在主线程更新状态
-        allImages = loadedData.first.allImages
-        imagesForSorting = loadedData.first.imagesExcludingTabula
-        systemBuckets = loadedData.first.systemBuckets
-        deletedImages = loadedData.second
-        
-        isLoading = false
+    fun removeConfirmedFromState(uris: Set<android.net.Uri>) {
+        deletedImages = deletedImages.filterNot { it.uri in uris }
+        allImages = allImages.filterNot { it.uri in uris }
+        imagesForSorting = imagesForSorting.filterNot { it.uri in uris }
     }
 
-    /**
-     * 执行删除操作
-     */
-    fun performDelete(image: ImageFile, onResult: (Boolean) -> Unit) {
+    // A restored system request must finish before we classify its pending journal.
+    // mediaAccessRevision（C4/T07）：回前台权限级别变化或带权限回前台时递增——
+    // 作为键重启本 effect 取消在途扫描（晚到结果不覆盖新权限态），并按现有
+    // 快照契约（loadAllData + projectSnapshot）整表刷新：失去访问权的旧条目
+    // 随 MediaStore 重查消失，外部删除/修改与部分选择集变更在返回时更新。
+    LaunchedEffect(
+        mediaAccessRevision,
+        deletionRecoveryRevision,
+        deletePermissionInFlight,
+        recycleBinLoadRevision,
+        isDeletingRecycleBin
+    ) {
+        if (isDeletingRecycleBin) return@LaunchedEffect
+        try {
+            if (!deletePermissionInFlight) {
+                val recovered = reconcileRecycleBinDeletion(
+                    recycleBinManager,
+                    resolveVolume = { resolveMediaVolumeName(context, it) },
+                    verify = fileOperationManager::verifyDeletionState
+                )
+                if (recovered.unknown.isNotEmpty()) {
+                    Toast.makeText(context, "上次删除尚有无法核对的照片，请检查照片访问权限或存储卷后重试", Toast.LENGTH_LONG).show()
+                }
+            }
+            val loadedData = withContext(Dispatchers.IO) {
+                val loadResult = LocalImageRepository(context).loadAllData()
+                val deleted = recycleBinManager.loadRecycleBin()
+                // 浏览/推荐由"快照 − 软删除集合"派生，相册计数与封面同步重算。
+                val projected = projectSnapshot(loadResult, deleted)
+                albumManager.initialize(preloadedBuckets = projected.systemBuckets)
+                Pair(projected, deleted)
+            }
+            allImages = loadedData.first.allImages
+            imagesForSorting = loadedData.first.imagesExcludingTabula
+            systemBuckets = loadedData.first.systemBuckets
+            deletedImages = loadedData.second
+            recycleBinLoadError = false
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            recycleBinLoadError = true
+            Log.e("TabulaApp", "Could not load/reconcile recycle bin", e)
+            Toast.makeText(context, "回收站记录未能读取或核对，原记录已保留，请重试", Toast.LENGTH_LONG).show()
+        } finally {
+            isLoading = false
+        }
+    }
+
+    if (recycleBinLoadError) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { recycleBinLoadError = false },
+            title = { Text("回收站记录未能读取") },
+            text = { Text("无法读取或保存回收站记录。原有记录未清空，请重试。") },
+            confirmButton = {
+                Button(onClick = { recycleBinLoadError = false; recycleBinLoadRevision++ }) { Text("重试") }
+            }
+        )
+    }
+
+    fun deleteRecycleBinImages(images: List<ImageFile>) {
+        if (isDeletingRecycleBin || deletePermissionInFlight || images.isEmpty()) return
+        val snapshot = images.toList()
+        isDeletingRecycleBin = true
         scope.launch {
-            val result = fileOperationManager.deleteImage(image.uri)
-            when (result) {
-                is FileOperationManager.DeleteResult.Success -> {
-                    val success = result.deleted.isNotEmpty()
-                    Log.d("TabulaApp", "Deleted: ${image.displayName}, success=$success")
-                    onResult(success)
-                }
-                is FileOperationManager.DeleteResult.NeedsPermission -> {
-                    onRequestDeletePermission(result.intentSender) { granted ->
-                        if (granted) {
-                            // 授权后验证实际删除结果
-                            scope.launch {
-                                val actuallyDeleted = fileOperationManager.verifyDeletion(result.pendingUris)
-                                val success = actuallyDeleted.isNotEmpty()
-                                Log.d("TabulaApp", "Delete permission granted for: ${image.displayName}, verified=$success")
-                                onResult(success)
+            try {
+                var recoveredCount = 0
+                val summary = deleteRecycleBinSelection(
+                    snapshot.map { it.uri }, recycleBinManager,
+                    request = fileOperationManager::deleteImages,
+                    resolveVolume = { resolveMediaVolumeName(context, it) },
+                    permission = { result ->
+                        suspendCancellableCoroutine { continuation ->
+                            onRequestDeletePermission(result.intentSender) { allowed ->
+                                if (continuation.isActive) continuation.resume(allowed)
                             }
-                        } else {
-                            Log.w("TabulaApp", "Delete permission denied for: ${image.displayName}")
-                            onResult(false)
                         }
-                    }
+                    },
+                    verify = fileOperationManager::verifyDeletionState,
+                    onRecovered = { recovered ->
+                        recoveredCount = recovered.deleted.size
+                        removeConfirmedFromState(recovered.deleted)
+                        if (recovered.unknown.isNotEmpty()) {
+                            Toast.makeText(context, "上次删除尚有无法核对的照片，已保留；其余照片将继续处理", Toast.LENGTH_LONG).show()
+                        }
+                    },
+                    onDeleted = { removeConfirmedFromState(it) }
+                )
+                val processed = summary.deleted.size + recoveredCount
+                val message = when {
+                    summary.cancelled -> "已取消，已处理 ${processed} 张，剩余 ${summary.remaining.size} 张"
+                    summary.error != null -> "已处理 ${processed} 张，剩余 ${summary.remaining.size} 张；${summary.error}"
+                    summary.remaining.isEmpty() -> "已处理 ${processed} 张照片"
+                    else -> "已处理 ${processed} 张，${summary.remaining.size} 张未能删除，请重试"
                 }
-                is FileOperationManager.DeleteResult.Error -> {
-                    Log.e("TabulaApp", "Delete error: ${result.message}")
-                    onResult(false)
-                }
+                Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+            } catch (e: CancellationException) {
+                throw e // Recovery queries the journal instead of re-deleting.
+            } catch (e: RecycleBinCommitException) {
+                allImages = allImages.filterNot { it.uri in e.physicallyDeleted }
+                imagesForSorting = imagesForSorting.filterNot { it.uri in e.physicallyDeleted }
+                Log.e("TabulaApp", "Deletion records require reconciliation", e)
+                Toast.makeText(context, e.message, Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                Log.e("TabulaApp", "Recycle bin deletion failed", e)
+                Toast.makeText(context, "未能完成删除或保存记录，已停止；保留的记录将于重试时核对", Toast.LENGTH_LONG).show()
+            } finally {
+                isDeletingRecycleBin = false
             }
         }
     }
-    
+
+    /**
+     * T02c：恢复（单条/批量共用）——单次对账、单次核验、逐项决策、共享记录事务。
+     * UNKNOWN 保留在回收站，MISSING 清除死记录且不入图库，仅 PRESENT 恢复进图库。
+     */
+    fun restoreImagesInOneTransaction(images: List<ImageFile>) {
+        if (images.isEmpty() || isDeletingRecycleBin || deletePermissionInFlight) return
+        scope.launch {
+            try {
+                val recovered = reconcileRecycleBinDeletion(
+                    recycleBinManager,
+                    resolveVolume = { resolveMediaVolumeName(context, it) },
+                    verify = fileOperationManager::verifyDeletionState
+                )
+                removeConfirmedFromState(recovered.deleted)
+                val candidates = images.filter { it.uri !in recovered.unknown && it.uri !in recovered.deleted }
+                // 升级兼容：聚合 URI 无法唯一确认身份的候选（跨卷同 ID 混存）
+                // 归入保留（UNKNOWN 语义），不参与缺失裁决。
+                val (confirmedUris, unconfirmedUris) = partitionByConfirmedIdentity(
+                    candidates.map { it.uri }, candidates
+                ) { resolveMediaVolumeName(context, it) }
+                val confirmedSet = confirmedUris.toSet()
+                // 未确认身份的候选不参与核验与裁决：保留在回收站（UNKNOWN 语义）。
+                val verifiable = candidates.filter { it.uri in confirmedSet }
+                val verification = withContext(Dispatchers.IO) {
+                    fileOperationManager.verifyDeletionState(verifiable.map { it.uri })
+                }
+                val restorable = mutableListOf<ImageFile>()
+                val missing = mutableListOf<ImageFile>()
+                var keptUnknown = images.count { it.uri in recovered.unknown } + unconfirmedUris.size
+                candidates.forEach { image ->
+                    if (image.uri !in confirmedSet) return@forEach
+                    when (decideRestoreAction(image.uri, verification)) {
+                        RestoreDecision.PROCEED_RESTORE -> restorable += image
+                        RestoreDecision.DROP_MISSING -> missing += image
+                        RestoreDecision.KEEP_UNKNOWN -> keptUnknown++
+                    }
+                }
+                // 单一记录事务：只移除核验通过的条目；未知项原样保留。
+                if (restorable.isNotEmpty()) recycleBinManager.removeAllFromRecycleBin(restorable)
+                if (missing.isNotEmpty()) recycleBinManager.removeAllFromRecycleBin(missing, permanentlyRemoved = true)
+                // T03：内存态与持久层同口径——按媒体身份移除/回插，跨卷同数值
+                // ID 记录互不影响。
+                val removed = restorable + missing
+                deletedImages =
+                    deletedImages.filterNot { row -> removed.any { it.matchesSameMediaIdentity(row) } }
+                restorable.forEach { image ->
+                    if (allImages.none { it.matchesSameMediaIdentity(image) }) allImages = allImages + image
+                    val isInTabulaAlbum = albums.any { album ->
+                        album.systemAlbumPath?.trimEnd('/')?.substringAfterLast('/') == image.bucketDisplayName
+                    }
+                    if (!isInTabulaAlbum && imagesForSorting.none { it.matchesSameMediaIdentity(image) }) {
+                        imagesForSorting = imagesForSorting + image
+                    }
+                }
+                // 恢复改变软删除集合，推荐派生集合同步失效（与移除路径对称）。
+                if (restorable.isNotEmpty()) recommendationEngine.invalidateSimilarGroupCache()
+                // 重新查询媒体与持久回收站，统一刷新照片、相册数量和封面。
+                if (restorable.isNotEmpty()) recycleBinLoadRevision++
+                val message = buildString {
+                    if (restorable.isNotEmpty()) append("已恢复 ${restorable.size} 张")
+                    if (missing.isNotEmpty()) append(if (isEmpty()) "${missing.size} 张已不在媒体库" else "，${missing.size} 张已不在媒体库")
+                    if (keptUnknown > 0) append(if (isEmpty()) "${keptUnknown} 张状态未核对已保留" else "，${keptUnknown} 张状态未核对已保留")
+                }
+                if (images.size > 1 && message.isNotEmpty()) {
+                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                } else if (missing.isNotEmpty()) {
+                    Toast.makeText(context, "照片已不在媒体库中，已清除对应回收站记录", Toast.LENGTH_LONG).show()
+                } else if (keptUnknown > 0) {
+                    Toast.makeText(context, "照片状态尚未核对，暂不能恢复，请检查照片访问权限或存储卷后重试", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e("TabulaApp", "Could not restore recycle bin record", e)
+                Toast.makeText(context, "未能保存恢复记录，照片仍保留在回收站", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+
     /**
      * Batch delete
      */
-    fun performDeleteBatch(images: List<ImageFile>, onResult: (Boolean) -> Unit) {
+    fun performDeleteBatch(images: List<ImageFile>, onResult: (BatchDeleteSummary<android.net.Uri>) -> Unit) {
         if (images.isEmpty()) {
-            onResult(true)
+            onResult(BatchDeleteSummary(emptySet(), emptySet(), false, null))
             return
         }
         
         scope.launch {
-            val result = fileOperationManager.deleteImages(images.map { it.uri })
-            when (result) {
-                is FileOperationManager.DeleteResult.Success -> {
-                    val success = result.deleted.size == images.size
-                    Log.d("TabulaApp", "Deleted batch: ${result.deleted.size}/${images.size}")
-                    onResult(success)
-                }
-                is FileOperationManager.DeleteResult.NeedsPermission -> {
-                    onRequestDeletePermission(result.intentSender) { granted ->
-                        if (granted) {
-                            // 授权后验证实际删除结果
-                            scope.launch {
-                                val actuallyDeleted = fileOperationManager.verifyDeletion(result.pendingUris)
-                                val success = actuallyDeleted.size == images.size
-                                Log.d("TabulaApp", "Delete permission granted for batch: ${actuallyDeleted.size}/${images.size}")
-                                onResult(success)
+            // C2/T04：详情删除入口接入串行按项批处理（分批/取消不请求后续批/部分成功/UNKNOWN 隔离）。
+            val summary = deleteInBatches(
+                items = images.map { it.uri },
+                deleteBatch = { batch ->
+                    deleteMediaUrisBatch(
+                        batch,
+                        request = fileOperationManager::deleteImages,
+                        permission = { result ->
+                            suspendCancellableCoroutine { continuation ->
+                                onRequestDeletePermission(result.intentSender) { allowed ->
+                                    if (continuation.isActive) continuation.resume(allowed)
+                                }
                             }
-                        } else {
-                            Log.w("TabulaApp", "Delete permission denied for batch: ${images.size}")
-                            onResult(false)
-                        }
+                        },
+                        verify = fileOperationManager::verifyDeletionState
+                    )
+                },
+                onDeleted = { confirmed ->
+                    withContext(NonCancellable) {
+                        val keys = confirmed.map { it.toString() }.toSet()
+                        allImages = allImages.filter { it.uri.toString() !in keys }
+                        imagesForSorting = imagesForSorting.filter { it.uri.toString() !in keys }
                     }
                 }
-                is FileOperationManager.DeleteResult.Error -> {
-                    Log.e("TabulaApp", "Delete error: ${result.message}")
-                    onResult(false)
-                }
-            }
+            )
+            val deletedUris = summary.deleted.map { it.toString() }.toSet()
+            Log.d("TabulaApp", "Deleted batch: ${deletedUris.size}/${images.size}")
+            onResult(summary)
         }
     }
     
@@ -503,40 +755,43 @@ fun TabulaApp(
      * @param uris 待删除的 URI 列表
      * @param onResult 回调，返回成功删除的 URI 列表
      */
-    fun performDeleteUris(uris: List<android.net.Uri>, onResult: (Set<String>) -> Unit) {
+    fun performDeleteUris(uris: List<android.net.Uri>, onResult: (BatchDeleteSummary<android.net.Uri>) -> Unit) {
         if (uris.isEmpty()) {
-            onResult(emptySet())
+            onResult(BatchDeleteSummary(emptySet(), emptySet(), false, null))
             return
         }
         
         scope.launch {
-            val result = fileOperationManager.deleteImages(uris)
-            when (result) {
-                is FileOperationManager.DeleteResult.Success -> {
-                    val deletedUris = result.deleted.map { it.toString() }.toSet()
-                    Log.d("TabulaApp", "Cleanup deleted: ${deletedUris.size}/${uris.size}")
-                    onResult(deletedUris)
-                }
-                is FileOperationManager.DeleteResult.NeedsPermission -> {
-                    onRequestDeletePermission(result.intentSender) { granted ->
-                        if (granted) {
-                            scope.launch {
-                                val actuallyDeleted = fileOperationManager.verifyDeletion(result.pendingUris)
-                                val deletedUris = actuallyDeleted.map { it.toString() }.toSet()
-                                Log.d("TabulaApp", "Cleanup permission granted, deleted: ${deletedUris.size}/${uris.size}")
-                                onResult(deletedUris)
+            // C2/T04：原图清理入口接入串行按项批处理（分批/取消不请求后续批/部分成功/UNKNOWN 隔离）。
+            val summary = deleteInBatches(
+                items = uris,
+                deleteBatch = { batch ->
+                    deleteMediaUrisBatch(
+                        batch,
+                        request = fileOperationManager::deleteImages,
+                        permission = { result ->
+                            suspendCancellableCoroutine { continuation ->
+                                onRequestDeletePermission(result.intentSender) { allowed ->
+                                    if (continuation.isActive) continuation.resume(allowed)
+                                }
                             }
-                        } else {
-                            Log.w("TabulaApp", "Cleanup permission denied for: ${uris.size} images")
-                            onResult(emptySet())
-                        }
+                        },
+                        verify = fileOperationManager::verifyDeletionState
+                    )
+                },
+                onDeleted = { confirmed ->
+                    withContext(NonCancellable) {
+                        val keys = confirmed.map { it.toString() }.toSet()
+                        albumManager.clearDeletedUris(keys)
+                        allImages = allImages.filter { it.uri.toString() !in keys }
+                        imagesForSorting = imagesForSorting.filter { it.uri.toString() !in keys }
+                        pendingSourceImageUris = pendingSourceImageUris.filter { it !in confirmed }
                     }
                 }
-                is FileOperationManager.DeleteResult.Error -> {
-                    Log.e("TabulaApp", "Cleanup error: ${result.message}")
-                    onResult(emptySet())
-                }
-            }
+            )
+            val deletedUris = summary.deleted.map { it.toString() }.toSet()
+            Log.d("TabulaApp", "Cleanup deleted: ${deletedUris.size}/${uris.size}")
+            onResult(summary)
         }
     }
 
@@ -546,6 +801,16 @@ fun TabulaApp(
             enabled = hapticEnabled,
             strength = hapticStrength
         )
+    }
+
+    fun commitPendingArchiveWithFeedback(actionId: String) {
+        scope.launch {
+            when (albumManager.commitPendingArchive(actionId)) {
+                AlbumManager.ArchiveCommitOutcome.COPY_FAILED ->
+                    Toast.makeText(context, "归档失败，照片未复制", Toast.LENGTH_LONG).show()
+                else -> {}
+            }
+        }
     }
 
     val deckContent: @Composable () -> Unit = {
@@ -561,23 +826,27 @@ fun TabulaApp(
                 preferences.totalReviewedCount++
             },
             onRemove = { image ->
-                val newImages = allImages.toMutableList().apply { remove(image) }
-                allImages = newImages
-                // 同时从待整理列表中移除
-                val newSortingImages = imagesForSorting.toMutableList().apply { remove(image) }
-                imagesForSorting = newSortingImages
-                deletedImages = deletedImages + image.copy(deletedAt = System.currentTimeMillis())
-                
-                preferences.totalReviewedCount++
-                preferences.totalDeletedCount++
-                
-                // 清除相似组缓存（图片列表已变化）
-                recommendationEngine.invalidateSimilarGroupCache()
-                
                 scope.launch {
-                    recycleBinManager.addToRecycleBin(image)
+                    try {
+                        recycleBinManager.addToRecycleBin(image)
+                        albumCleanupEngine.recordUserRemovedImage(image)
+                        val persisted = recycleBinManager.loadRecycleBin()
+                        // 即时状态与刷新后的投影同口径：按媒体身份（卷, ID）过滤，
+                        // 跨卷同数值 ID 的其他照片不受本次回收影响。
+                        allImages = allImages.filterNot { row -> persisted.any { it.matchesSameMediaIdentity(row) } }
+                        imagesForSorting =
+                            imagesForSorting.filterNot { row -> persisted.any { it.matchesSameMediaIdentity(row) } }
+                        deletedImages = persisted
+                        preferences.totalReviewedCount++
+                        preferences.totalDeletedCount++
+                        recommendationEngine.invalidateSimilarGroupCache()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.e("TabulaApp", "Could not mark photo for deletion", e)
+                        Toast.makeText(context, "未能保存回收站记录，照片仍保留在待整理照片中", Toast.LENGTH_LONG).show()
+                    }
                 }
-                Log.d("TabulaApp", "Moved to trash: ${image.displayName}")
             },
             onNavigateToTrash = {
                 currentScreen = AppScreen.RECYCLE_BIN
@@ -595,8 +864,8 @@ fun TabulaApp(
                  scope.launch {
                      // 先提交之前的 pending action（如果有）
                      // 这样快速连续归档时，前一个会被自动提交
-                     albumManager.getLastPendingArchive()?.let { 
-                         albumManager.commitPendingArchive(it.id)
+                     albumManager.getLastPendingArchive()?.let {
+                         commitPendingArchiveWithFeedback(it.id)
                      }
                      
                      // 加入新的 pending action（不立即复制）
@@ -620,8 +889,8 @@ fun TabulaApp(
                 scope.launch {
                     try {
                         // 先提交之前的 pending action（如果有）
-                        albumManager.getLastPendingArchive()?.let { 
-                            albumManager.commitPendingArchive(it.id)
+                        albumManager.getLastPendingArchive()?.let {
+                            commitPendingArchiveWithFeedback(it.id)
                         }
                         
                         // 1. 创建图集
@@ -645,8 +914,8 @@ fun TabulaApp(
             onCommitArchive = {
                 scope.launch {
                     // Snackbar 消失时提交归档，执行真正的复制
-                    albumManager.getLastPendingArchive()?.let { 
-                        albumManager.commitPendingArchive(it.id)
+                    albumManager.getLastPendingArchive()?.let {
+                        commitPendingArchiveWithFeedback(it.id)
                     }
                 }
             },
@@ -661,13 +930,17 @@ fun TabulaApp(
             },
             // 推荐算法回调 - 使用 RecommendationEngine
             getRecommendedBatch = { images, size ->
-                recommendationEngine.getRecommendedBatch(images, size)
+                recommendationEngine.getRecommendedBatch(
+                    images, size,
+                    identityCandidates = allImages + deletedImages
+                )
             },
             // 推荐模式刷新触发器（切换算法时刷新批次）
             recommendModeRefreshKey = recommendModeRefreshKey,
-            // 从冷却池移除照片的回调（切换算法时移除未浏览的照片）
-            onRemoveFromCooldown = { imageIds ->
-                recommendationEngine.removeFromCooldown(imageIds)
+            // 从冷却池移除照片的回调（切换算法时移除未浏览的照片；
+            // C1/T03-DECKCOOLDOWN：按完整媒体身份键移除）
+            onRemoveFromCooldown = { unviewedImages ->
+                recommendationEngine.removeFromCooldown(unviewedImages)
             },
             // 刷新按钮回调（系统相册集成后，不需要同步，只需刷新）
             onSyncClick = {
@@ -678,8 +951,9 @@ fun TabulaApp(
                         val repository = LocalImageRepository(context)
                         val refreshedData = withContext(Dispatchers.IO) {
                             val loadResult = repository.loadAllData()
-                            albumManager.refreshAlbumsFromSystem(loadResult.systemBuckets)
-                            loadResult
+                            val projected = projectSnapshot(loadResult, deletedImages)
+                            albumManager.refreshAlbumsFromSystem(projected.systemBuckets)
+                            projected
                         }
                         systemBuckets = refreshedData.systemBuckets
                         allImages = refreshedData.allImages
@@ -751,17 +1025,27 @@ fun TabulaApp(
                 currentScreen = AppScreen.OTHER_ALBUMS
             },
             // 原图清理
-            pendingCleanupCount = pendingSourceImageUris.size,
+            pendingCleanupCount = pendingSourceImageUris.size + unverifiedSourceImageCount,
             onCleanupSourceImages = {
                 scope.launch {
                     // 重新获取最新的待清理原图（用户可能又归类了新照片）
                     val cleanableResult = albumManager.getCleanableUrisForAllAlbums()
-                    if (!cleanableResult.isEmpty && cleanableResult.sourceUris.isNotEmpty()) {
-                        pendingSourceImageUris = cleanableResult.sourceUris
+                    pendingSourceImageUris = cleanableResult.sourceUris
+                    unverifiedSourceImageCount = cleanableResult.unverifiedSourceCount
+                    if (cleanableResult.sourceUris.isNotEmpty()) {
+                        dialogSourceImageUris = cleanableResult.sourceUris.toList()
                         showSourceImageDeletionDialog = true
                     } else {
-                        pendingSourceImageUris = emptyList()
-                        Toast.makeText(context, "没有需要清理的原图", Toast.LENGTH_SHORT).show()
+                        showSourceImageDeletionDialog = false
+                        if (cleanableResult.unverifiedSourceCount > 0) {
+                            Toast.makeText(
+                                context,
+                                "副本尚未验证，已保留 ${cleanableResult.unverifiedSourceCount} 张原图",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        } else {
+                            Toast.makeText(context, "没有需要清理的原图", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }
             }
@@ -772,52 +1056,19 @@ fun TabulaApp(
         RecycleBinScreen(
             deletedImages = deletedImages,
             onRestore = { image ->
-                deletedImages = deletedImages.toMutableList().apply { remove(image) }
-                allImages = allImages + image
-                // 恢复图片时也添加回待整理列表（如果不是 Tabula 图集内的照片）
-                // 简单起见，检查 bucketDisplayName 是否不在 albums 列表中
-                // 注意：这只是近似判断，更准确的需要查询 RELATIVE_PATH
-                val isInTabulaAlbum = albums.any { album -> 
-                    album.systemAlbumPath?.trimEnd('/')?.substringAfterLast('/') == image.bucketDisplayName 
-                }
-                if (!isInTabulaAlbum) {
-                    imagesForSorting = imagesForSorting + image
-                }
-                scope.launch {
-                    recycleBinManager.removeFromRecycleBin(image)
-                }
-                Log.d("TabulaApp", "Restored: ${image.displayName}")
+                restoreImagesInOneTransaction(listOf(image))
+            },
+            onRestoreBatch = { images ->
+                restoreImagesInOneTransaction(images)
             },
             onPermanentDelete = { image ->
-                performDelete(image) { success ->
-                    if (success) {
-                        deletedImages = deletedImages.toMutableList().apply { remove(image) }
-                        scope.launch {
-                            recycleBinManager.removeFromRecycleBin(image)
-                        }
-                    }
-                }
+                deleteRecycleBinImages(listOf(image))
             },
             onPermanentDeleteBatch = { images ->
-                performDeleteBatch(images) { success ->
-                    if (success) {
-                        deletedImages = deletedImages.toMutableList().apply { removeAll(images) }
-                        scope.launch {
-                            recycleBinManager.removeAllFromRecycleBin(images)
-                        }
-                    }
-                }
+                deleteRecycleBinImages(images)
             },
             onClearAll = {
-                val imagesToDelete = deletedImages
-                performDeleteBatch(imagesToDelete) { success ->
-                    if (success) {
-                        scope.launch {
-                            recycleBinManager.clearRecycleBin()
-                        }
-                        deletedImages = emptyList()
-                    }
-                }
+                deleteRecycleBinImages(deletedImages)
             },
             onNavigateBack = {
                 currentScreen = AppScreen.DECK
@@ -827,6 +1078,20 @@ fun TabulaApp(
             playMotionSound = playMotionSound,
             motionSoundVolume = motionSoundVolume
         )
+        if (isDeletingRecycleBin || deletePermissionInFlight) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = {},
+                confirmButton = {},
+                title = { Text("正在处理回收站") },
+                text = {
+                    Column {
+                        androidx.compose.material3.CircularProgressIndicator()
+                        Spacer(Modifier.height(16.dp))
+                        Text("请在系统提示中确认删除。取消系统提示可停止后续删除。")
+                    }
+                }
+            )
+        }
     }
 
     val settingsContent: @Composable () -> Unit = {
@@ -873,6 +1138,7 @@ fun TabulaApp(
                 preferences.swipeHapticsEnabled = enabled
             },
             onNavigateToAbout = { currentScreen = AppScreen.ABOUT },
+            onNavigateToSupport = { currentScreen = AppScreen.SUPPORT },
             onNavigateBack = { currentScreen = AppScreen.DECK },
             onNavigateToStatistics = { currentScreen = AppScreen.STATISTICS },
             onRecommendModeChange = { 
@@ -887,7 +1153,6 @@ fun TabulaApp(
             onNavigateToVibrationSound = { currentScreen = AppScreen.VIBRATION_SOUND },
             onNavigateToDisplaySettings = { currentScreen = AppScreen.DISPLAY_SETTINGS },
             onNavigateToLab = { currentScreen = AppScreen.LAB },
-            onNavigateToSupport = { currentScreen = AppScreen.SUPPORT },
             onNavigateToReminderSettings = { currentScreen = AppScreen.REMINDER_SETTINGS },
             excludedAlbumCount = excludedAlbumCount,
             hiddenAlbumCount = hiddenAlbumCount,
@@ -1016,6 +1281,7 @@ fun TabulaApp(
         
         AlbumTagManagementScreen(
             albums = albums,
+            allImages = allImages,
             excludedAlbumIds = excludedIds,
             preferences = preferences,
             onReorderAlbums = { newOrder ->
@@ -1123,7 +1389,20 @@ fun TabulaApp(
             albums = albums,
             allImages = allImages,
             getImagesForAlbum = { albumId -> albumManager.getImageIdsForAlbum(albumId) },
-            getImageMappingsForAlbum = { albumId -> albumManager.getImageMappingsForAlbum(albumId) },
+            getAlbumImages = { albumId ->
+                // C0-DETAIL-EMPTY-RETRY 探针接缝（仅 debug 构建）：强制详情加载失败。
+                if (BuildConfig.DEBUG && preferences.debugForceAlbumLoadFailure) {
+                    throw java.io.IOException("probe: forced album load failure")
+                }
+                val images = albumManager.getAlbumDetailImages(albumId)
+                if (BuildConfig.DEBUG) {
+                    com.tabula.v3.ui.util.DebugAlbumLoadGate.awaitIfArmed(albumId)
+                    // Keep the existing cancellable slow-load probe compatible.
+                    val delayMs = preferences.debugAlbumLoadDelayMs
+                    if (delayMs > 0) kotlinx.coroutines.delay(delayMs)
+                }
+                images
+            },
             onCreateAlbum = { name, color, emoji ->
                 scope.launch {
                     try {
@@ -1138,6 +1417,9 @@ fun TabulaApp(
             },
             onUpdateAlbum = { album ->
                 scope.launch { albumManager.updateAlbum(album) }
+            },
+            onSetCover = { albumName, image ->
+                scope.launch { albumManager.setAlbumCover(albumName, image) }
             },
             onDeleteAlbum = { albumId ->
                 scope.launch { albumManager.deleteAlbum(albumId) }
@@ -1180,39 +1462,37 @@ fun TabulaApp(
             showMotionBadges = showMotionBadges,
             playMotionSound = playMotionSound,
             motionSoundVolume = motionSoundVolume,
-            onMoveToAlbum = { imageIds, targetAlbumId ->
+            onMoveToAlbum = { identityKeys, targetAlbumId ->
                 scope.launch {
                     selectedAlbumId?.let { currentAlbumId ->
-                        albumManager.moveImagesToAlbum(imageIds, currentAlbumId, targetAlbumId)
+                        // C1/T03-MOVECOPY-IDENTITY：完整身份选择键直达消费端，
+                        // AlbumManager 从当前媒体集合按身份重新解析。
+                        val result = albumManager.moveImagesByIdentity(identityKeys, currentAlbumId, targetAlbumId)
+                        val message = if (result.retainedCount > 0) {
+                            "已移动 ${result.movedCount} 张，${result.retainedCount} 张未移动"
+                        } else {
+                            "已移动 ${result.movedCount} 张图片"
+                        }
+                        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                     }
                 }
             },
-            onCopyToAlbum = { imageIds, targetAlbumId ->
+            onCopyToAlbum = { identityKeys, targetAlbumId ->
                 scope.launch {
-                    albumManager.copyImagesToAlbum(imageIds, targetAlbumId)
+                    albumManager.copyImagesByIdentity(identityKeys, targetAlbumId)
                 }
             },
-            onDeleteImages = { imageIds ->
-                // 找到对应的 ImageFile
-                val imagesToDelete = allImages.filter { it.id in imageIds }
+            onDeleteImages = { identityKeys ->
+                // O5③：按完整媒体身份（卷|ID）解析确认行——不同卷的同数值 ID
+                // 只删确认选中的那一行，另一卷同 ID 行不进入删除请求。
+                val imagesToDelete = resolveImagesByIdentitySelection(allImages, identityKeys)
                 if (imagesToDelete.isNotEmpty()) {
                     // 执行永久删除操作
-                    performDeleteBatch(imagesToDelete) { success ->
-                        if (success) {
-                            // 从 allImages 中移除
-                            val deletedIds = imagesToDelete.map { it.id }.toSet()
-                            allImages = allImages.filter { it.id !in deletedIds }
-                            imagesForSorting = imagesForSorting.filter { it.id !in deletedIds }
-                            
-                            // 刷新图集信息（更新 imageCount 等，确保与系统相册同步）
-                            scope.launch {
-                                albumManager.refreshAlbumsFromSystem()
-                            }
-                            
-                            Toast.makeText(context, "已永久删除 ${imagesToDelete.size} 张图片", Toast.LENGTH_SHORT).show()
-                        } else {
-                            Toast.makeText(context, "删除失败", Toast.LENGTH_SHORT).show()
+                    performDeleteBatch(imagesToDelete) { summary ->
+                        if (summary.deleted.isNotEmpty()) {
+                            scope.launch { albumManager.refreshAlbumsFromSystem() }
                         }
+                        Toast.makeText(context, mediaDeletionMessage(summary, "图片"), Toast.LENGTH_LONG).show()
                     }
                 }
             }
@@ -1388,32 +1668,35 @@ fun TabulaApp(
         // ========== 原图删除提醒对话框 ==========
         if (showSourceImageDeletionDialog) {
             SourceImageDeletionDialog(
-                imageCount = pendingSourceImageUris.size,
+                imageCount = dialogSourceImageUris.size,
                 onConfirm = {
+                    // 只允许删除用户在弹窗中确认的候选；新出现的候选留待下次确认。
+                    val confirmedUris = dialogSourceImageUris.toSet()
                     showSourceImageDeletionDialog = false
-                    val urisToDelete = pendingSourceImageUris
-                    pendingSourceImageUris = emptyList()  // 立即清空，隐藏清理按钮
                     scope.launch {
-                        Toast.makeText(context, "正在删除 ${urisToDelete.size} 张原图...", Toast.LENGTH_SHORT).show()
-                        
-                        performDeleteUris(urisToDelete) { deletedUris ->
-                            if (deletedUris.isNotEmpty()) {
-                                scope.launch {
-                                    albumManager.clearDeletedUris(deletedUris)
-                                    allImages = allImages.filter { img -> 
-                                        !deletedUris.contains(img.uri.toString())
-                                    }
-                                    // 同时从待整理列表中移除
-                                    imagesForSorting = imagesForSorting.filter { img ->
-                                        !deletedUris.contains(img.uri.toString())
-                                    }
-                                }
-                                Toast.makeText(context, "已删除 ${deletedUris.size} 张原图", Toast.LENGTH_SHORT).show()
+                        // 仍对候选逐项深度复核，并限制到弹窗确认时的集合。
+                        val cleanableResult = albumManager.getReverifiedCleanableUrisForAllAlbums()
+                        val urisToDelete = cleanableResult.sourceUris.filter { it in confirmedUris }
+                        pendingSourceImageUris = urisToDelete
+                        unverifiedSourceImageCount = cleanableResult.unverifiedSourceCount
+                        if (urisToDelete.isEmpty()) {
+                            if (cleanableResult.unverifiedSourceCount > 0) {
+                                Toast.makeText(
+                                    context,
+                                    "副本尚未验证，已保留 ${cleanableResult.unverifiedSourceCount} 张原图",
+                                    Toast.LENGTH_LONG
+                                ).show()
                             } else {
-                                // 删除失败或取消，恢复待清理列表
-                                pendingSourceImageUris = urisToDelete
-                                Toast.makeText(context, "删除失败或已取消", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "没有需要清理的原图", Toast.LENGTH_SHORT).show()
                             }
+                            return@launch
+                        }
+
+                        pendingSourceImageUris = urisToDelete
+                        Toast.makeText(context, "正在删除 ${urisToDelete.size} 张原图...", Toast.LENGTH_SHORT).show()
+                        performDeleteUris(urisToDelete) { summary ->
+                            pendingSourceImageUris = urisToDelete.filter { it in summary.remaining }
+                            Toast.makeText(context, mediaDeletionMessage(summary, "原图"), Toast.LENGTH_LONG).show()
                         }
                     }
                 },
@@ -1491,7 +1774,7 @@ private fun SourceImageDeletionDialog(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "已确认照片成功复制，删除是安全的。",
+                            text = "只会删除已确认存在副本的原图；副本未验证的原图会保留。",
                             color = textColor.copy(alpha = 0.8f),
                             style = MaterialTheme.typography.bodySmall
                         )

@@ -501,7 +501,7 @@ fun AboutScreen(
                         Spacer(modifier = Modifier.height(12.dp))
 
                         Text(
-                            text = "Tabula 完全在本地运行，不会收集、上传或共享您的任何照片和数据。您的隐私是我们的首要关注。",
+                            text = "照片整理在本地进行，Tabula 不会自行上传您的照片。只有在您主动分享并选择接收应用时，才会将选中的照片交给该应用。",
                             style = MaterialTheme.typography.bodyMedium,
                             color = secondaryTextColor,
                             lineHeight = 22.sp

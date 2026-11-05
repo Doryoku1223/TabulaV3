@@ -61,8 +61,10 @@ import coil.request.CachePolicy
 import coil.request.ImageRequest
 import coil.size.Precision
 import com.tabula.v3.data.model.ImageFile
+import com.tabula.v3.data.repository.mediaIdentityKey
 import com.tabula.v3.di.CoilSetup
 import com.tabula.v3.ui.util.findActivity
+import com.tabula.v3.ui.util.gridThumbnailCacheKey
 import com.tabula.v3.ui.util.rememberImageFeatures
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -283,7 +285,9 @@ fun SwipeableViewerOverlay(
                 .size(displayWidthDp, displayHeightDp)
                 .clip(RoundedCornerShape(displayCornerRadius.dp)),
             userScrollEnabled = !isMultiTouchActive && currentPageZoom <= 1.05f,
-            key = { images.getOrNull(it)?.id ?: it },
+            // O5③：Pager key 用完整媒体身份键——列表含不同卷同数值 ID 行时
+            // 不再重复 key 崩溃（与回收站查看器同修法）。
+            key = { images.getOrNull(it)?.mediaIdentityKey() ?: it.toString() },
             // 添加 flingBehavior 确保滑动后对齐到页面，防止卡在两图之间
             flingBehavior = PagerDefaults.flingBehavior(
                 state = pagerState,
@@ -409,7 +413,11 @@ private fun SwipeableImagePage(
     // 高清图加载状态
     var shouldLoadUltraHd by remember { mutableStateOf(false) }
     
-    val thumbnailCacheKey = remember(image.id) { "album_grid_${image.id}" }
+    // 缩略图缓存键（C1/T03-THUMBKEY）：与网格共用 grid_ 命名空间——身份 +
+    // 内容版本，跨卷同 ID 不串图、编辑后重载；首开温命中网格缩略图。
+    val thumbnailCacheKey = remember(image.id, image.dateModified) {
+        gridThumbnailCacheKey("grid_", image)
+    }
 
     LaunchedEffect(currentScale) {
         if (currentScale > 1.5f && !shouldLoadUltraHd) {

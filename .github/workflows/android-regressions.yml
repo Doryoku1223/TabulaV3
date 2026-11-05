@@ -1,0 +1,137 @@
+name: Android correctness regressions
+
+on:
+  push:
+    branches: [master, 'upstream/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: android-regressions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - name: Install build SDK
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;35.0.0"'
+      - name: Run full unit regressions and build release and device-test APKs
+        run: bash ./gradlew --no-daemon --stacktrace :app:testReleaseUnitTest :app:assembleRelease :app:assembleDebug :app:assembleDebugAndroidTest
+      - name: Verify release identity and shrinking
+        run: |
+          APK=app/build/outputs/apk/release/app-release-unsigned.apk
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" > badging.txt
+          grep -F "package: name='com.tabula.v3'" badging.txt
+          test -s app/build/outputs/mapping/release/mapping.txt
+          mkdir -p artifacts device-apks
+          cp "$APK" artifacts/Tabula-regressions-unsigned.apk
+          cp badging.txt artifacts/
+          sha256sum "$APK" > artifacts/SHA256SUMS.txt
+          cp app/build/outputs/apk/debug/app-debug.apk device-apks/
+          cp app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk device-apks/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: Tabula-regressions-build
+          path: |
+            artifacts/
+            app/build/test-results/testReleaseUnitTest/
+            app/build/reports/tests/testReleaseUnitTest/
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Tabula-regressions-device-apks
+          path: device-apks/
+
+  device:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - api: 36
+            sdk: '36'
+            ram: 2048M
+          - api: 37
+            sdk: '37.0'
+            ram: 4096M
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      API_LEVEL: ${{ matrix.api }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: Tabula-regressions-device-apks
+          path: device-apks/
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Prepare command-line tools and verified AVD
+        if: matrix.api == 37
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p device-results
+          evidence=device-results/avd-preflight.txt
+          java -version > "$evidence" 2>&1 || true
+          sdk="$ANDROID_HOME"
+          "$sdk/cmdline-tools/latest/bin/sdkmanager" --install 'cmdline-tools;22.0'
+          tools="$sdk/cmdline-tools/22.0"
+          "$tools/bin/sdkmanager" --version >> "$evidence" 2>&1 || true
+          cat "$tools/source.properties" >> "$evidence"
+          grep -Eq '^Pkg.Revision[[:space:]]*=[[:space:]]*22\.0([[:space:]]|$)' "$tools/source.properties"
+          tools_root="$(readlink -f "$sdk/cmdline-tools")"
+          latest_resolved="$(readlink -f "$sdk/cmdline-tools/latest")"
+          case "$latest_resolved" in "$tools_root"/*) ;; *) echo "latest resolves outside cmdline-tools" >&2; exit 1 ;; esac
+          backup="$RUNNER_TEMP/tabula-original-cmdline-tools-latest"
+          test ! -e "$backup" && test ! -L "$backup"
+          mv "$sdk/cmdline-tools/latest" "$backup"
+          ln -s 22.0 "$sdk/cmdline-tools/latest"
+          export PATH="$sdk/cmdline-tools/latest/bin:$PATH"
+          test "$(readlink -f "$(command -v avdmanager)")" = "$(readlink -f "$tools/bin/avdmanager")"
+          "$tools/bin/sdkmanager" --install "system-images;android-${{ matrix.sdk }};google_apis;x86_64"
+          mkdir -p "$HOME/.android/avd"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          echo no | "$tools/bin/avdmanager" create avd --force -n test --package "system-images;android-${{ matrix.sdk }};google_apis;x86_64" --device pixel_6
+          grep -E '^(target|path)[[:space:]]*=' "$ANDROID_AVD_HOME/test.ini" >> "$evidence" || true
+          grep -Eq '^target[[:space:]]*=[[:space:]]*android-37\.0[[:space:]]*$' "$ANDROID_AVD_HOME/test.ini"
+      - name: Exercise actual MediaStore and old pending records
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: ${{ matrix.sdk }}
+          force-avd-creation: ${{ matrix.api != 37 }}
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: ${{ matrix.ram }}
+          disk-size: 8G
+          emulator-options: -no-window -gpu swiftshader -no-snapshot -noaudio -no-boot-anim -no-metrics
+          disable-animations: true
+          script: python tools/run-volume-device-probe.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: Tabula-regressions-API${{ matrix.api }}
+          path: device-results/
+          if-no-files-found: warn

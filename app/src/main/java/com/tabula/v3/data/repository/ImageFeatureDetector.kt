@@ -46,13 +46,21 @@ object ImageFeatureDetector {
         checkHdr: Boolean,
         checkMotion: Boolean
     ): ImageFeatures = withContext(Dispatchers.IO) {
+        // T11a：快速模式门槛、信号量繁忙或异常产生的阴性不可信（definitive=false）。
+        var definitive = true
+        val onInconclusive = { definitive = false }
         val xmp = if (checkHdr || checkMotion) readXmp(context, uri) else null
-        val isHdr = if (checkHdr) detectHdr(context, uri, xmp) else false
-        val motionInfo = if (checkMotion) detectMotionPhoto(context, uri, xmp) else null
-        ImageFeatures(isHdr = isHdr, motionPhotoInfo = motionInfo)
+        val isHdr = if (checkHdr) detectHdr(context, uri, xmp, onInconclusive) else false
+        val motionInfo = if (checkMotion) detectMotionPhoto(context, uri, xmp, onInconclusive) else null
+        ImageFeatures(isHdr = isHdr, motionPhotoInfo = motionInfo, definitive = definitive)
     }
 
-    private fun detectHdr(context: Context, uri: Uri, xmp: String?): Boolean {
+    private fun detectHdr(
+        context: Context,
+        uri: Uri,
+        xmp: String?,
+        onInconclusive: () -> Unit
+    ): Boolean {
         val resolver = context.contentResolver
         
         // 第一步：查询 MediaStore HDR 标志（最快，零成本）
@@ -70,15 +78,17 @@ object ImageFeatureDetector {
             return true
         }
         
-        // 快速模式下跳过重量级检测
+        // 快速模式下跳过重量级检测：阴性不可信（T11a）
         if (fastModeEnabled) {
+            onInconclusive()
             return false
         }
         
         // 第四步：使用 ImageDecoder 检测 gainmap（重量级，需要解码图片）
         // 使用信号量限制并发数量
         if (!heavyDetectionSemaphore.tryAcquire()) {
-            // 无法获取许可，跳过重量级检测
+            // 无法获取许可：阴性不可信（T11a）
+            onInconclusive()
             return false
         }
 
@@ -109,19 +119,26 @@ object ImageFeatureDetector {
                     bitmap.recycle()  // 立即回收
                 } catch (e: Exception) {
                     Log.w(TAG, "Gainmap detect failed: ${e.message}")
+                    onInconclusive()
                 }
             }
             
             hdrColorSpace || hasGainmap
         } catch (e: Exception) {
             Log.w(TAG, "HDR detect failed: ${e.message}")
+            onInconclusive()
             false
         } finally {
             heavyDetectionSemaphore.release()
         }
     }
 
-    private fun detectMotionPhoto(context: Context, uri: Uri, xmp: String?): MotionPhotoInfo? {
+    private fun detectMotionPhoto(
+        context: Context,
+        uri: Uri,
+        xmp: String?,
+        onInconclusive: () -> Unit
+    ): MotionPhotoInfo? {
         return try {
             val fileLength = queryContentLength(context.contentResolver, uri) ?: return null
             
@@ -163,6 +180,7 @@ object ImageFeatureDetector {
             detectVideoByFileScan(context, uri, fileLength)
         } catch (e: Exception) {
             Log.w(TAG, "Motion photo detect failed: ${e.message}")
+            onInconclusive()
             null
         }
     }

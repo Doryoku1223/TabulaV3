@@ -11,6 +11,13 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Share
+import com.tabula.v3.ui.util.rememberPhotoShareAction
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
@@ -41,11 +48,12 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import coil.compose.AsyncImagePainter
-import coil.request.CachePolicy
 import coil.request.ImageRequest
 import coil.size.Precision
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.di.CoilSetup
+import com.tabula.v3.ui.util.deckViewerThumbnailRequest
+import com.tabula.v3.ui.util.viewerHdRequest
 import com.tabula.v3.ui.util.findActivity
 import com.tabula.v3.ui.util.rememberImageFeatures
 import kotlinx.coroutines.delay
@@ -104,6 +112,7 @@ fun ViewerOverlay(
     // 源位置信息 - 使用remember保存初始值，确保退出动画时使用正确的位置
     val initialSourceRect = remember { viewerState.sourceRect }
     val image = viewerState.image
+    val sharePhoto = rememberPhotoShareAction()
     
     // 检查源位置是否有效（宽高大于0）
     val isSourceValid = initialSourceRect.width > 0f && initialSourceRect.height > 0f
@@ -142,9 +151,9 @@ fun ViewerOverlay(
     var isUltraHdLoaded by remember { mutableStateOf(false) }
     var shouldLoadUltraHd by remember { mutableStateOf(false) }
     
-    // 缩略图缓存键（与网格一致，确保立即显示）
-    val thumbnailCacheKey = remember(image.id) { "album_grid_${image.id}" }
-    val sysThumbnailCacheKey = remember(image.id) { "sys_grid_${image.id}" }
+    // 底层缩略图请求：C3/T06-VIEWERKEY——构造统一走 deckViewerThumbnailRequest
+    //（ui.util）：键与 deck 卡片位图一致（卷限定 URI+DATE_MODIFIED，跨卷同
+    // ID 不串图、编辑后自然失效），内存只读借用卡片位图温命中、不回写挤占。
 
     // 计算目标位置（居中显示，保持原比例）
     // 使用 actualWidth/actualHeight 考虑 EXIF 旋转，确保收缩动画位置正确
@@ -521,20 +530,9 @@ fun ViewerOverlay(
             contentAlignment = Alignment.Center
         ) {
             // 底层：缩略图（立即可见，避免黑屏）
-            // 使用与网格相同的缓存键，确保从内存缓存立即加载
+            // 请求构造统一走 deckViewerThumbnailRequest（ui.util）
             AsyncImage(
-                model = ImageRequest.Builder(context)
-                    .data(image.uri)
-                    .size(coil.size.Size(240, 240))
-                    .precision(Precision.INEXACT)
-                    .bitmapConfig(Bitmap.Config.RGB_565)
-                    .memoryCacheKey(thumbnailCacheKey)
-                    .diskCacheKey(thumbnailCacheKey)
-                    .memoryCachePolicy(CachePolicy.ENABLED)
-                    .diskCachePolicy(CachePolicy.ENABLED)
-                    .crossfade(false)
-                    .allowHardware(false)
-                    .build(),
+                model = deckViewerThumbnailRequest(context, image),
                 contentDescription = null,
                 imageLoader = imageLoader,
                 contentScale = ContentScale.Fit,
@@ -560,13 +558,7 @@ fun ViewerOverlay(
             // 否则 TextureView 会覆盖底层的 HDR 图片，导致 HDR 效果消失
             Box(modifier = Modifier.fillMaxSize()) {
                 AsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(image.uri)
-                        .size(hdTargetSize)
-                        .precision(Precision.INEXACT)
-                        .crossfade(200)
-                        .bitmapConfig(Bitmap.Config.ARGB_8888)
-                        .build(),
+                    model = viewerHdRequest(context, image, hdTargetSize),
                     contentDescription = image.displayName,
                     imageLoader = imageLoader,
                     contentScale = ContentScale.Fit,
@@ -593,6 +585,16 @@ fun ViewerOverlay(
                     )
                 }
             }
+        }
+        IconButton(
+            onClick = { sharePhoto(image) },
+            enabled = !isExiting && !animProgress.isRunning,
+            modifier = Modifier.align(Alignment.TopEnd)
+                .statusBarsPadding().padding(12.dp)
+                .size(48.dp).clip(RoundedCornerShape(12.dp))
+                .background(Color(0xFF2C2C2E))
+        ) {
+            Icon(Icons.Outlined.Share, contentDescription = "分享当前照片", tint = Color.White)
         }
     }
 }

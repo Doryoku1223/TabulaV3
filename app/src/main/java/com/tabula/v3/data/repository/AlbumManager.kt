@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.util.Log
 import com.tabula.v3.data.model.Album
+import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.data.model.AlbumActionType
 import com.tabula.v3.data.model.AlbumMapping
 import com.tabula.v3.data.model.PendingAlbumAction
@@ -132,15 +133,22 @@ class AlbumManager(private val context: Context) {
         val order: Int = 0,
         val createdAt: Long = System.currentTimeMillis(),
         val isHidden: Boolean = false,  // 是否隐藏此图集
-        val isExcludedFromRecommend: Boolean = false  // 是否从推荐中排除（屏蔽图集）
+        val isExcludedFromRecommend: Boolean = false,  // 是否从推荐中排除（屏蔽图集）
+        // C1/T03-COVER：用户设置的封面完整媒体身份（卷+数值 ID）。
+        // coverVolumeName=null 为旧口径（卷未知，展示端唯一解析/歧义回退）。
+        val coverImageId: Long? = null,
+        val coverVolumeName: String? = null
     )
 
     // ========== 系统相册同步管理器 ==========
-    
+
     private val syncManager: SystemAlbumSyncManager by lazy {
         SystemAlbumSyncManager.getInstance(context)
     }
-    
+
+    /** source→verified destination 证据账本；internal 以便测试注入故障存储。 */
+    internal var copyEvidenceStore: CopyEvidenceStore = CopyEvidenceStore(context)
+
     private val imageRepository: LocalImageRepository by lazy {
         LocalImageRepository(context)
     }
@@ -207,20 +215,54 @@ class AlbumManager(private val context: Context) {
      * 更新相册元数据（颜色等）
      */
     suspend fun updateAlbum(album: Album) = withContext(Dispatchers.IO) {
-        // 更新元数据
+        // 更新元数据。C1/T03-COVER 复验轮四：名称/颜色等属性编辑**不得**把
+        // 显示态的桶默认封面持久化为用户封面（否则自动封面被冻结）——封面
+        // 字段保留元数据中已持久化的用户设置（无则继续走桶默认）。
+        // 显式设置封面走 setAlbumCover。
         val currentMetadata = loadMetadata()
+        val existing = currentMetadata[album.name]
         val metadata = AlbumMetadata(
             name = album.name,
             color = album.color,
             textColor = album.textColor,
             order = album.order,
-            createdAt = album.createdAt
+            createdAt = album.createdAt,
+            isHidden = existing?.isHidden ?: false,
+            isExcludedFromRecommend = existing?.isExcludedFromRecommend ?: false,
+            coverImageId = existing?.coverImageId,
+            coverVolumeName = existing?.coverVolumeName
         )
         val updatedMetadata = currentMetadata + (album.name to metadata)
         saveMetadata(updatedMetadata)
         _metadata.value = updatedMetadata
-        
+
         // 刷新图集列表
+        refreshAlbumsFromSystem()
+    }
+
+    /**
+     * 显式设置图集封面（C1/T03-COVER 复验轮四）：完整媒体身份（卷+ID）随
+     * 元数据持久化，其余属性保留既有值；刷新后用户封面优先于桶默认封面，
+     * 重启/刷新均保持。升级前无此通道（设置即被桶默认覆盖，从不生效）。
+     */
+    suspend fun setAlbumCover(albumName: String, image: ImageFile) = withContext(Dispatchers.IO) {
+        val currentMetadata = loadMetadata()
+        val existing = currentMetadata[albumName]
+        val metadata = AlbumMetadata(
+            name = albumName,
+            color = existing?.color,
+            textColor = existing?.textColor,
+            order = existing?.order ?: Int.MAX_VALUE,
+            createdAt = existing?.createdAt ?: System.currentTimeMillis(),
+            isHidden = existing?.isHidden ?: false,
+            isExcludedFromRecommend = existing?.isExcludedFromRecommend ?: false,
+            coverImageId = image.id,
+            coverVolumeName = image.volumeName
+        )
+        saveMetadata(currentMetadata + (albumName to metadata))
+        _metadata.value = currentMetadata + (albumName to metadata)
+
+        // 刷新图集列表（用户封面优先于桶默认封面）
         refreshAlbumsFromSystem()
     }
 
@@ -532,11 +574,11 @@ class AlbumManager(private val context: Context) {
     }
 
     /**
-     * 获取相册内的所有图片映射信息（从系统相册读取）
+     * 获取相册详情的完整图片列表（T05：详情直接消费仓库的完整 ImageFile，
+     * 不再把查询结果压平成 (id, uri) 映射导致屏幕层逐 URI N+1 补读）。
      */
-    suspend fun getImageMappingsForAlbum(albumId: String): List<Pair<Long, String>> = withContext(Dispatchers.IO) {
-        val images = imageRepository.getImagesByBucket(albumId)
-        images.map { Pair(it.id, it.uri.toString()) }
+    suspend fun getAlbumDetailImages(albumId: String): List<ImageFile> = withContext(Dispatchers.IO) {
+        imageRepository.getImagesByBucket(albumId)
     }
 
     /**
@@ -558,26 +600,80 @@ class AlbumManager(private val context: Context) {
         imageIds.mapNotNull { imageMap[it]?.uri }
     }
 
+    // ========== 移动/复制图片到其他图集（系统相册集成版） ==========
+
     /**
-     * 检查 URI 是否仍然有效
+     * 按完整媒体身份（卷|ID 选择键）批量移动到另一个图集。
+     *
+     * C1/T03-MOVECOPY-IDENTITY：执行前按完整身份从当前媒体集合重新解析；
+     * 所选身份已失效（行已不在库中）时跳过计数，绝不回退到同数值 ID 的
+     * 另一卷照片。图集目标仍按名称定位（按名合并是显式产品语义）。
      */
-    private fun isUriValid(uri: Uri, contentResolver: android.content.ContentResolver): Boolean {
-        return try {
-            contentResolver.query(
-                uri,
-                arrayOf(android.provider.MediaStore.Images.Media._ID),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-                cursor.moveToFirst()
-            } ?: false
-        } catch (e: Exception) {
-            false
+    suspend fun moveImagesByIdentity(
+        selectedIdentityKeys: Collection<String>,
+        fromAlbumId: String,
+        toAlbumId: String
+    ): MoveImagesResult = withContext(Dispatchers.IO) {
+        if (selectedIdentityKeys.isEmpty()) return@withContext MoveImagesResult(0, 0)
+
+        val targetBucket = _albums.value.find { it.name == toAlbumId }
+        val targetPath = targetBucket?.systemAlbumPath
+
+        Log.d(TAG, "Moving ${selectedIdentityKeys.size} identity-selected images from $fromAlbumId to $toAlbumId")
+
+        // C1/T03-MOVECOPY-IDENTITY：执行前按完整媒体身份从当前媒体集合重新
+        // 解析确认行——只操作身份键精确匹配的行；选择已失效（行已不在库中）
+        // 跳过计数，绝不回退到同数值 ID 的另一卷照片。
+        val keySet = selectedIdentityKeys.toSet()
+        val resolvedRows = imageRepository.getAllImages().filter { it.mediaIdentityKey() in keySet }
+
+        var movedCount = 0
+        // Includes failed moves, stale selections and missing rows; this count does not
+        // assert their URIs remain readable.
+        var retainedCount = selectedIdentityKeys.size - resolvedRows.size
+        for (image in resolvedRows) {
+            if (syncManager.moveImageToBucket(image.uri, toAlbumId, targetPath) != null) {
+                movedCount++
+            } else {
+                retainedCount++
+            }
         }
+
+        if (movedCount > 0) {
+            // 只在有成功移动时刷新图集列表，失败项仍保留在原图集中。
+            refreshAlbumsFromSystem()
+        }
+
+        Log.d(TAG, "Moved $movedCount identity-selected images to $toAlbumId; retained $retainedCount at source")
+        MoveImagesResult(movedCount = movedCount, retainedCount = retainedCount)
     }
 
-    // ========== 移动/复制图片到其他图集（系统相册集成版） ==========
+    /**
+     * 按完整媒体身份（卷|ID 选择键）批量复制到另一个图集。
+     * 语义同 moveImagesByIdentity：当前媒体集合按完整身份重新解析，
+     * 失效选择跳过、不回退同数值 ID 的另一卷。
+     */
+    suspend fun copyImagesByIdentity(
+        selectedIdentityKeys: Collection<String>,
+        toAlbumId: String
+    ) = withContext(Dispatchers.IO) {
+        if (selectedIdentityKeys.isEmpty()) return@withContext
+
+        Log.d(TAG, "Copying ${selectedIdentityKeys.size} identity-selected images to $toAlbumId")
+
+        // C1/T03-MOVECOPY-IDENTITY：与移动同口径——按完整身份解析确认行，
+        // 每行复制各自的卷限定源；失效选择跳过，不回退同数值 ID 的另一卷。
+        val keySet = selectedIdentityKeys.toSet()
+        val resolvedRows = imageRepository.getAllImages().filter { it.mediaIdentityKey() in keySet }
+        for (image in resolvedRows) {
+            syncManager.addImageToSystemAlbum(image.uri, toAlbumId)
+        }
+
+        // 刷新图集列表
+        refreshAlbumsFromSystem()
+
+        Log.d(TAG, "Copied ${resolvedRows.size}/${selectedIdentityKeys.size} identity-selected images to $toAlbumId")
+    }
 
     /**
      * 批量将图片移动到另一个图集
@@ -586,8 +682,8 @@ class AlbumManager(private val context: Context) {
         imageIds: List<Long>,
         fromAlbumId: String,
         toAlbumId: String
-    ) = withContext(Dispatchers.IO) {
-        if (imageIds.isEmpty()) return@withContext
+    ): MoveImagesResult = withContext(Dispatchers.IO) {
+        if (imageIds.isEmpty()) return@withContext MoveImagesResult(0, 0)
         
         val targetBucket = _albums.value.find { it.name == toAlbumId }
         val targetPath = targetBucket?.systemAlbumPath
@@ -595,15 +691,30 @@ class AlbumManager(private val context: Context) {
         Log.d(TAG, "Moving ${imageIds.size} images from $fromAlbumId to $toAlbumId")
         
         val images = imageRepository.getAllImages()
+        var movedCount = 0
+        // Includes failed moves and missing IDs; this count does not assert their URIs remain readable.
+        var retainedCount = 0
         for (imageId in imageIds) {
-            val image = images.find { it.id == imageId } ?: continue
-            syncManager.moveImageToBucket(image.uri, toAlbumId, targetPath)
+            val image = images.find { it.id == imageId }
+            if (image == null) {
+                retainedCount++
+                continue
+            }
+
+            if (syncManager.moveImageToBucket(image.uri, toAlbumId, targetPath) != null) {
+                movedCount++
+            } else {
+                retainedCount++
+            }
         }
         
-        // 刷新图集列表
-        refreshAlbumsFromSystem()
+        if (movedCount > 0) {
+            // 只在有成功移动时刷新图集列表，失败项仍保留在原图集中。
+            refreshAlbumsFromSystem()
+        }
         
-        Log.d(TAG, "Moved ${imageIds.size} images to $toAlbumId")
+        Log.d(TAG, "Moved $movedCount images to $toAlbumId; retained $retainedCount at source")
+        MoveImagesResult(movedCount = movedCount, retainedCount = retainedCount)
     }
 
     /**
@@ -643,19 +754,29 @@ class AlbumManager(private val context: Context) {
     ) = withContext(Dispatchers.IO) {
         try {
             // 1. 从系统相册获取所有 bucket（优先使用预加载数据，避免重复查询）
-            val systemBuckets = preloadedBuckets ?: imageRepository.getAllBucketsWithInfo()
+            // T03：bucket 层身份为 (卷, 路径)；Album 消费者簇未迁移前在此显式按显示名合并。
+            val systemBuckets = mergeBucketsByName(preloadedBuckets ?: imageRepository.getAllBucketsWithInfo())
             val systemBucketNames = systemBuckets.map { it.name }.toSet()
             
             // 2. 加载本地元数据
             val metadata = loadMetadata()
             
             // 3. 从系统 bucket 创建 Album 列表
+            // C1/T03-COVER：封面身份来源优先级 = 用户设置（metadata 持久化，
+            // 卷+ID）> 桶默认封面（该卷最新照片，卷随桶携带）。旧口径（metadata
+            // 无封面字段）行为与升级前一致。
             val albumsFromSystem = systemBuckets.map { bucket ->
                 val meta = metadata[bucket.name]
+                val userCover = meta?.coverImageId
                 Album(
                     id = bucket.name,  // 使用 bucket 名称作为 ID
                     name = bucket.name,
-                    coverImageId = bucket.coverImageId,
+                    coverImageId = userCover ?: bucket.coverImageId,
+                    coverVolumeName = if (userCover != null) {
+                        meta.coverVolumeName
+                    } else {
+                        bucket.volumeName
+                    },
                     color = meta?.color,
                     textColor = meta?.textColor,
                     order = meta?.order ?: Int.MAX_VALUE,  // 无元数据的排在最后
@@ -936,7 +1057,12 @@ class AlbumManager(private val context: Context) {
                     order = obj.optInt("order", Int.MAX_VALUE),
                     createdAt = obj.optLong("createdAt", System.currentTimeMillis()),
                     isHidden = obj.optBoolean("isHidden", false),
-                    isExcludedFromRecommend = obj.optBoolean("isExcludedFromRecommend", false)
+                    isExcludedFromRecommend = obj.optBoolean("isExcludedFromRecommend", false),
+                    // C1/T03-COVER：旧 JSON 无封面字段 → opt 兜底 null（升级
+                    // 前行为=桶默认封面，兼容）；卷缺失为旧口径（展示端唯一
+                    // 解析/歧义回退）。
+                    coverImageId = obj.optLong("coverImageId", -1).takeIf { it != -1L },
+                    coverVolumeName = obj.optString("coverVolumeName", "").takeIf { it.isNotEmpty() }
                 )
             }
 
@@ -959,6 +1085,9 @@ class AlbumManager(private val context: Context) {
                     put("createdAt", meta.createdAt)
                     put("isHidden", meta.isHidden)
                     put("isExcludedFromRecommend", meta.isExcludedFromRecommend)
+                    // C1/T03-COVER：封面完整媒体身份持久化（-1/空串 = 无封面）。
+                    put("coverImageId", meta.coverImageId ?: -1)
+                    put("coverVolumeName", meta.coverVolumeName ?: "")
                 }
                 jsonArray.put(obj)
             }
@@ -986,46 +1115,76 @@ class AlbumManager(private val context: Context) {
     }
 
     /**
-     * 获取所有图集的待清理原图
-     * 
-     * 原图是指归类时被复制的源文件，清理后可释放空间
+     * 获取所有图集的待清理原图。
+     *
+     * 候选 = 账本中存在 source→verified destination 证据、且目标当前仍存在且与源
+     * 身份独立的源。旧记录（source_images.json）没有证据，一律按未验证保留，
+     * 不列为候选；最终删除前还有逐字节深度复核（见 getReverifiedCleanableUris*）。
      */
     suspend fun getCleanableUrisForAllAlbums(): CleanableUrisResult = withContext(Dispatchers.IO) {
-        val sourceUris = getAllSourceImages()
-        // 验证 URI 是否仍然有效（文件是否存在）
-        val validUris = sourceUris.filter { isUriValid(it, context.contentResolver) }
-        
-        CleanableUrisResult(
-            sourceUris = validUris,
+        computeCleanableUris(getAllSourceImages())
+    }
+
+    /**
+     * 获取指定图集的待清理原图（口径同 [getCleanableUrisForAllAlbums]）。
+     */
+    suspend fun getCleanableUrisForAlbum(albumId: String): CleanableUrisResult = withContext(Dispatchers.IO) {
+        computeCleanableUris(getSourceImagesForAlbum(albumId))
+    }
+
+    private suspend fun computeCleanableUris(sources: List<Uri>): CleanableUrisResult {
+        val ledger = copyEvidenceStore.loadAll()
+        val cleanable = mutableListOf<Uri>()
+        for (sourceUri in sources) {
+            val entry = ledger[sourceUri.toString()] ?: continue
+            if (syncManager.isIndependentExistingCopy(sourceUri, Uri.parse(entry.destinationUri))) {
+                cleanable.add(sourceUri)
+            }
+        }
+        return CleanableUrisResult(
+            sourceUris = cleanable,
             orphanUris = emptyList(),
-            sourceTotalCount = sourceUris.size,
+            sourceTotalCount = sources.size,
             orphanTotalCount = 0
         )
     }
 
     /**
-     * 获取指定图集的待清理原图
+     * 清理确认时刻使用：对账本候选逐项做全文深度复核（源/目标 SHA-256 一致且身份独立）。
+     * 复核不过的源落回"未验证"，绝不进入删除集合。
      */
-    suspend fun getCleanableUrisForAlbum(albumId: String): CleanableUrisResult = withContext(Dispatchers.IO) {
-        val sourceUris = getSourceImagesForAlbum(albumId)
-        // 验证 URI 是否仍然有效
-        val validUris = sourceUris.filter { isUriValid(it, context.contentResolver) }
-        
+    suspend fun getReverifiedCleanableUrisForAllAlbums(): CleanableUrisResult = withContext(Dispatchers.IO) {
+        val sources = getAllSourceImages()
+        val ledger = copyEvidenceStore.loadAll()
+        val cleanable = mutableListOf<Uri>()
+        for (sourceUri in sources) {
+            val entry = ledger[sourceUri.toString()] ?: continue
+            val destination = try {
+                Uri.parse(entry.destinationUri)
+            } catch (e: Exception) {
+                Log.w(TAG, "Ledger destination unparsable for $sourceUri", e)
+                continue
+            }
+            if (syncManager.verifyCopyIntegrity(sourceUri, destination)) {
+                cleanable.add(sourceUri)
+            }
+        }
         CleanableUrisResult(
-            sourceUris = validUris,
+            sourceUris = cleanable,
             orphanUris = emptyList(),
-            sourceTotalCount = sourceUris.size,
+            sourceTotalCount = sources.size,
             orphanTotalCount = 0
         )
     }
 
     /**
      * 清除已删除的原图记录
-     * 
-     * 当用户清理原图后调用，从追踪列表中移除已删除的 URI
+     *
+     * 当用户清理原图后调用，从追踪列表与证据账本中移除已删除的 URI
      */
     suspend fun clearDeletedUris(deletedUris: Set<String>) = withContext(Dispatchers.IO) {
         clearSourceImageRecords(deletedUris = deletedUris)
+        copyEvidenceStore.removeAll(deletedUris)
     }
 
     // ========== 数据类（保持兼容性） ==========
@@ -1058,7 +1217,13 @@ class AlbumManager(private val context: Context) {
         val allUris: List<Uri> get() = sourceUris + orphanUris
         val isEmpty: Boolean get() = sourceUris.isEmpty() && orphanUris.isEmpty()
         val totalValidCount: Int get() = sourceUris.size + orphanUris.size
+        val unverifiedSourceCount: Int get() = (sourceTotalCount - sourceUris.size).coerceAtLeast(0)
     }
+
+    data class MoveImagesResult(
+        val movedCount: Int,
+        val retainedCount: Int
+    )
 
     // ========== 延迟执行归档功能（撤销核心） ==========
 
@@ -1110,45 +1275,71 @@ class AlbumManager(private val context: Context) {
     }
 
     /**
+     * 归档提交结果。
+     * COMMITTED：复制成功（可能附证据写入失败，源按未验证保留）；
+     * COPY_FAILED：已领取但复制失败，未产生任何记录；
+     * NOT_CLAIMED：action 已被提交/撤销过，属于良性重复调用，无副作用。
+     */
+    enum class ArchiveCommitOutcome { COMMITTED, COPY_FAILED, NOT_CLAIMED }
+
+    /**
      * 提交待归档操作，执行真正的复制
-     * 
+     *
      * Snackbar 超时消失时调用，表示用户确认了归档操作。
      * 此时才执行真正的图片复制。
-     * 
+     *
+     * 原子领取：同一 action 的并发/重复提交至多产生一次复制副作用。
+     *
      * @param actionId 要提交的操作 ID
-     * @return 是否成功执行
      */
-    suspend fun commitPendingArchive(actionId: String): Boolean = withContext(Dispatchers.IO) {
-        val action = pendingArchiveQueue.find { it.id == actionId }
+    suspend fun commitPendingArchive(actionId: String): ArchiveCommitOutcome = withContext(Dispatchers.IO) {
+        val action = claimPendingArchive(actionId)
         if (action == null) {
-            Log.w(TAG, "Pending archive not found: $actionId (might have been cancelled)")
-            return@withContext false
+            Log.w(TAG, "Pending archive not claimed: $actionId (might have been committed or cancelled)")
+            return@withContext ArchiveCommitOutcome.NOT_CLAIMED
         }
-        
-        // 从队列中移除
-        pendingArchiveQueue.remove(action)
-        
-        // 执行真正的复制
+
         Log.d(TAG, "Committing archive: imageId=${action.imageId} -> album='${action.albumName}'")
-        
+
         val uri = Uri.parse(action.imageUri)
-        val newUri = syncManager.addImageToSystemAlbum(uri, action.albumId)
-        
-        if (newUri != null) {
-            Log.d(TAG, "Successfully copied image to ${action.albumName}, newUri: $newUri")
-            
-            // 记录原图位置，用于后续清理
-            addSourceImageRecord(action.albumId, action.imageUri)
-            
-            // 记录使用频率（用于智能排序）
-            usageTracker.recordUsage(action.albumId)
-            
-            // 刷新图集列表以更新图片数量
-            refreshAlbumsFromSystem()
-            return@withContext true
-        } else {
-            Log.e(TAG, "Failed to copy image to ${action.albumName}")
-            return@withContext false
+        val evidence = syncManager.copyImageWithEvidence(uri, action.albumId)
+
+        if (evidence == null) {
+            Log.e(TAG, "Failed to copy image to ${action.albumName}; source retained")
+            return@withContext ArchiveCommitOutcome.COPY_FAILED
+        }
+
+        val recorded = copyEvidenceStore.put(
+            sourceUri = action.imageUri,
+            entry = CopyEvidenceEntry(
+                destinationUri = evidence.uri.toString(),
+                byteCount = evidence.byteCount,
+                sha256Hex = evidence.sha256Hex,
+                albumId = action.albumId,
+                recordedAt = System.currentTimeMillis()
+            )
+        )
+        if (!recorded) {
+            Log.w(TAG, "Copy succeeded but evidence write failed; source stays unverified: ${action.imageUri}")
+        }
+
+        // 记录原图位置，用于后续清理
+        addSourceImageRecord(action.albumId, action.imageUri)
+
+        // 记录使用频率（用于智能排序）
+        usageTracker.recordUsage(action.albumId)
+
+        // 刷新图集列表以更新图片数量
+        refreshAlbumsFromSystem()
+        return@withContext ArchiveCommitOutcome.COMMITTED
+    }
+
+    /** 在队列锁内一次性完成查找与移除，保证同一 action 只被领取一次。 */
+    private fun claimPendingArchive(actionId: String): PendingArchive? {
+        synchronized(pendingArchiveQueue) {
+            val index = pendingArchiveQueue.indexOfFirst { it.id == actionId }
+            if (index < 0) return null
+            return pendingArchiveQueue.removeAt(index)
         }
     }
 

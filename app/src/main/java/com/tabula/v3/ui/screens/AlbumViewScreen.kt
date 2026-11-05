@@ -70,7 +70,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.isActive
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -101,6 +103,8 @@ import com.tabula.v3.R
 import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.data.model.SyncMode
+import com.tabula.v3.data.repository.mediaIdentityKey
+import com.tabula.v3.data.repository.resolveAlbumCoverImage
 import com.tabula.v3.di.CoilSetup
 import com.tabula.v3.ui.components.AlbumDeleteConfirmDialog
 import com.tabula.v3.ui.components.AlbumEditDialog
@@ -108,11 +112,12 @@ import com.tabula.v3.ui.components.SourceRect
 import com.tabula.v3.ui.components.SwipeableViewerOverlay
 import com.tabula.v3.ui.components.SwipeableViewerState
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
-import com.tabula.v3.ui.util.DragSelectState
-import com.tabula.v3.ui.util.gridDragHandler
-import com.tabula.v3.ui.util.gridDragHandlerLongPress
+import com.tabula.v3.ui.util.gridDragHandlerString
 import com.tabula.v3.ui.util.HapticFeedback
+import com.tabula.v3.ui.util.gridThumbnailCacheKey
+import com.tabula.v3.ui.util.coverImageRequest
 import com.tabula.v3.ui.util.ItemBounds
+import com.tabula.v3.ui.util.rememberStringDragSelectState
 
 /**
  * 相册视图屏幕
@@ -130,9 +135,10 @@ fun AlbumViewScreen(
     albums: List<Album>,
     allImages: List<ImageFile>,
     getImagesForAlbum: suspend (String) -> List<Long>,
-    getImageMappingsForAlbum: (suspend (String) -> List<Pair<Long, String>>)? = null,
+    getAlbumImages: (suspend (String) -> List<ImageFile>)? = null,
     onCreateAlbum: (name: String, color: Long?, emoji: String?) -> Unit,
     onUpdateAlbum: (Album) -> Unit,
+    onSetCover: ((albumName: String, image: ImageFile) -> Unit)? = null,
     onDeleteAlbum: (String) -> Unit,
     onHideAlbum: ((String) -> Unit)? = null,
     onUnhideAlbum: ((String) -> Unit)? = null,
@@ -145,13 +151,12 @@ fun AlbumViewScreen(
     showMotionBadges: Boolean = false,
     playMotionSound: Boolean = false,
     motionSoundVolume: Int = 100,
-    onMoveToAlbum: ((List<Long>, String) -> Unit)? = null,
-    onCopyToAlbum: ((List<Long>, String) -> Unit)? = null,
-    onDeleteImages: ((List<Long>) -> Unit)? = null
+    onMoveToAlbum: ((List<String>, String) -> Unit)? = null,
+    onCopyToAlbum: ((List<String>, String) -> Unit)? = null,
+    onDeleteImages: ((List<String>) -> Unit)? = null
 ) {
     val isDarkTheme = LocalIsDarkTheme.current
     val context = LocalContext.current
-    val contentResolver = context.contentResolver
 
     val backgroundColor = if (isDarkTheme) Color.Black else Color(0xFFF2F2F7)
     val textColor = if (isDarkTheme) Color.White else Color(0xFF1C1C1E)
@@ -166,22 +171,24 @@ fun AlbumViewScreen(
     var editingAlbum by remember { mutableStateOf<Album?>(null) }
     var viewerState by remember { mutableStateOf<SwipeableViewerState?>(null) }
     var albumImages by remember { mutableStateOf<List<ImageFile>>(emptyList()) }
+    // T05：加载失败有明确状态；失败时保留旧列表，可重试。
+    var albumLoadError by remember { mutableStateOf(false) }
+    var albumLoadRevision by remember { mutableIntStateOf(0) }
     
     // 渐进式加载状态
     var isLoadingMore by remember { mutableStateOf(false) }
     var hasMoreImages by remember { mutableStateOf(true) }
     
-    // 使用 Map 优化查找，将 O(n) 降为 O(1)
-    val imageMap = remember(allImages) { allImages.associateBy { it.id } }
-
     // 响应 allImages 变化：当图片被删除时，自动从 albumImages 中移除
-    // 这解决了在图集中删除图片后不能实时刷新的问题
+    // 这解决了在图集中删除图片后不能实时刷新的问题。
+    // O5③：同步按完整媒体身份键匹配——删除确认行后，另一卷的同数值 ID 行
+    // 不因纯 ID 匹配被连带剪掉（下一轮重载前保持可见）。
     LaunchedEffect(allImages) {
         if (albumImages.isNotEmpty()) {
-            // 获取当前 allImages 中存在的图片 ID 集合
-            val validImageIds = allImages.map { it.id }.toSet()
+            // 获取当前 allImages 中存在的完整身份键集合
+            val validIdentityKeys = allImages.map { it.mediaIdentityKey() }.toSet()
             // 过滤掉已不存在的图片
-            val filteredImages = albumImages.filter { it.id in validImageIds }
+            val filteredImages = albumImages.filter { it.mediaIdentityKey() in validIdentityKeys }
             // 只有在确实有图片被删除时才更新状态，避免不必要的重组
             if (filteredImages.size != albumImages.size) {
                 albumImages = filteredImages
@@ -190,54 +197,31 @@ fun AlbumViewScreen(
     }
     
     // 加载图片逻辑 - 优化版：渐进式加载 + Map 查找 + 协程取消检查
-    LaunchedEffect(currentAlbum?.id) {
+    LaunchedEffect(currentAlbum?.id, albumLoadRevision) {
         if (currentAlbum != null) {
             // 重置加载状态
             hasMoreImages = true
-            
-            if (getImageMappingsForAlbum != null) {
-                // 使用新的加载方式：支持已清理原图的图片
-                val mappings = getImageMappingsForAlbum(currentAlbum.id)
-                
-                // 协程取消检查：如果在获取 mappings 后协程已被取消，直接返回
-                if (!isActive) return@LaunchedEffect
-                
-                // 使用 Map 进行 O(1) 查找，而非 O(n) 的 find
-                // 收集需要从 MediaStore 查询的 URI（不在 imageMap 中的）
-                val foundImages = mutableListOf<ImageFile>()
-                val missingUris = mutableListOf<android.net.Uri>()
-                
-                for ((imageId, imageUri) in mappings) {
-                    val image = imageMap[imageId]
-                    if (image != null) {
-                        foundImages.add(image)
-                    } else {
-                        missingUris.add(android.net.Uri.parse(imageUri))
-                    }
-                }
-                
-                // 批量查询缺失的图片（限制批量大小避免 ANR）
-                val batchSize = 50
-                val queriedImages = mutableListOf<ImageFile>()
-                for (i in missingUris.indices step batchSize) {
-                    // 协程取消检查：在每个批次前检查，避免已取消的协程继续执行耗时操作
+            albumLoadError = false
+            try {
+                if (getAlbumImages != null) {
+                    // T05：详情直接消费仓库返回的完整 ImageFile——查询结果即最终结果，
+                    // 不再压平成 (id, uri) 映射后逐 URI 补读（旧实现的 N+1 来源）。
+                    val images = getAlbumImages(currentAlbum.id)
+
+                    // 协程取消检查：切相册或重建后旧结果不覆盖新页面
                     if (!isActive) return@LaunchedEffect
-                    
-                    val batch = missingUris.subList(i, minOf(i + batchSize, missingUris.size))
-                    batch.mapNotNull { uri ->
-                        queryImageFromUri(contentResolver, uri)
-                    }.let { queriedImages.addAll(it) }
+
+                    albumImages = images
+                } else {
+                    // 兼容旧的加载方式 - 也使用 Set 优化
+                    val imageIds = getImagesForAlbum(currentAlbum.id).toSet()
+                    albumImages = allImages.filter { it.id in imageIds }
                 }
-                
-                // 协程取消检查：在更新状态前检查，避免更新已无效的状态
-                if (!isActive) return@LaunchedEffect
-                
-                // 合并结果并去重
-                albumImages = (foundImages + queriedImages).distinctBy { it.id }
-            } else {
-                // 兼容旧的加载方式 - 也使用 Set 优化
-                val imageIds = getImagesForAlbum(currentAlbum.id).toSet()
-                albumImages = allImages.filter { it.id in imageIds }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 失败保留旧列表，置错误状态供 UI 提示与重试。
+                if (isActive) albumLoadError = true
             }
         } else {
             albumImages = emptyList()
@@ -269,6 +253,8 @@ fun AlbumViewScreen(
                 images = albumImages,
                 textColor = textColor,
                 secondaryTextColor = secondaryTextColor,
+                loadError = albumLoadError,
+                onLoadRetry = { albumLoadRevision++ },
                 isDarkTheme = isDarkTheme,
                 showHdrBadges = showHdrBadges,
                 showMotionBadges = showMotionBadges,
@@ -295,10 +281,9 @@ fun AlbumViewScreen(
                     { excluded: Boolean -> callback(currentAlbum.id, excluded) }
                 },
                 isExcludedFromRecommend = isAlbumExcludedFromRecommend?.invoke(currentAlbum.id) ?: false,
-                onSetCover = if (onUpdateAlbum != null) { imageId ->
-                    val updatedAlbum = currentAlbum.copy(coverImageId = imageId)
-                    onUpdateAlbum(updatedAlbum)
-                } else null,
+                onSetCover = onSetCover?.let { callback ->
+                    { image: ImageFile -> callback(currentAlbum.name, image) }
+                },
                 onNavigateBack = onNavigateBack,
                 albums = albums,
                 allImages = allImages,
@@ -346,11 +331,41 @@ fun AlbumViewScreen(
  * 相册内容视图
  */
 @Composable
+private fun AlbumLoadErrorRow(
+    text: String,
+    textColor: Color,
+    onRetry: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = text,
+            color = textColor.copy(alpha = 0.8f),
+            fontSize = 13.sp
+        )
+        Text(
+            text = "重试",
+            color = textColor,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.clickable { onRetry() }
+        )
+    }
+}
+
+@Composable
 private fun AlbumContentView(
     album: Album,
     images: List<ImageFile>,
     textColor: Color,
     secondaryTextColor: Color,
+    loadError: Boolean = false,
+    onLoadRetry: () -> Unit = {},
     isDarkTheme: Boolean,
     showHdrBadges: Boolean = false,
     showMotionBadges: Boolean = false,
@@ -361,13 +376,13 @@ private fun AlbumContentView(
     onDeleteEmptyClick: (() -> Unit)? = null,
     onExcludeFromRecommend: ((Boolean) -> Unit)? = null,
     isExcludedFromRecommend: Boolean = false,
-    onSetCover: ((Long) -> Unit)? = null,
+    onSetCover: ((ImageFile) -> Unit)? = null,  // C1/T03-COVER：album 名由外层闭包绑定
     onNavigateBack: () -> Unit,
     albums: List<Album> = emptyList(),
     allImages: List<ImageFile> = emptyList(),
-    onMoveToAlbum: ((List<Long>, String) -> Unit)? = null,
-    onCopyToAlbum: ((List<Long>, String) -> Unit)? = null,
-    onDeleteImages: ((List<Long>) -> Unit)? = null
+    onMoveToAlbum: ((List<String>, String) -> Unit)? = null,
+    onCopyToAlbum: ((List<String>, String) -> Unit)? = null,
+    onDeleteImages: ((List<String>) -> Unit)? = null
 ) {
     val context = LocalContext.current
     var showMenu by remember { mutableStateOf(false) }
@@ -386,71 +401,70 @@ private fun AlbumContentView(
         }
     }
     
-    // 多选模式状态
+    // 多选模式状态。O5③：选择集按完整媒体身份键（卷|ID）——不同卷的同数值
+    // ID 是不同照片，必须可独立选中/取消，批量删除只消费确认选中的行。
     var isSelectionMode by remember { mutableStateOf(false) }
-    var selectedImageIds by remember { mutableStateOf(setOf<Long>()) }
-    
+    var selectedImageKeys by remember { mutableStateOf(setOf<String>()) }
+
     // 图集选择弹窗状态
     var showAlbumPicker by remember { mutableStateOf(false) }
     var isCopyMode by remember { mutableStateOf(false) }  // true=复制, false=移动
-    
+
     // 隐藏确认弹窗状态
     var showHideConfirm by remember { mutableStateOf(false) }
-    
+
     // 删除空图集确认弹窗状态
     var showDeleteEmptyConfirm by remember { mutableStateOf(false) }
-    
+
     // 删除图片确认弹窗状态
     var showDeleteImagesConfirm by remember { mutableStateOf(false) }
-    
+
     // 滑动多选状态
-    val dragSelectState = remember(sortedImages) {
-        DragSelectState(
-            items = { sortedImages },
-            itemKey = { it.id },
-            selectedIds = { selectedImageIds },
-            onSelectionChange = { newSelection ->
-                selectedImageIds = newSelection
-                // 如果取消选中所有项，退出多选模式
-                if (newSelection.isEmpty() && isSelectionMode) {
-                    isSelectionMode = false
-                }
-            },
-            onEnterSelectionMode = {
-                if (!isSelectionMode) {
-                    isSelectionMode = true
-                }
+    val dragSelectState = rememberStringDragSelectState(
+        items = sortedImages,
+        itemKey = { it.mediaIdentityKey() },
+        selectedIds = selectedImageKeys,
+        onSelectionChange = { newSelection ->
+            selectedImageKeys = newSelection
+            // 如果取消选中所有项，退出多选模式
+            if (newSelection.isEmpty() && isSelectionMode) {
+                isSelectionMode = false
             }
-        )
-    }
-    
+        },
+        onEnterSelectionMode = {
+            if (!isSelectionMode) {
+                isSelectionMode = true
+            }
+        }
+    )
+
     // 退出多选模式
     fun exitSelectionMode() {
         isSelectionMode = false
-        selectedImageIds = emptySet()
+        selectedImageKeys = emptySet()
     }
-    
+
     // 切换选中状态
-    fun toggleSelection(imageId: Long) {
-        selectedImageIds = if (imageId in selectedImageIds) {
-            selectedImageIds - imageId
+    fun toggleSelection(identityKey: String) {
+        selectedImageKeys = if (identityKey in selectedImageKeys) {
+            selectedImageKeys - identityKey
         } else {
-            selectedImageIds + imageId
+            selectedImageKeys + identityKey
         }
         // 如果取消选中后没有选中项，退出多选模式
-        if (selectedImageIds.isEmpty()) {
+        if (selectedImageKeys.isEmpty()) {
             isSelectionMode = false
         }
     }
-    
+
     // 全选/取消全选
     fun toggleSelectAll() {
-        selectedImageIds = if (selectedImageIds.size == images.size) {
+        selectedImageKeys = if (selectedImageKeys.size == images.size) {
             emptySet()
         } else {
-            images.map { it.id }.toSet()
+            images.map { it.mediaIdentityKey() }.toSet()
         }
-        if (selectedImageIds.isEmpty()) {
+        if (selectedImageKeys.isEmpty()) {
             isSelectionMode = false
         }
     }
@@ -502,7 +516,7 @@ private fun AlbumContentView(
                     
                     // 选中数量
                     Text(
-                        text = "已选 ${selectedImageIds.size} 项",
+                        text = "已选 ${selectedImageKeys.size} 项",
                         color = textColor,
                         fontSize = 18.sp,
                         fontWeight = FontWeight.SemiBold,
@@ -514,7 +528,7 @@ private fun AlbumContentView(
                         onClick = { toggleSelectAll() }
                     ) {
                         Text(
-                            text = if (selectedImageIds.size == images.size) "取消全选" else "全选",
+                            text = if (selectedImageKeys.size == images.size) "取消全选" else "全选",
                             color = Color(0xFF007AFF),
                             fontSize = 16.sp,
                             fontWeight = FontWeight.Medium
@@ -762,13 +776,24 @@ private fun AlbumContentView(
 
         // 只有当 imageCount 也为 0 时才显示空状态，避免加载期间闪烁
         if (images.isEmpty() && album.imageCount == 0) {
-            // 空状态 - TaTa 占领相册
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(32.dp),
-                contentAlignment = Alignment.Center
-            ) {
+            // C0-DETAIL-EMPTY-RETRY：首次加载失败且列表为空时，错误与重试必须可见，
+            // 不能被友好空态遮盖。
+            Column(modifier = Modifier.fillMaxSize()) {
+                if (loadError) {
+                    AlbumLoadErrorRow(
+                        text = "图集加载失败，未能获取照片",
+                        textColor = textColor,
+                        onRetry = onLoadRetry
+                    )
+                }
+                // 空状态 - TaTa 占领相册
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .weight(1f)
+                        .padding(32.dp),
+                    contentAlignment = Alignment.Center
+                ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     // TaTa 图片
                     AsyncImage(
@@ -825,7 +850,17 @@ private fun AlbumContentView(
                     )
                 }
             }
+            }
         } else {
+            // T05：加载失败给出明确状态与重试入口（保留旧列表不清空）。
+            if (loadError) {
+                AlbumLoadErrorRow(
+                    text = "图集加载失败，当前显示为上次结果",
+                    textColor = textColor,
+                    onRetry = onLoadRetry
+                )
+            }
+
             // 照片网格 - 使用 WindowInsets 获取导航栏高度，让内容沉浸到导航栏下方
             val navBarInsets = WindowInsets.navigationBars
             val navBarHeight = with(LocalDensity.current) { navBarInsets.getBottom(this).toDp() }
@@ -842,18 +877,21 @@ private fun AlbumContentView(
                 state = gridState,
                 modifier = Modifier
                     .fillMaxSize()
-                    .gridDragHandler(dragSelectState, isSelectionMode = isSelectionMode)
+                    .gridDragHandlerString(dragSelectState, isSelectionMode = isSelectionMode)
                 // 注：LazyVerticalGrid 的预取由 Compose 自动管理
                 // 图片加载优化主要通过 Coil 的缓存策略实现
             ) {
-                items(sortedImages, key = { it.id }) { image ->
+                // O5③：列表 key/拖选边界注册用完整身份键——不同卷同数值 ID 行
+                // 共存时不再重复 key 崩溃或边界互相覆盖。
+                items(sortedImages, key = { it.mediaIdentityKey() }) { image ->
+                    val identityKey = image.mediaIdentityKey()
                     // 使用 Box 包装并注册位置（窗口坐标系），支持滑动多选
                     Box(
                         modifier = Modifier.onGloballyPositioned { coordinates ->
                             val position = coordinates.positionInWindow()
                             val size = coordinates.size
                             dragSelectState.registerItemBounds(
-                                image.id,
+                                identityKey,
                                 ItemBounds(
                                     left = position.x,
                                     top = position.y,
@@ -871,20 +909,20 @@ private fun AlbumContentView(
                                 onImageClick(image, sourceRect, sortedImages)
                             },
                             onSetCover = onSetCover?.let { callback ->
-                                { callback(image.id) }
+                                { callback(image) }
                             },
                             isSelectionMode = isSelectionMode,
-                            isSelected = image.id in selectedImageIds,
+                            isSelected = identityKey in selectedImageKeys,
                             onLongPress = {
                                 // 长按进入多选模式并选中当前图片
                                 if (!isSelectionMode) {
                                     HapticFeedback.heavyTap(context)
                                     isSelectionMode = true
-                                    selectedImageIds = setOf(image.id)
+                                    selectedImageKeys = setOf(identityKey)
                                 }
                             },
                             onToggleSelect = {
-                                toggleSelection(image.id)
+                                toggleSelection(identityKey)
                             }
                         )
                     }
@@ -895,7 +933,7 @@ private fun AlbumContentView(
         
         // 多选模式底部操作栏
         androidx.compose.animation.AnimatedVisibility(
-            visible = isSelectionMode && selectedImageIds.isNotEmpty(),
+            visible = isSelectionMode && selectedImageKeys.isNotEmpty(),
             enter = androidx.compose.animation.slideInVertically(
                 initialOffsetY = { it },
                 animationSpec = spring(
@@ -1032,14 +1070,16 @@ private fun AlbumContentView(
                 },
                 text = {
                     Text(
-                        text = "确定要删除选中的 ${selectedImageIds.size} 张图片吗？\n\n此操作将永久删除图片，无法恢复。",
+                        text = "确定要删除选中的 ${selectedImageKeys.size} 张图片吗？\n\n此操作将永久删除图片，无法恢复。",
                         color = if (isDarkTheme) Color(0xFFAEAEB2) else Color(0xFF3C3C43)
                     )
                 },
                 confirmButton = {
                     TextButton(
                         onClick = {
-                            onDeleteImages?.invoke(selectedImageIds.toList())
+                            // O5③：回调携带确认行的完整媒体身份键，消费侧
+                            // （MainActivity）按身份解析，不按数值 ID 串卷。
+                            onDeleteImages?.invoke(selectedImageKeys.toList())
                             showDeleteImagesConfirm = false
                             exitSelectionMode()
                             HapticFeedback.mediumTap(context)
@@ -1070,11 +1110,14 @@ private fun AlbumContentView(
                 allImages = allImages,
                 title = if (isCopyMode) "复制到图集" else "移动到图集",
                 onAlbumSelected = { targetAlbumId ->
-                    // 根据模式执行复制或移动操作
+                    // 根据模式执行复制或移动操作。
+                    // C1/T03-MOVECOPY-IDENTITY：确认集合按完整媒体身份键传递，
+                    // 消费端（AlbumManager）从当前媒体集合按身份重新解析——
+                    // 不再压缩成数值 ID（跨卷同 ID 不折叠、不串卷）。
                     if (isCopyMode) {
-                        onCopyToAlbum?.invoke(selectedImageIds.toList(), targetAlbumId)
+                        onCopyToAlbum?.invoke(selectedImageKeys.toList(), targetAlbumId)
                     } else {
-                        onMoveToAlbum?.invoke(selectedImageIds.toList(), targetAlbumId)
+                        onMoveToAlbum?.invoke(selectedImageKeys.toList(), targetAlbumId)
                     }
                     showAlbumPicker = false
                     exitSelectionMode()
@@ -1253,9 +1296,11 @@ private fun PhotoGridItem(
                 }
             )
     ) {
-        // 使用稳定的缓存键，基于图片 ID
-        val cacheKey = remember(image.id) { "album_grid_${image.id}" }
-        
+        // 缩略图缓存键：完整媒体身份 + 内容版本（C1/T03-THUMBKEY）。
+        // 两网格与查看器共用 grid_ 命名空间（请求规格一致），查看器首开
+        // 直接温命中网格缩略图。
+        val cacheKey = remember(image.id, image.dateModified) { gridThumbnailCacheKey("grid_", image) }
+
         // 占位符背景色 - 在图片加载前显示，避免空白闪烁
         val isDarkTheme = LocalIsDarkTheme.current
         val placeholderColor = if (isDarkTheme) Color(0xFF2C2C2E) else Color(0xFFE5E5EA)
@@ -1533,11 +1578,9 @@ private fun AlbumPickerDialog(
                     ) {
                         items(albums.size) { index ->
                             val album = albums[index]
-                            // 查找封面图片
-                            val coverImage = album.coverImageId?.let { coverId ->
-                                allImages.find { it.id == coverId }
-                            }
-                            
+                            // 查找封面图片（C1/T03-COVER：按完整媒体身份解析）
+                            val coverImage = resolveAlbumCoverImage(album, allImages)
+
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -1560,14 +1603,13 @@ private fun AlbumPickerDialog(
                                     contentAlignment = Alignment.Center
                                 ) {
                                     if (coverImage != null) {
-                                        // 显示封面图片
+                                        // C1/T03-COVERKEY：封面请求经生产构造器（身份+内容版本键）。
                                         AsyncImage(
-                                            model = ImageRequest.Builder(context)
-                                                .data(coverImage.uri)
-                                                .size(coil.size.Size(144, 144))
-                                                .precision(Precision.INEXACT)
-                                                .crossfade(true)
-                                                .build(),
+                                            model = coverImageRequest(
+                                                context, coverImage, "album_list_cover_",
+                                                size = coil.size.Size(144, 144),
+                                                crossfade = true, inexact = true
+                                            ),
                                             contentDescription = album.name,
                                             imageLoader = imageLoader,
                                             contentScale = ContentScale.Crop,
@@ -1635,49 +1677,3 @@ private fun AlbumPickerDialog(
  * 通过 URI 从 MediaStore 查询图片信息
  * 用于加载已清理原图后同步到系统相册的图片
  */
-private fun queryImageFromUri(
-    contentResolver: android.content.ContentResolver,
-    uri: android.net.Uri
-): ImageFile? {
-    return try {
-        val projection = arrayOf(
-            android.provider.MediaStore.Images.Media._ID,
-            android.provider.MediaStore.Images.Media.DISPLAY_NAME,
-            android.provider.MediaStore.Images.Media.DATE_MODIFIED,
-            android.provider.MediaStore.Images.Media.SIZE,
-            android.provider.MediaStore.Images.Media.WIDTH,
-            android.provider.MediaStore.Images.Media.HEIGHT,
-            android.provider.MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
-            android.provider.MediaStore.Images.Media.ORIENTATION
-        )
-        
-        contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                val id = cursor.getLong(cursor.getColumnIndexOrThrow(android.provider.MediaStore.Images.Media._ID))
-                val displayName = cursor.getString(cursor.getColumnIndexOrThrow(android.provider.MediaStore.Images.Media.DISPLAY_NAME)) ?: "Unknown"
-                val dateModified = cursor.getLong(cursor.getColumnIndexOrThrow(android.provider.MediaStore.Images.Media.DATE_MODIFIED))
-                val size = cursor.getLong(cursor.getColumnIndexOrThrow(android.provider.MediaStore.Images.Media.SIZE))
-                val width = cursor.getInt(cursor.getColumnIndexOrThrow(android.provider.MediaStore.Images.Media.WIDTH))
-                val height = cursor.getInt(cursor.getColumnIndexOrThrow(android.provider.MediaStore.Images.Media.HEIGHT))
-                val bucketName = cursor.getString(cursor.getColumnIndexOrThrow(android.provider.MediaStore.Images.Media.BUCKET_DISPLAY_NAME))
-                val orientation = cursor.getInt(cursor.getColumnIndexOrThrow(android.provider.MediaStore.Images.Media.ORIENTATION))
-                
-                ImageFile(
-                    id = id,
-                    uri = uri,
-                    displayName = displayName,
-                    dateModified = dateModified,
-                    size = size,
-                    width = width,
-                    height = height,
-                    bucketDisplayName = bucketName,
-                    orientation = orientation
-                )
-            } else null
-        }
-    } catch (e: Exception) {
-        android.util.Log.w("AlbumViewScreen", "Failed to query image from URI: $uri", e)
-        null
-    }
-}
-

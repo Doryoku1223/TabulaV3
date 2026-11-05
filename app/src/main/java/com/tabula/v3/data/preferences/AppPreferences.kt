@@ -7,6 +7,19 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import com.tabula.v3.data.repository.LocalImageRepository
 
+/** 一条抽取冷却记录：抽取时间 + 随机冷却天数。 */
+data class PickCooldownEntry(val pickedAt: Long, val days: Int)
+
+/**
+ * C1/T03-DECKCOOLDOWN：随机抽取冷却池索引——完整媒体身份键（卷|ID）与
+ * 旧裸数值 ID 双视图。新格式键形如 "external_primary|42"（非纯数字），
+ * 旧格式键为纯数字 ID（升级前数据）。
+ */
+data class PickCooldownIndex(
+    val byIdentityKey: Map<String, PickCooldownEntry>,
+    val byLegacyBareId: Map<Long, PickCooldownEntry>
+)
+
 /**
  * 应用设置管理器
  */
@@ -71,6 +84,23 @@ class AppPreferences(context: Context) {
     var showDeleteConfirm: Boolean
         get() = prefs.getBoolean(KEY_DELETE_CONFIRM, true)
         set(value) = prefs.edit().putBoolean(KEY_DELETE_CONFIRM, value).apply()
+
+    /**
+     * 仅调试探针使用（BuildConfig.DEBUG 门控）：强制图集详情加载失败，
+     * 用于设备验证 C0-DETAIL-EMPTY-RETRY 的错误/重试 UI。生产构建不读取。
+     */
+    var debugForceAlbumLoadFailure: Boolean
+        get() = prefs.getBoolean(KEY_DEBUG_FORCE_ALBUM_LOAD_FAILURE, false)
+        set(value) = prefs.edit().putBoolean(KEY_DEBUG_FORCE_ALBUM_LOAD_FAILURE, value).apply()
+
+    /**
+     * 仅调试探针使用（BuildConfig.DEBUG 门控）：详情查询完成后的返回延迟毫秒，
+     * 制造慢加载窗口，用于设备验证切图集/取消后旧结果不覆盖新页面（C0/T05）。
+     * 0 表示无延迟；生产构建不读取。
+     */
+    var debugAlbumLoadDelayMs: Long
+        get() = prefs.getLong(KEY_DEBUG_ALBUM_LOAD_DELAY_MS, 0L)
+        set(value) = prefs.edit().putLong(KEY_DEBUG_ALBUM_LOAD_DELAY_MS, value).apply()
 
     /**
      * Show HDR badges
@@ -395,39 +425,43 @@ class AppPreferences(context: Context) {
     private val similarGroupCooldownOptions = listOf(3, 5, 7)
 
     /**
-     * 记录照片被抽取的时间，并随机分配冷却天数
+     * 批量记录照片被抽取的时间（C1/T03-DECKCOOLDOWN：完整媒体身份键），
+     * 并随机分配冷却天数
      */
-    fun recordImagePicked(imageId: Long) {
-        val randomCooldownDays = cooldownOptions.random()
-        pickTimestampsPrefs.edit()
-            .putLong("time_$imageId", System.currentTimeMillis())
-            .putInt("days_$imageId", randomCooldownDays)
-            .apply()
+    fun recordImagesPickedByIdentity(identityKeys: Collection<String>) {
+        if (identityKeys.isEmpty()) return
+        val editor = pickTimestampsPrefs.edit()
+        val now = System.currentTimeMillis()
+
+        identityKeys.forEach { key ->
+            val randomCooldownDays = cooldownOptions.random()
+            editor.putLong("time_$key", now)
+            editor.putInt("days_$key", randomCooldownDays)
+        }
+
+        editor.apply()
     }
 
     /**
-     * 获取照片上次被抽取的时间，如果从未被抽取则返回0
+     * C1/T03-DECKCOOLDOWN 旧数据迁移：裸数值 ID 记录在调用方确认当前媒体
+     * 集合内唯一可解析后，改写为完整媒体身份键。put+remove 同一 editor
+     * 单事务，中断后重跑幂等；身份键已存在时保留新记录、仅清裸键。
+     *
+     * @return 是否发生改写
      */
-    fun getImagePickedTimestamp(imageId: Long): Long {
-        return pickTimestampsPrefs.getLong("time_$imageId", 0L)
-    }
-
-    /**
-     * 获取照片的冷却天数
-     */
-    fun getImageCooldownDays(imageId: Long): Int {
-        return pickTimestampsPrefs.getInt("days_$imageId", cooldownOptions.first())
-    }
-
-    /**
-     * 检查照片是否在冷却期内
-     */
-    fun isImageInCooldown(imageId: Long): Boolean {
-        val pickedTime = getImagePickedTimestamp(imageId)
-        if (pickedTime == 0L) return false
-        val cooldownDays = getImageCooldownDays(imageId)
-        val cooldownMillis = cooldownDays.toLong() * 24 * 60 * 60 * 1000
-        return System.currentTimeMillis() - pickedTime < cooldownMillis
+    fun migratePickRecordToIdentity(bareId: Long, identityKey: String): Boolean {
+        val pickedAt = pickTimestampsPrefs.getLong("time_$bareId", 0L)
+        if (pickedAt == 0L) return false
+        val days = pickTimestampsPrefs.getInt("days_$bareId", cooldownOptions.first())
+        val editor = pickTimestampsPrefs.edit()
+        if (!pickTimestampsPrefs.contains("time_$identityKey")) {
+            editor.putLong("time_$identityKey", pickedAt)
+            editor.putInt("days_$identityKey", days)
+        }
+        editor.remove("time_$bareId")
+        editor.remove("days_$bareId")
+        editor.apply()
+        return true
     }
 
     /**
@@ -453,64 +487,47 @@ class AppPreferences(context: Context) {
     }
 
     /**
-     * 批量获取当前在冷却期内的图片ID集合
-     * 一次性读取所有记录，避免多次单独读取 SharedPreferences
+     * 批量读取当前冷却池（C1/T03-DECKCOOLDOWN）。
+     * 一次性读取所有记录，避免多次单独读取 SharedPreferences；
+     * 新格式身份键与旧裸数值键分别归入双视图，过期记录不返回。
      */
-    fun getCooldownImageIds(): Set<Long> {
+    fun getPickCooldownIndex(): PickCooldownIndex {
         val now = System.currentTimeMillis()
-        val cooldownIds = mutableSetOf<Long>()
-        
+        val byIdentity = mutableMapOf<String, PickCooldownEntry>()
+        val byLegacy = mutableMapOf<Long, PickCooldownEntry>()
+
         pickTimestampsPrefs.all.forEach { (key, value) ->
-            if (key.startsWith("time_") && value is Long) {
-                val imageIdStr = key.removePrefix("time_")
-                val imageId = imageIdStr.toLongOrNull() ?: return@forEach
-                val cooldownDays = pickTimestampsPrefs.getInt("days_$imageIdStr", cooldownOptions.first())
-                val cooldownMillis = cooldownDays.toLong() * 24 * 60 * 60 * 1000
-                
-                if (now - value < cooldownMillis) {
-                    cooldownIds.add(imageId)
-                }
-            }
+            if (!key.startsWith("time_") || value !is Long) return@forEach
+            val suffix = key.removePrefix("time_")
+            val cooldownDays = pickTimestampsPrefs.getInt("days_$suffix", cooldownOptions.first())
+            val cooldownMillis = cooldownDays.toLong() * 24 * 60 * 60 * 1000
+            if (now - value >= cooldownMillis) return@forEach
+            val entry = PickCooldownEntry(value, cooldownDays)
+            val bareId = suffix.toLongOrNull()
+            if (bareId != null) byLegacy[bareId] = entry else byIdentity[suffix] = entry
         }
-        
-        return cooldownIds
+
+        return PickCooldownIndex(byIdentity, byLegacy)
     }
 
     /**
-     * 批量记录照片被抽取的时间
-     */
-    fun recordImagesPicked(imageIds: List<Long>) {
-        if (imageIds.isEmpty()) return
-        val editor = pickTimestampsPrefs.edit()
-        val now = System.currentTimeMillis()
-        
-        imageIds.forEach { imageId ->
-            val randomCooldownDays = cooldownOptions.random()
-            editor.putLong("time_$imageId", now)
-            editor.putInt("days_$imageId", randomCooldownDays)
-        }
-        
-        editor.apply()
-    }
-    
-    /**
-     * 从冷却池中移除指定的照片
+     * 从冷却池中移除指定身份键的照片
      * 用于切换推荐算法时，将未浏览的照片从冷却池中移除
-     * 
+     *
      * 注意：使用 commit() 而非 apply() 以确保移除操作在返回前完成，
      * 避免与后续的批次获取产生竞态条件。
-     * 
-     * @param imageIds 要移除的照片ID列表
+     *
+     * @param identityKeys 要移除的照片完整媒体身份键列表
      */
-    fun removeImagesFromCooldown(imageIds: List<Long>) {
-        if (imageIds.isEmpty()) return
+    fun removeImagesFromCooldownByIdentity(identityKeys: Collection<String>) {
+        if (identityKeys.isEmpty()) return
         val editor = pickTimestampsPrefs.edit()
-        
-        imageIds.forEach { imageId ->
-            editor.remove("time_$imageId")
-            editor.remove("days_$imageId")
+
+        identityKeys.forEach { key ->
+            editor.remove("time_$key")
+            editor.remove("days_$key")
         }
-        
+
         // 使用 commit() 同步执行，确保移除完成后再返回
         // 这样后续获取新批次时，这些照片不会被排除
         editor.commit()
@@ -783,8 +800,55 @@ class AppPreferences(context: Context) {
     }
     
     /**
+     * 整体替换图集的永久处理标记集合（C1/T03-GROUPID 旧格式标记唯一
+     * 映射迁移的写回通道；歧义旧条目由调用方原样保留）。
+     */
+    fun replaceAlbumPermanentlyProcessedGroups(albumId: String, groupIds: Set<String>) {
+        albumCleanupPrefs.edit()
+            .putStringSet("processed_$albumId", groupIds)
+            .apply()
+    }
+
+    /**
+     * 整体替换图集的组目录（C1/T03-GROUPID 复验轮：旧格式组 ID 唯一映射
+     * 迁移的组目录写回通道——groups_ 与 processed_ 口径必须一致，否则
+     * 已处理数/剩余数/完成状态失真）。
+     */
+    fun replaceAlbumGroupIds(albumId: String, groupIds: Set<String>) {
+        albumCleanupPrefs.edit()
+            .putStringSet("groups_$albumId", groupIds)
+            .apply()
+    }
+
+    /**
+     * 组成员持久化键改名（C1/T03-GROUPID 复验轮：group_images_ 与组目录
+     * 同步迁移；源键不存在时为无操作）。
+     */
+    fun renameGroupMembersKey(albumId: String, fromGroupId: String, toGroupId: String) {
+        val members = albumCleanupPrefs.getString("group_images_${albumId}_$fromGroupId", null)
+            ?: return
+        albumCleanupPrefs.edit()
+            .putString("group_images_${albumId}_$toGroupId", members)
+            .remove("group_images_${albumId}_$fromGroupId")
+            .apply()
+    }
+
+    /**
+     * 组数量持久化键改名（C1/T03-GROUPID 复验轮：group_size_ 与组目录
+     * 同步迁移；源键不存在时为无操作）。
+     */
+    fun renameGroupSizeKey(albumId: String, fromGroupId: String, toGroupId: String) {
+        if (!albumCleanupPrefs.contains("group_size_${albumId}_$fromGroupId")) return
+        val count = albumCleanupPrefs.getInt("group_size_${albumId}_$fromGroupId", 0)
+        albumCleanupPrefs.edit()
+            .putInt("group_size_${albumId}_$toGroupId", count)
+            .remove("group_size_${albumId}_$fromGroupId")
+            .apply()
+    }
+
+    /**
      * 批量永久标记图集中的组为已处理
-     * 
+     *
      * @param albumId 图集ID
      * @param groupIds 组ID列表
      */
@@ -856,6 +920,7 @@ class AppPreferences(context: Context) {
             .remove("groups_$albumId")
             .remove("analyzed_$albumId")
             .remove("processed_$albumId")  // 清除永久处理记录
+            .remove("acknowledged_members_$albumId")
             .putStringSet(KEY_COMPLETED_CLEANUP_ALBUMS, completedSet)
             .apply()
     }
@@ -887,8 +952,49 @@ class AppPreferences(context: Context) {
     }
     
     /**
+     * 获取图集清理断点的保存时刻（毫秒；C1/T03-GROUPID 复验轮三：用于
+     * 判断断点保存后分析是否重跑过——重跑使旧位置索引不可确认）。
+     *
+     * @param albumId 图集ID
+     * @return 保存时刻毫秒，无断点返回 0
+     */
+    fun getAlbumCleanupCheckpointSavedAt(albumId: String): Long {
+        return albumCleanupPrefs.getLong("checkpoint_time_$albumId", 0L)
+    }
+
+    /**
+     * 整体替换图集清理断点并**保留原保存时刻**（C1/T03-GROUPID 复验轮三：
+     * 旧格式断点引用迁移的写回通道——重写引用时若刷新保存时刻，会使
+     * "分析晚于断点"的时序判据在迁移入口失效）。
+     */
+    fun replaceAlbumCleanupCheckpoint(
+        albumId: String,
+        groupIds: List<String>,
+        currentIndex: Int,
+        savedAtMs: Long
+    ) {
+        albumCleanupPrefs.edit()
+            .putStringSet("checkpoint_groups_$albumId", groupIds.toSet())
+            .putString("checkpoint_groups_order_$albumId", groupIds.joinToString(","))
+            .putInt("checkpoint_index_$albumId", currentIndex)
+            .putLong("checkpoint_time_$albumId", savedAtMs)
+            .apply()
+    }
+
+    /**
+     * 获取图集最近一次相似组分析的时刻（毫秒；C1/T03-GROUPID 复验轮三：
+     * 晚于断点保存时刻说明分析重跑过，批次组成/排序可能已变）。
+     *
+     * @param albumId 图集ID
+     * @return 分析时刻毫秒，从未分析返回 0
+     */
+    fun getAlbumAnalyzedAt(albumId: String): Long {
+        return albumCleanupPrefs.getLong("analyzed_$albumId", 0L)
+    }
+
+    /**
      * 获取图集清理断点
-     * 
+     *
      * @param albumId 图集ID
      * @return 断点信息 (组ID列表, 当前索引)，如果没有断点返回 null
      */
@@ -925,6 +1031,40 @@ class AppPreferences(context: Context) {
             .apply()
     }
     
+    /** 仅记录用户明确移入回收站的完整媒体身份；权限快照缺席不得调用此接口。 */
+    fun acknowledgeCleanupMember(identityKey: String) {
+        acknowledgeCleanupMembers(setOf(identityKey))
+    }
+
+    fun acknowledgeCleanupMembers(identityKeys: Set<String>) {
+        if (identityKeys.isEmpty()) return
+        // 不同 AppPreferences 实例仍共享此对象，读并集与写入必须共用同一把锁。
+        synchronized(albumCleanupPrefs) {
+            val albumIds = albumCleanupPrefs.all.keys.filter { it.startsWith("groups_") }
+                .map { it.removePrefix("groups_") }
+            val editor = albumCleanupPrefs.edit()
+            var hasConfirmedMembers = false
+            for (albumId in albumIds) {
+                // 不按裸 ID 猜卷；旧目录在唯一身份迁移后才能加入确认集。
+                val members = getAlbumGroupIds(albumId).flatMap { groupId ->
+                    getGroupImageIds(albumId, groupId).orEmpty()
+                }.toSet()
+                val confirmed = identityKeys.intersect(members)
+                if (confirmed.isEmpty()) continue
+                val acknowledged = getAlbumAcknowledgedCleanupMembers(albumId)
+                editor.putStringSet("acknowledged_members_$albumId", acknowledged + confirmed)
+                hasConfirmedMembers = true
+            }
+            // commit=false 也可能先改变内存；同值重试仍须同步落盘，不能据内存跳过。
+            if (hasConfirmedMembers && !editor.commit()) {
+                throw IllegalStateException("Could not persist acknowledged cleanup member")
+            }
+        }
+    }
+
+    fun getAlbumAcknowledgedCleanupMembers(albumId: String): Set<String> =
+        albumCleanupPrefs.getStringSet("acknowledged_members_$albumId", emptySet())?.toSet() ?: emptySet()
+
     // ==================== 相似组图片 ID 持久化（性能优化）====================
     
     /**
@@ -941,30 +1081,33 @@ class AppPreferences(context: Context) {
     }
     
     /**
-     * 批量保存多个组的图片 ID 列表
-     * 
+     * 批量保存多个组的成员列表（C1/T03-GROUPID：值为完整媒体身份键
+     * "卷|ID"；既有构建写入的旧格式为逗号分隔裸数字 ID，读取侧按
+     * 唯一性解析兼容，见 AlbumCleanupEngine.restoreGroupsFromPrefs）。
+     *
      * @param albumId 图集ID
-     * @param groupImageIds 组ID到图片ID列表的映射
+     * @param groupImageIds 组ID到成员身份键列表的映射
      */
-    fun saveGroupsImageIds(albumId: String, groupImageIds: Map<String, List<Long>>) {
+    fun saveGroupsImageIds(albumId: String, groupImageIds: Map<String, List<String>>) {
         val editor = albumCleanupPrefs.edit()
-        groupImageIds.forEach { (groupId, imageIds) ->
-            editor.putString("group_images_${albumId}_$groupId", imageIds.joinToString(","))
+        groupImageIds.forEach { (groupId, memberKeys) ->
+            editor.putString("group_images_${albumId}_$groupId", memberKeys.joinToString(","))
         }
         editor.apply()
     }
-    
+
     /**
-     * 获取单个组的图片 ID 列表
-     * 
+     * 获取单个组的成员列表（原始字符串：新格式为身份键"卷|ID"，
+     * 旧格式为裸数字 ID——由调用方按身份解析，此处不做语义过滤）。
+     *
      * @param albumId 图集ID
      * @param groupId 组ID
-     * @return 组内图片 ID 列表，如果不存在返回 null
+     * @return 组内成员键列表，如果不存在返回 null
      */
-    fun getGroupImageIds(albumId: String, groupId: String): List<Long>? {
+    fun getGroupImageIds(albumId: String, groupId: String): List<String>? {
         val idsString = albumCleanupPrefs.getString("group_images_${albumId}_$groupId", null)
             ?: return null
-        return idsString.split(",").mapNotNull { it.toLongOrNull() }
+        return idsString.split(",").filter { it.isNotBlank() }
     }
     
     /**
@@ -1013,6 +1156,8 @@ class AppPreferences(context: Context) {
         private const val PREFS_NAME = "tabula_prefs"
         private const val KEY_SORT_ORDER = "sort_order"
         private const val KEY_THEME_MODE = "theme_mode"
+        private const val KEY_DEBUG_FORCE_ALBUM_LOAD_FAILURE = "debug_force_album_load_failure"
+        private const val KEY_DEBUG_ALBUM_LOAD_DELAY_MS = "debug_album_load_delay_ms"
         private const val KEY_DELETE_CONFIRM = "delete_confirm"
         private const val KEY_SHOW_HDR_BADGES = "show_hdr_badges"
         private const val KEY_SHOW_MOTION_BADGES = "show_motion_badges"

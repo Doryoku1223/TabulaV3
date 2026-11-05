@@ -15,6 +15,8 @@ import android.net.Uri
  * @param bucketDisplayName 所属相册名称
  * @param orientation EXIF 旋转角度（0, 90, 180, 270）
  * @param deletedAt 移入回收站的时间戳（毫秒），0 表示未删除
+ * @param volumeName 所属存储卷（T03 身份契约；null 表示未知）
+ * @param relativePath 相对路径如 "DCIM/Camera/"（T03 身份契约；null 表示未知）
  */
 data class ImageFile(
     val id: Long,
@@ -26,7 +28,9 @@ data class ImageFile(
     val height: Int,
     val bucketDisplayName: String?,
     val orientation: Int = 0,
-    val deletedAt: Long = 0L
+    val deletedAt: Long = 0L,
+    val volumeName: String? = null,
+    val relativePath: String? = null
 ) {
     /**
      * 是否需要交换宽高（90度或270度旋转）

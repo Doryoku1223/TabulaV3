@@ -109,8 +109,9 @@ import com.tabula.v3.ui.components.MotionPhotoPlayer
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.theme.TabulaColors
 import com.tabula.v3.ui.util.DragSelectState
-import com.tabula.v3.ui.util.gridDragHandler
-import com.tabula.v3.ui.util.gridDragHandlerLongPress
+import com.tabula.v3.data.repository.mediaIdentityKey
+import com.tabula.v3.ui.util.gridDragHandlerString
+import com.tabula.v3.ui.util.rememberStringDragSelectState
 import com.tabula.v3.ui.util.HapticFeedback
 import com.tabula.v3.ui.util.ItemBounds
 import com.tabula.v3.ui.util.findActivity
@@ -126,6 +127,7 @@ import kotlinx.coroutines.launch
 fun RecycleBinScreen(
     deletedImages: List<ImageFile>,
     onRestore: (ImageFile) -> Unit,
+    onRestoreBatch: (List<ImageFile>) -> Unit = {},
     onPermanentDelete: (ImageFile) -> Unit,
     onPermanentDeleteBatch: (List<ImageFile>) -> Unit,
     onClearAll: () -> Unit,
@@ -153,7 +155,8 @@ fun RecycleBinScreen(
     
     // 多选模式状态
     var isSelectionMode by remember { mutableStateOf(false) }
-    var selectedImages by remember { mutableStateOf<Set<Long>>(emptySet()) }
+    // T03：选择集以媒体身份键（卷|ID）为粒度，跨卷同数值 ID 记录独立选中。
+    var selectedImages by remember { mutableStateOf<Set<String>>(emptySet()) }
     
     // 长按操作菜单
     val sheetState = rememberModalBottomSheetState()
@@ -180,25 +183,23 @@ fun RecycleBinScreen(
     }
     
     // 滑动多选状态
-    val dragSelectState = remember(sortedImages) {
-        DragSelectState(
-            items = { sortedImages },
-            itemKey = { it.id },
-            selectedIds = { selectedImages },
-            onSelectionChange = { newSelection ->
-                selectedImages = newSelection
-                // 如果取消选中所有项，退出多选模式
-                if (newSelection.isEmpty() && isSelectionMode) {
-                    isSelectionMode = false
-                }
-            },
-            onEnterSelectionMode = {
-                if (!isSelectionMode) {
-                    isSelectionMode = true
-                }
+    val dragSelectState = rememberStringDragSelectState(
+        items = sortedImages,
+        itemKey = { it.mediaIdentityKey() },
+        selectedIds = selectedImages,
+        onSelectionChange = { newSelection ->
+            selectedImages = newSelection
+            // 如果取消选中所有项，退出多选模式
+            if (newSelection.isEmpty() && isSelectionMode) {
+                isSelectionMode = false
             }
-        )
-    }
+        },
+        onEnterSelectionMode = {
+            if (!isSelectionMode) {
+                isSelectionMode = true
+            }
+        }
+    )
 
     // 返回键处理
     BackHandler(enabled = viewerState != null || isSelectionMode) {
@@ -229,15 +230,17 @@ fun RecycleBinScreen(
                         selectedImages = emptySet()
                     },
                     onRestoreSelected = {
-                        selectedImages.forEach { id ->
-                            deletedImages.find { it.id == id }?.let { onRestore(it) }
+                        // T02c：批量恢复走单一共享事务；单条恢复也复用同一路径。
+                        val images = selectedImages.mapNotNull { key ->
+                            deletedImages.find { it.mediaIdentityKey() == key }
                         }
+                        if (images.size == 1) onRestore(images.first()) else onRestoreBatch(images)
                         isSelectionMode = false
                         selectedImages = emptySet()
                     },
                     onDeleteSelected = {
-                        val imagesToDelete = selectedImages.mapNotNull { id ->
-                            deletedImages.find { it.id == id }
+                        val imagesToDelete = selectedImages.mapNotNull { key ->
+                            deletedImages.find { it.mediaIdentityKey() == key }
                         }
                         if (imagesToDelete.isNotEmpty()) {
                             onPermanentDeleteBatch(imagesToDelete)
@@ -279,7 +282,7 @@ fun RecycleBinScreen(
                     state = staggeredGridState,
                     modifier = Modifier
                         .fillMaxSize()
-                        .gridDragHandler(dragSelectState, isSelectionMode = isSelectionMode),
+                        .gridDragHandlerString(dragSelectState, isSelectionMode = isSelectionMode),
                     contentPadding = PaddingValues(
                         start = 16.dp,
                         end = 16.dp,
@@ -289,8 +292,9 @@ fun RecycleBinScreen(
                     horizontalArrangement = Arrangement.spacedBy(12.dp), // 增加间距
                     verticalItemSpacing = 12.dp
                 ) {
-                    items(sortedImages, key = { it.id }) { image ->
-                        val isSelected = selectedImages.contains(image.id)
+                    items(sortedImages, key = { it.mediaIdentityKey() }) { image ->
+                        val identityKey = image.mediaIdentityKey()
+                        val isSelected = selectedImages.contains(identityKey)
                         
                         // 使用 Box 包装并注册位置（窗口坐标系），仅多选模式下追踪位置
                         Box(
@@ -299,7 +303,7 @@ fun RecycleBinScreen(
                                     val position = coordinates.positionInWindow()
                                     val size = coordinates.size
                                     dragSelectState.registerItemBounds(
-                                        image.id,
+                                        identityKey,
                                         ItemBounds(
                                             left = position.x,
                                             top = position.y,
@@ -321,9 +325,9 @@ fun RecycleBinScreen(
                                         // 在多选模式下切换选中
                                         if (!isSelected) HapticFeedback.lightTap(context)
                                         selectedImages = if (isSelected) {
-                                            selectedImages - image.id
+                                            selectedImages - identityKey
                                         } else {
-                                            selectedImages + image.id
+                                            selectedImages + identityKey
                                         }
                                     } else {
                                         // 打开全屏查看
@@ -336,7 +340,7 @@ fun RecycleBinScreen(
                                         // 进入多选模式，触发振动
                                         HapticFeedback.mediumTap(context)
                                         isSelectionMode = true
-                                        selectedImages = setOf(image.id)
+                                        selectedImages = setOf(identityKey)
                                     }
                                 }
                             )
@@ -743,7 +747,7 @@ private fun FullScreenViewer(
             state = pagerState,
             modifier = Modifier.fillMaxSize(),
             userScrollEnabled = !isMultiTouchActive && currentPageZoom <= 1.05f,
-            key = { images.getOrNull(it)?.id ?: it },
+            key = { images.getOrNull(it)?.mediaIdentityKey() ?: it.toString() },
             // 添加 flingBehavior 确保滑动后对齐到页面，防止卡在两图之间
             flingBehavior = PagerDefaults.flingBehavior(
                 state = pagerState,

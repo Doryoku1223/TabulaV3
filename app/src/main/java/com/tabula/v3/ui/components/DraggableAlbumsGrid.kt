@@ -54,6 +54,9 @@ import coil.request.ImageRequest
 import com.tabula.v3.R
 import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
+import com.tabula.v3.data.repository.resolveCoverRow
+import com.tabula.v3.ui.util.coverImageRequest
+
 import com.tabula.v3.ui.util.HapticFeedback
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -78,7 +81,8 @@ fun DraggableAlbumsGrid(
     val scope = rememberCoroutineScope()
     
     // 建立 ID 到 ImageFile 的映射
-    val imageMap = remember(allImages) { allImages.associateBy { it.id } }
+    // C1/T03-COVER：多值映射——跨卷同 ID 行不折叠。
+    val imageMap = remember(allImages) { allImages.groupBy { it.id } }
     
     // 拖拽状态
     var draggingAlbumId by remember { mutableStateOf<String?>(null) }
@@ -132,7 +136,9 @@ fun DraggableAlbumsGrid(
 
         items(orderedAlbums, key = { it.id }) { album ->
             val isDragging = draggingAlbumId == album.id
-            val coverImage = album.coverImageId?.let { imageMap[it] }
+            val coverImage = album.coverImageId?.let { coverId ->
+                resolveCoverRow(album.coverVolumeName, coverId, imageMap[coverId].orEmpty())
+            }
             
             Box(
                 modifier = Modifier
@@ -237,7 +243,6 @@ private fun AlbumGridItem(
     
     // 如果 coverImage 为 null 但有 coverImageId，直接用 ID 构建 URI 作为 fallback
     val coverUri = coverImage?.uri 
-        ?: album.coverImageId?.let { android.net.Uri.parse("content://media/external/images/media/$it") }
     
     // 跟踪图片加载状态
     var loadFailed by remember { mutableStateOf(false) }
@@ -290,11 +295,11 @@ private fun AlbumGridItem(
                 }
         ) {
             if (coverUri != null && !loadFailed) {
+                // C1/T03-COVERKEY：封面请求经生产构造器（身份+内容版本键）。
                 AsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(coverUri)
-                        .crossfade(true)
-                        .build(),
+                    model = coverImageRequest(
+                        context, coverImage!!, "draggable_album_cover_", crossfade = true
+                    ),
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize(),
