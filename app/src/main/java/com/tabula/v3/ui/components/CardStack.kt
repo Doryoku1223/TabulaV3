@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -49,7 +50,9 @@ import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.data.preferences.SwipeStyle
 import com.tabula.v3.di.PreloadingManager
+import com.tabula.v3.di.cardMemoryCacheKey
 import com.tabula.v3.ui.util.HapticFeedback
+import com.tabula.v3.ui.util.ownedScaledCopyOrNull
 import com.tabula.v3.ui.util.preloadImageFeatures
 import com.tabula.v3.ui.util.rememberImageFeatures
 import kotlinx.coroutines.CoroutineStart
@@ -184,9 +187,14 @@ fun SwipeableCardStack(
     fixedTagTriggerIndex: Int? = null,
     // 固定标签 Genie 动画完成回调
     onFixedTagAnimationComplete: (() -> Unit)? = null,
-    genieController: GenieAnimationController
+    genieController: GenieAnimationController,
+    shareState: CardShareState? = null
 ) {
-    if (images.isEmpty()) return
+    DisposableEffect(shareState) { onDispose { shareState?.clear() } }
+    if (images.isEmpty()) {
+        SideEffect { shareState?.clear() }
+        return
+    }
     
     // 根据切换样式分发到不同的实现
     if (swipeStyle == SwipeStyle.DRAW) {
@@ -216,7 +224,8 @@ fun SwipeableCardStack(
             onSwipeStart = onSwipeStart,
             fixedTagTriggerIndex = fixedTagTriggerIndex,
             onFixedTagAnimationComplete = onFixedTagAnimationComplete,
-            genieController = genieController
+            genieController = genieController,
+            shareState = shareState
         )
         return
     }
@@ -334,6 +343,7 @@ fun SwipeableCardStack(
     // 预加载当前索引前后的图片，加快卡片显示速度
     // 优化：减少预加载范围（从 3 降到 1），减少内存压力
     val preloadingManager = remember { PreloadingManager(context, preloadRange = 1) }
+    DisposableEffect(Unit) { onDispose { preloadingManager.dispose() } }
     
     LaunchedEffect(currentIndex, images) {
         // 预加载当前索引周围的图片
@@ -464,7 +474,7 @@ fun SwipeableCardStack(
                 var bitmap: Bitmap? = null
                 
                 // 方案1：尝试从 Coil 内存缓存获取（在 IO 线程安全访问）
-                val cacheKey = "card_${currentImg.id}"
+                val cacheKey = cardMemoryCacheKey(currentImg)
                 val cachedBitmap = context.imageLoader.memoryCache?.get(
                     coil.memory.MemoryCache.Key(cacheKey)
                 )?.bitmap
@@ -473,17 +483,7 @@ fun SwipeableCardStack(
                     // 从缓存获取成功，缩放到 Genie 动画需要的尺寸
                     // 注意：Bitmap.createScaledBitmap 是 CPU 密集型操作，保持在 IO 线程避免影响 UI
                     val maxSize = 250
-                    val scale = minOf(
-                        maxSize.toFloat() / cachedBitmap.width,
-                        maxSize.toFloat() / cachedBitmap.height,
-                        1f
-                    )
-                    val targetWidth = (cachedBitmap.width * scale).toInt().coerceAtLeast(50)
-                    val targetHeight = (cachedBitmap.height * scale).toInt().coerceAtLeast(50)
-                    
-                    // 创建缩放副本（不修改缓存中的原图）
-                    // 使用 filter=false 加速缩放，Genie 动画不需要高质量缩放
-                    bitmap = Bitmap.createScaledBitmap(cachedBitmap, targetWidth, targetHeight, false)
+                    bitmap = ownedScaledCopyOrNull(cachedBitmap, 250)
                 }
                 
                 // 方案2：缓存未命中，使用快速文件加载
@@ -536,22 +536,13 @@ fun SwipeableCardStack(
                 var bitmap: Bitmap? = null
                 
                 // 方案1：尝试从 Coil 内存缓存获取
-                val cacheKey = "card_${currentImg.id}"
+                val cacheKey = cardMemoryCacheKey(currentImg)
                 val cachedBitmap = context.imageLoader.memoryCache?.get(
                     coil.memory.MemoryCache.Key(cacheKey)
                 )?.bitmap
                 
                 if (cachedBitmap != null && !cachedBitmap.isRecycled) {
-                    val maxSize = 250
-                    val scale = minOf(
-                        maxSize.toFloat() / cachedBitmap.width,
-                        maxSize.toFloat() / cachedBitmap.height,
-                        1f
-                    )
-                    val targetWidth = (cachedBitmap.width * scale).toInt().coerceAtLeast(50)
-                    val targetHeight = (cachedBitmap.height * scale).toInt().coerceAtLeast(50)
-                    // 使用 filter=false 加速缩放
-                    bitmap = Bitmap.createScaledBitmap(cachedBitmap, targetWidth, targetHeight, false)
+bitmap = ownedScaledCopyOrNull(cachedBitmap, 250)
                 }
                 
                 // 方案2：缓存未命中，使用快速文件加载
@@ -996,6 +987,14 @@ fun SwipeableCardStack(
             onClassifyModeChange?.invoke(false)
         }
     }
+
+    fun resolveSharePhoto(): ImageFile? {
+        return if (isDragging || isClassifyMode || isTransitioning || genieController.isAnimating ||
+                fixedTagTriggerIndex != null || dragOffsetX.isRunning || dragOffsetY.isRunning ||
+                dragScale.isRunning || dragAlpha.isRunning) null else currentImage
+    }
+    val sharingAvailable = resolveSharePhoto() != null
+    SideEffect { shareState?.update(::resolveSharePhoto, sharingAvailable) }
 
     Box(
         modifier = modifier
@@ -1580,7 +1579,8 @@ private fun DrawModeCardStack(
     onSwipeStart: ((xRatio: Float, yRatio: Float) -> Unit)? = null,
     fixedTagTriggerIndex: Int? = null,
     onFixedTagAnimationComplete: (() -> Unit)? = null,
-    genieController: GenieAnimationController
+    genieController: GenieAnimationController,
+    shareState: CardShareState? = null
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -1617,32 +1617,13 @@ private fun DrawModeCardStack(
     var drawState by remember { mutableStateOf(DrawCardState(currentIndex = currentIndex)) }
     
     // 当外部 currentIndex 变化时同步状态（如删除图片后）
-    // 改进：保留 dealtStack 中仍然有效的条目，只清理已删除的图片记录
+    // 重校验按发牌时捕获的完整媒体身份 (卷,ID) 定位（revalidateDealtStack），
+    // 不同卷的同数值 ID 行不会互串；缺失/歧义按缺失丢弃，不回退裸 ID 匹配
     LaunchedEffect(currentIndex, images.size) {
         if (drawState.currentIndex != currentIndex) {
-            // 构建当前图片 ID 集合，用于快速查找
-            val currentImageIds = images.map { it.id }.toSet()
-            
-            // 过滤 dealtStack，只保留仍然存在的图片记录
-            // 同时重新计算 originalIndex（因为删除操作可能改变了索引）
-            val validDealtStack = drawState.dealtStack.mapNotNull { dealtCard ->
-                if (dealtCard.cardId in currentImageIds) {
-                    // 卡片仍然存在，查找新的索引位置
-                    val newIndex = images.indexOfFirst { it.id == dealtCard.cardId }
-                    if (newIndex != -1 && newIndex < currentIndex) {
-                        // 只保留在当前索引之前的条目
-                        dealtCard.copy(originalIndex = newIndex)
-                    } else {
-                        null
-                    }
-                } else {
-                    null  // 卡片已被删除
-                }
-            }
-            
             drawState = drawState.copy(
                 currentIndex = currentIndex,
-                dealtStack = validDealtStack,
+                dealtStack = revalidateDealtStack(drawState.dealtStack, images, currentIndex),
                 // 清除动画状态
                 returningCard = null,
                 exitingRightCard = null
@@ -1768,6 +1749,7 @@ private fun DrawModeCardStack(
     
     // 图片预加载 - 扩大范围确保流畅
     val preloadingManager = remember { PreloadingManager(context, preloadRange = 5) }
+    DisposableEffect(Unit) { onDispose { preloadingManager.dispose() } }
     LaunchedEffect(drawState.currentIndex, images) {
         preloadingManager.preloadAround(
             images = images,
@@ -1803,10 +1785,11 @@ private fun DrawModeCardStack(
     val rightCard = drawState.getRightCard(images)   // deck[i+2]
     
     // 预览返回牌（左滑收牌时显示）
-    val previewReturningCard = remember(drawState.dealtStack) {
-        if (drawState.canRecall()) {
-            drawState.dealtStack.lastOrNull()?.let { images.getOrNull(it.originalIndex) }
-        } else null
+    // C4/T07 任务 B：预览必须随快照替换刷新——dealtStack 与 images 双键
+    //（同身份行更新为最新对象时 dealtStack 不变，单键会停留旧版本；实际
+    // 收牌在 recall 时现取 images[originalIndex]，预览须与之一致）
+    val previewReturningCard = remember(drawState.dealtStack, images) {
+        if (drawState.canRecall()) previewReturningCardOf(drawState.dealtStack, images) else null
     }
     
     // 计算卡片比例
@@ -2139,22 +2122,13 @@ private fun DrawModeCardStack(
         preloadGenieJob = scope.launch(Dispatchers.IO) {
             try {
                 var bitmap: Bitmap? = null
-                val cacheKey = "card_${currentImg.id}"
+                val cacheKey = cardMemoryCacheKey(currentImg)
                 val cachedBitmap = context.imageLoader.memoryCache?.get(
                     MemoryCache.Key(cacheKey)
                 )?.bitmap
                 
                 if (cachedBitmap != null && !cachedBitmap.isRecycled) {
-                    val maxSize = 250
-                    val scale = minOf(
-                        maxSize.toFloat() / cachedBitmap.width,
-                        maxSize.toFloat() / cachedBitmap.height,
-                        1f
-                    )
-                    val targetWidth = (cachedBitmap.width * scale).toInt().coerceAtLeast(50)
-                    val targetHeight = (cachedBitmap.height * scale).toInt().coerceAtLeast(50)
-                    // 使用 filter=false 加速缩放
-                    bitmap = Bitmap.createScaledBitmap(cachedBitmap, targetWidth, targetHeight, false)
+bitmap = ownedScaledCopyOrNull(cachedBitmap, 250)
                 }
                 
                 if (bitmap == null) {
@@ -2204,22 +2178,13 @@ private fun DrawModeCardStack(
         preloadDeleteJob = scope.launch(Dispatchers.IO) {
             try {
                 var bitmap: Bitmap? = null
-                val cacheKey = "card_${currentImg.id}"
+                val cacheKey = cardMemoryCacheKey(currentImg)
                 val cachedBitmap = context.imageLoader.memoryCache?.get(
                     MemoryCache.Key(cacheKey)
                 )?.bitmap
                 
                 if (cachedBitmap != null && !cachedBitmap.isRecycled) {
-                    val maxSize = 250
-                    val scale = minOf(
-                        maxSize.toFloat() / cachedBitmap.width,
-                        maxSize.toFloat() / cachedBitmap.height,
-                        1f
-                    )
-                    val targetWidth = (cachedBitmap.width * scale).toInt().coerceAtLeast(50)
-                    val targetHeight = (cachedBitmap.height * scale).toInt().coerceAtLeast(50)
-                    // 使用 filter=false 加速缩放
-                    bitmap = Bitmap.createScaledBitmap(cachedBitmap, targetWidth, targetHeight, false)
+bitmap = ownedScaledCopyOrNull(cachedBitmap, 250)
                 }
                 
                 if (bitmap == null) {
@@ -2518,6 +2483,15 @@ private fun DrawModeCardStack(
             onClassifyModeChange?.invoke(false)
         }
     }
+
+    fun resolveSharePhoto(): ImageFile? {
+        return if (isDragging || isClassifyMode || isDrawTransitioning || isRecallTransitioning ||
+                drawState.returningCard != null || genieController.isAnimating || fixedTagTriggerIndex != null ||
+                centerDragOffsetX.isRunning || centerDragOffsetY.isRunning ||
+                centerDragScale.isRunning || centerDragAlpha.isRunning) null else centerCard
+    }
+    val sharingAvailable = resolveSharePhoto() != null
+    SideEffect { shareState?.update(::resolveSharePhoto, sharingAvailable) }
 
     Box(
         modifier = modifier

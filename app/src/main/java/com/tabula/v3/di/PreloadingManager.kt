@@ -3,18 +3,17 @@ package com.tabula.v3.di
 import android.content.Context
 import android.util.Log
 import androidx.compose.ui.unit.IntSize
+import coil.request.Disposable
 import coil.request.ImageRequest
 import coil.size.Size
 import com.tabula.v3.data.model.ImageFile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -31,183 +30,154 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class PreloadingManager(
     private val context: Context,
-    private val preloadRange: Int = 1  // 从 2 降到 1，减少内存压力
+    private val preloadRange: Int = 1,  // 从 2 降到 1，减少内存压力
+    providedLoader: coil.ImageLoader? = null,
+    // C4/T07 任务 E：测试注入确定性调度 scope（防抖时序不再依赖真实 IO
+    // 调度与 Thread.sleep）；生产路径不传，默认 scope 行为不变
+    providedScope: CoroutineScope? = null
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val imageLoader = CoilSetup.getImageLoader(context)
+    private val scope: CoroutineScope = providedScope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val imageLoader: coil.ImageLoader = providedLoader ?: CoilSetup.getImageLoader(context)
 
-    // 记录已预加载的索引，避免重复加载（线程安全）
-    private val preloadedIndices: MutableSet<Int> = ConcurrentHashMap.newKeySet()
-    
-    // 保护并发操作的锁
-    private val mutex = Mutex()
-
-    // 上次预加载的中心索引
-    @Volatile
-    private var lastPreloadCenter: Int = -1
-    
-    // 预加载暂停状态（滑动时暂停）
+    private val lock = Any()
+    private data class Active(val token: Long, val identity: String, val cacheResult: Boolean, var disposable: Disposable? = null)
+    private val active = mutableMapOf<Int, Active>()
+    private val completed = mutableSetOf<String>()
+    private var nextToken = 0L
+    private var generation = 0L
+    private var disposed = false
     private val isPaused = AtomicBoolean(false)
-    
-    // 防抖任务
     private var debounceJob: Job? = null
-    
-    // 防抖延迟（毫秒）
     private val debounceDelay = 100L
 
-    /**
-     * 暂停预加载（在快速滑动时调用）
-     */
     fun pause() {
         isPaused.set(true)
-        debounceJob?.cancel()
-    }
-    
-    /**
-     * 恢复预加载
-     */
-    fun resume() {
-        isPaused.set(false)
+        synchronized(lock) { generation++; debounceJob?.cancel() }
     }
 
-    /**
-     * 根据当前索引预加载相邻图片（带防抖）
-     *
-     * @param images 完整图片列表
-     * @param currentIndex 当前显示的索引
-     * @param cardSize 卡片尺寸（宽 x 高），用于精确加载
-     */
-    fun preloadAround(
-        images: List<ImageFile>,
-        currentIndex: Int,
-        cardSize: IntSize
-    ) {
-        // 如果中心索引没变，跳过
-        if (currentIndex == lastPreloadCenter) return
-        lastPreloadCenter = currentIndex
-        
-        // 取消之前的防抖任务
-        debounceJob?.cancel()
-        
-        // 使用防抖延迟执行预加载，避免快速滑动时触发大量加载
-        debounceJob = scope.launch {
-            delay(debounceDelay)
-            
-            // 如果被暂停，跳过
-            if (isPaused.get()) return@launch
-            
-            mutex.withLock {
-                // 计算需要预加载的索引范围
-                val startIndex = (currentIndex - preloadRange).coerceAtLeast(0)
-                val endIndex = (currentIndex + preloadRange).coerceAtMost(images.lastIndex)
+    fun resume() { isPaused.set(false) }
 
-                for (index in startIndex..endIndex) {
-                    // 再次检查暂停状态
-                    if (isPaused.get()) break
-                    
-                    // 跳过已预加载的
-                    if (index in preloadedIndices) continue
-
-                    val image = images.getOrNull(index) ?: continue
-                    preloadImage(image, cardSize)
-                    preloadedIndices.add(index)
+    fun preloadAround(images: List<ImageFile>, currentIndex: Int, cardSize: IntSize) {
+        if (isPaused.get()) return
+        val snapshot = images.toList()
+        synchronized(lock) {
+            if (disposed || isPaused.get()) return
+            val runGeneration = ++generation
+            debounceJob?.cancel()
+            debounceJob = scope.launch {
+                delay(debounceDelay)
+                synchronized(lock) {
+                    if (disposed || isPaused.get() || runGeneration != generation) return@synchronized
+                    val start = (currentIndex - preloadRange).coerceAtLeast(0)
+                    val end = (currentIndex + preloadRange).coerceAtMost(snapshot.lastIndex)
+                    val window = if (start <= end) (start..end).mapNotNull { index ->
+                        snapshot.getOrNull(index)?.let { index to requestIdentity(it) }
+                    }.toMap() else emptyMap()
+                    val windowKeys = window.values.toSet()
+                    completed.retainAll(windowKeys)
+                    val stale = active.filter { (index, request) -> window[index] != request.identity }
+                    stale.forEach { (index, request) -> active.remove(index); request.disposable?.dispose() }
+                    window.forEach { (index, identity) ->
+                        if (identity !in completed && active[index]?.identity != identity) {
+                            enqueue(index, snapshot[index], identity)
+                        }
+                    }
                 }
-
-                // 清理过期的预加载记录（保留最近的范围）
-                val keepRange = (currentIndex - preloadRange * 2)..(currentIndex + preloadRange * 2)
-                val toRemove = preloadedIndices.filter { it !in keepRange }
-                preloadedIndices.removeAll(toRemove.toSet())
             }
         }
     }
 
-    /**
-     * 预加载单张图片
-     *
-     * @param image 要预加载的图片
-     * @param targetSize 目标尺寸（未使用，改为使用固定尺寸以匹配 ImageCard）
-     */
-    private suspend fun preloadImage(image: ImageFile, targetSize: IntSize) {
-        // 如果被暂停，跳过
-        if (isPaused.get()) return
-        
+    // cardSize 为兼容调用方保留；沿用固定 720px 上限，身份键记录实际解码尺寸。
+    private fun loadSize(image: ImageFile): Size = if (!image.hasDimensionInfo) {
+        Size(540, 720)
+    } else if (image.aspectRatio < 1f) {
+        Size((720 * image.aspectRatio).toInt().coerceAtLeast(270), 720)
+    } else {
+        Size(720, (720 / image.aspectRatio).toInt().coerceAtLeast(270))
+    }
+
+    private fun requestIdentity(image: ImageFile): String = "${cardMemoryCacheKey(image)}|${loadSize(image)}|hardware=false"
+
+    // lock is held; callbacks may arrive synchronously during enqueue.
+    private fun enqueue(index: Int, image: ImageFile, identity: String, cacheResult: Boolean = true) {
+        val token = ++nextToken
+        val requestState = Active(token, identity, cacheResult)
+        active[index] = requestState
         try {
-            // 使用与 ImageCard 相同的缓存键格式
-            val cacheKey = "card_${image.id}"
-            
-            // 优化：使用更小的尺寸（720px 而非 1080px）
-            val loadSize = if (!image.hasDimensionInfo) {
-                Size(540, 720)  // 从 810x1080 降到 540x720
-            } else {
-                val maxDimension = 720  // 从 1080 降到 720
-                if (image.aspectRatio < 1f) {
-                    val height = maxDimension
-                    val width = (height * image.aspectRatio).toInt().coerceAtLeast(270)
-                    Size(width, height)
-                } else {
-                    val width = maxDimension
-                    val height = (width / image.aspectRatio).toInt().coerceAtLeast(270)
-                    Size(width, height)
-                }
-            }
-            
             val request = ImageRequest.Builder(context)
                 .data(image.uri)
-                .size(loadSize)
-                // 使用与 ImageCard 相同的缓存键
-                .memoryCacheKey(cacheKey)
-                .diskCacheKey(cacheKey)
+                .size(loadSize(image))
+                .memoryCacheKey(cardMemoryCacheKey(image))
+                .diskCacheKey(cardMemoryCacheKey(image))
                 .memoryCachePolicy(coil.request.CachePolicy.ENABLED)
                 .diskCachePolicy(coil.request.CachePolicy.ENABLED)
-                // 禁用硬件位图，与 ImageCard 保持一致
                 .allowHardware(false)
-                .build()
-
-            imageLoader.enqueue(request)
-
-            Log.d(TAG, "预加载图片: ${image.displayName}")
+                .listener(
+                    onSuccess = { _, _ -> finish(index, token, true) },
+                    onError = { _, _ -> finish(index, token, false) }
+                ).build()
+            val disposable = imageLoader.enqueue(request)
+            if (active[index] === requestState) requestState.disposable = disposable else disposable.dispose()
         } catch (e: Exception) {
+            if (active[index] === requestState) active.remove(index)
             Log.w(TAG, "预加载失败: ${image.displayName}", e)
         }
     }
 
-    /**
-     * 立即预加载指定索引的图片（优先级更高）
-     *
-     * @param images 图片列表
-     * @param indices 要预加载的索引列表
-     * @param cardSize 卡片尺寸
-     */
-    fun preloadImmediate(
-        images: List<ImageFile>,
-        indices: List<Int>,
-        cardSize: IntSize
-    ) {
-        scope.launch {
-            mutex.withLock {
-                indices.forEach { index ->
-                    val image = images.getOrNull(index) ?: return@forEach
-                    preloadImage(image, cardSize)
-                    preloadedIndices.add(index)
-                }
+    private fun finish(index: Int, token: Long, success: Boolean) {
+        synchronized(lock) {
+            val request = active[index] ?: return
+            if (request.token != token || disposed) return
+            active.remove(index)
+            if (success && request.cacheResult) completed.add(request.identity)
+        }
+    }
+
+    fun preloadImmediate(images: List<ImageFile>, indices: List<Int>, cardSize: IntSize) {
+        synchronized(lock) {
+            if (disposed || isPaused.get()) return
+            indices.forEach { index ->
+                val image = images.getOrNull(index) ?: return@forEach
+                val identity = requestIdentity(image)
+                val previous = active.remove(index)
+                previous?.disposable?.dispose()
+                enqueue(index, image, identity, cacheResult = false)
             }
         }
     }
 
-    /**
-     * 重置预加载状态（例如切换相册时）
-     */
     fun reset() {
-        debounceJob?.cancel()
-        scope.launch {
-            mutex.withLock {
-                preloadedIndices.clear()
-                lastPreloadCenter = -1
-            }
+        synchronized(lock) {
+            generation++
+            debounceJob?.cancel()
+            val old = active.values.toList()
+            active.clear()
+            completed.clear()
+            old.forEach { it.disposable?.dispose() }
         }
+    }
+
+    fun dispose() {
+        synchronized(lock) {
+            if (disposed) return
+            disposed = true
+            generation++
+            debounceJob?.cancel()
+            val old = active.values.toList()
+            active.clear()
+            completed.clear()
+            old.forEach { it.disposable?.dispose() }
+        }
+        scope.cancel()
     }
 
     companion object {
         private const val TAG = "PreloadingManager"
     }
 }
+
+/**
+ * T06b：卡片显示/预加载共用的缓存请求键，含内容版本（DATE_MODIFIED 毫秒，T03 契约）——
+ * 同 id 内容编辑后自然失效。所有 "card_" 键的读写必须经此函数，避免各处键格式漂移。
+ */
+fun cardMemoryCacheKey(image: ImageFile): String = "card_${image.uri}_${image.dateModified}"

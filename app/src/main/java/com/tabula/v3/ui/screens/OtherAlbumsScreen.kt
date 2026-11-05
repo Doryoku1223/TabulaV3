@@ -41,6 +41,9 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
+import com.tabula.v3.data.repository.resolveCoverRow
+import com.tabula.v3.ui.util.coverImageRequest
+
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.util.HapticFeedback
 
@@ -68,7 +71,8 @@ fun OtherAlbumsScreen(
     val secondaryTextColor = Color(0xFF8E8E93)
     val accentColor = Color(0xFF007AFF)
 
-    val imageMap = androidx.compose.runtime.remember(allImages) { allImages.associateBy { it.id } }
+    // C1/T03-COVER：多值映射——跨卷同 ID 行不折叠。
+    val imageMap = androidx.compose.runtime.remember(allImages) { allImages.groupBy { it.id } }
 
     // 按图片数量降序排序
     val sortedAlbums = androidx.compose.runtime.remember(albums) {
@@ -132,7 +136,9 @@ fun OtherAlbumsScreen(
             items(sortedAlbums, key = { it.id }) { album ->
                 OtherAlbumRow(
                     album = album,
-                    coverImage = album.coverImageId?.let { imageMap[it] },
+                    coverImage = album.coverImageId?.let { coverId ->
+                        resolveCoverRow(album.coverVolumeName, coverId, imageMap[coverId].orEmpty())
+                    },
                     onClick = { onAlbumClick(album) },
                     onPin = { onPinAlbum(album.name) },
                     cardColor = cardColor,
@@ -164,9 +170,8 @@ private fun OtherAlbumRow(
 ) {
     val context = LocalContext.current
 
-    // 封面 URI（优先用 imageMap，fallback 用 coverImageId 构建 URI）
+    // C1/T03-COVER：封面 URI = 解析行的卷限定 URI（解析失败 → 占位）。
     val coverUri = coverImage?.uri
-        ?: album.coverImageId?.let { android.net.Uri.parse("content://media/external/images/media/$it") }
 
     Row(
         modifier = Modifier
@@ -188,15 +193,13 @@ private fun OtherAlbumRow(
                 .clip(RoundedCornerShape(8.dp))
                 .background(if (isDarkTheme) Color(0xFF2C2C2E) else Color(0xFFE5E5EA))
         ) {
-            if (coverUri != null) {
+            if (coverImage != null) {
+                // C1/T03-COVERKEY：请求经生产构造器（身份+内容版本缓存键）。
                 AsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(coverUri)
-                        .size(coil.size.Size(120, 120))
-                        .precision(coil.size.Precision.INEXACT)
-                        .bitmapConfig(android.graphics.Bitmap.Config.RGB_565)
-                        .crossfade(false)
-                        .build(),
+                    model = coverImageRequest(
+                        context, coverImage, "other_albums_cover_",
+                        size = coil.size.Size(120, 120), inexact = true, rgb565 = true
+                    ),
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()

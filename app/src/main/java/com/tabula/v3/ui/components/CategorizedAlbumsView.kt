@@ -67,12 +67,17 @@ import coil.request.ImageRequest
 import com.tabula.v3.R
 import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
+import com.tabula.v3.data.repository.mediaIdentityKey
+import com.tabula.v3.data.repository.resolveCoverRow
+import com.tabula.v3.ui.util.gridThumbnailCacheKey
+
 import com.tabula.v3.data.repository.LocalImageRepository
 import com.tabula.v3.ui.util.HapticFeedback
 import com.tabula.v3.ui.util.StringDragSelectState
 import com.tabula.v3.ui.util.gridDragHandlerString
 import com.tabula.v3.ui.util.itemDragReceiverString
 import com.tabula.v3.ui.util.rememberStringDragSelectState
+import com.tabula.v3.ui.util.coverImageRequest
 import com.tabula.v3.ui.util.toggleSelection
 import kotlin.math.roundToInt
 
@@ -110,7 +115,9 @@ fun CategorizedAlbumsView(
     onOtherAlbumsClick: () -> Unit = {}     // ??"????"?????
 ) {
     val context = LocalContext.current
-    val imageMap = remember(allImages) { allImages.associateBy { it.id } }
+    // C1/T03-COVER：按数值 ID 分组的**多值**映射——跨卷同 ID 行不折叠，
+    // 封面解析按封面卷归属选取（resolveCoverRow）。
+    val imageMap = remember(allImages) { allImages.groupBy { it.id } }
     val selectableIds = remember(appAlbums, systemBuckets) {
         buildList {
             appAlbums?.forEach { add(it.id) }
@@ -269,7 +276,9 @@ fun CategorizedAlbumsView(
                             }
                         }
                         items(appAlbums, key = { it.id }) { album ->
-                            val coverImage = album.coverImageId?.let { imageMap[it] }
+                            val coverImage = album.coverImageId?.let { coverId ->
+                                resolveCoverRow(album.coverVolumeName, coverId, imageMap[coverId].orEmpty())
+                            }
                             AppAlbumCard(
                                 album = album,
                                 coverImage = coverImage,
@@ -337,7 +346,9 @@ fun CategorizedAlbumsView(
                 }
             } else {
                 items(systemBuckets, key = { it.name }) { bucket ->
-                    val coverImage = bucket.coverImageId?.let { imageMap[it] }
+                    val coverImage = bucket.coverImageId?.let { coverId ->
+                        resolveCoverRow(bucket.volumeName, coverId, imageMap[coverId].orEmpty())
+                    }
                     SystemBucketRow(
                         bucket = bucket,
                         coverImage = coverImage,
@@ -472,8 +483,9 @@ private fun AppAlbumCard(
     val context = LocalContext.current
 
     // ??? coverImage ? null ???? coverImageId??????? ID ???? URI ??? fallback
-    val coverUri = coverImage?.uri 
-        ?: album.coverImageId?.let { android.net.Uri.parse("content://media/external/images/media/$it") }
+    // C1/T03-COVER：封面 URI = 解析行的卷限定 URI；解析失败（缺失/歧义/
+    // 暂时不可读）→ null 占位，不猜聚合 URI（跨卷串图向量）。
+    val coverUri = coverImage?.uri
     
     // ????????????
     var loadFailed by remember { mutableStateOf(false) }
@@ -509,7 +521,10 @@ private fun AppAlbumCard(
                 )
             } else if (coverUri != null && !loadFailed) {
                 // ??????? - ?????????????????????????
-                val coverCacheKey = remember(album.id) { "album_thumb_${album.id}" }
+                // C1/T03-COVER：键 = 封面行身份 + 内容版本（封面更换/编辑后刷新）。
+                val coverCacheKey = remember(coverImage?.mediaIdentityKey(), coverImage?.dateModified) {
+                    gridThumbnailCacheKey("album_thumb_", coverImage)
+                }
                 AsyncImage(
                     model = ImageRequest.Builder(context)
                         .data(coverUri)
@@ -593,11 +608,9 @@ private fun AppAlbumGridCard(
     disableImageLoading: Boolean = false  // ????????????????????
 ) {
     val context = LocalContext.current
-    
-    // ??? coverImage ? null ???? coverImageId??????? ID ???? URI ??? fallback
-    val coverUri = coverImage?.uri 
-        ?: album.coverImageId?.let { android.net.Uri.parse("content://media/external/images/media/$it") }
-    
+    // C1/T03-COVER：封面 URI = 解析行的卷限定 URI；解析失败（缺失/歧义/
+    // 暂时不可读）→ null 占位，不猜聚合 URI（跨卷串图向量）。
+    val coverUri = coverImage?.uri
     // ????????????
     var loadFailed by remember { mutableStateOf(false) }
 
@@ -640,7 +653,10 @@ private fun AppAlbumGridCard(
                 )
             } else if (coverUri != null && !loadFailed) {
                 // ??????? - ?????????????????????????
-                val coverCacheKey = remember(album.id) { "album_thumb_grid_${album.id}" }
+                // C1/T03-COVER：键 = 封面行身份 + 内容版本（封面更换/编辑后刷新）。
+                val coverCacheKey = remember(coverImage?.mediaIdentityKey(), coverImage?.dateModified) {
+                    gridThumbnailCacheKey("album_thumb_", coverImage)
+                }
                 AsyncImage(
                     model = ImageRequest.Builder(context)
                         .data(coverUri)
@@ -756,11 +772,11 @@ private fun SystemBucketRow(
                 .background(if (isDarkTheme) Color(0xFF2C2C2E) else Color(0xFFE5E5EA))
         ) {
             if (coverImage != null) {
+                // C1/T03-COVERKEY：请求经生产构造器（身份+内容版本缓存键）。
                 AsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(coverImage.uri)
-                        .crossfade(true)
-                        .build(),
+                    model = coverImageRequest(
+                        context, coverImage, "system_bucket_cover_", crossfade = true
+                    ),
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
@@ -1008,7 +1024,7 @@ private fun OtherAlbumsCard(
 private fun DraggableAlbumsGridInternal(
     albums: List<Album>,
     allImages: List<ImageFile>,
-    imageMap: Map<Long, ImageFile>,
+    imageMap: Map<Long, List<ImageFile>>,
     onAlbumClick: (Album) -> Unit,
     onReorder: (List<String>) -> Unit,
     onCreateAlbumClick: (() -> Unit)?,
@@ -1277,7 +1293,9 @@ private fun DraggableAlbumsGridInternal(
                             // ??? key ?? Compose ??????????????????????????????????????
                             androidx.compose.runtime.key(album.id) {
                                 val isDragging = draggingAlbumId == album.id
-                                val coverImage = album.coverImageId?.let { imageMap[it] }
+                                val coverImage = album.coverImageId?.let { coverId ->
+                                    resolveCoverRow(album.coverVolumeName, coverId, imageMap[coverId].orEmpty())
+                                }
                                 
                                 // ??????????
                                 val (displacementX, displacementY) = calculateDisplacement(albumIndex)
@@ -1488,7 +1506,7 @@ private fun DraggableAlbumsGridInternal(
 @Composable
 private fun SimpleAlbumsGridInternal(
     albums: List<Album>,
-    imageMap: Map<Long, ImageFile>,
+    imageMap: Map<Long, List<ImageFile>>,
     onAlbumClick: (Album) -> Unit,
     onCreateAlbumClick: (() -> Unit)?,
     isSelectionMode: Boolean,
@@ -1538,7 +1556,9 @@ private fun SimpleAlbumsGridInternal(
                         
                         if (albumIndex in albums.indices) {
                             val album = albums[albumIndex]
-                            val coverImage = album.coverImageId?.let { imageMap[it] }
+                            val coverImage = album.coverImageId?.let { coverId ->
+                                resolveCoverRow(album.coverVolumeName, coverId, imageMap[coverId].orEmpty())
+                            }
                             
                             Box(modifier = Modifier.weight(1f)) {
                                 AppAlbumGridCard(

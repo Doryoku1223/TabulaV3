@@ -2,6 +2,7 @@ package com.tabula.v3.data.repository
 
 import android.content.Context
 import com.tabula.v3.data.cache.ImageHashCache
+import com.tabula.v3.data.cache.toHashKey
 import com.tabula.v3.data.model.ImageFile
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -24,12 +25,46 @@ data class SimilarGroup(
 ) {
     /** 组内图片数量 */
     val size: Int get() = images.size
-    
-    /** 组的唯一标识（用于冷却机制） */
-    val id: String get() = "${startTime}_${images.firstOrNull()?.id ?: 0}"
-    
+
+    /**
+     * 组的唯一标识（冷却与专清永久标记的主键）。
+     * C1/T03-GROUPID：身份 = 成员完整媒体身份键集合的内容寻址摘要——
+     * 排序后哈希（成员重排不产生变化）；键含卷（不同卷的不同成员集合必
+     * 不相同，跨卷同数值 ID 的组不再共用标记）。旧口径
+     * "startTime_首张数字 ID" 对成员重排不稳定且跨卷碰撞，识别与解析见
+     * [isLegacyGroupId]/[parseLegacyGroupId]。
+     */
+    val id: String get() = similarGroupId(images)
+
     /** 组的时间跨度（毫秒） */
     val durationMs: Long get() = endTime - startTime
+}
+
+/**
+ * C1/T03-GROUPID：相似组身份 = 排序后的成员完整媒体身份键集合的
+ * SHA-256 截断摘要。成员集相同 ⇒ 身份相同（检测与持久化恢复一致）；
+ * 任一成员不同（含卷不同）⇒ 身份不同。
+ */
+internal fun similarGroupId(images: List<ImageFile>): String {
+    val digest = java.security.MessageDigest.getInstance("SHA-256")
+    images.map { it.mediaIdentityKey() }.sorted().forEach { key ->
+        digest.update(key.toByteArray(Charsets.UTF_8))
+        digest.update('\n'.code.toByte())
+    }
+    return "grp_" + digest.digest().joinToString("") { "%02x".format(it) }.take(16)
+}
+
+/** 旧口径组 ID 形如 "${startTime 毫秒}_${首张数字 ID}"（无 grp_ 前缀）。 */
+internal fun isLegacyGroupId(groupId: String): Boolean =
+    !groupId.startsWith("grp_") && Regex("^\\d+_\\d+$").matches(groupId)
+
+/** 解析旧口径组 ID 为 (startTime 毫秒, 首张数字 ID)；非旧格式返回 null。 */
+internal fun parseLegacyGroupId(groupId: String): Pair<Long, Long>? {
+    if (!isLegacyGroupId(groupId)) return null
+    val parts = groupId.split('_')
+    val start = parts[0].toLongOrNull() ?: return null
+    val firstId = parts[1].toLongOrNull() ?: return null
+    return start to firstId
 }
 
 /**
@@ -121,8 +156,8 @@ class SimilarGroupDetector(
         for ((i, j) in candidatePairs) {
             val photo1 = sorted[i]
             val photo2 = sorted[j]
-            val hash1 = hashMap[photo1.id]
-            val hash2 = hashMap[photo2.id]
+            val hash1 = hashMap[photo1.toHashKey()]
+            val hash2 = hashMap[photo2.toHashKey()]
             
             // 计算完整相似度（含哈希）
             val (metaScore, hashDist) = calculateSimilarityWithHash(
@@ -214,55 +249,59 @@ class SimilarGroupDetector(
     }
     
     /**
-     * 确保所有图片的 pHash 已计算
-     * 
-     * @return Map<imageId, hash?>，hash 为 null 表示计算失败
+     * 确保所有图片的 pHash 已计算。
+     * C1/T03-HASHVOLUME：内部映射与缓存全部按完整媒体身份键（卷|ID）——
+     * 不同卷的同数值 ID 行各自计算、各自缓存，互不折叠。
+     *
+     * @return Map<身份键, hash?>，hash 为 null 表示计算失败
      */
     suspend fun ensureHashesComputed(
         images: List<ImageFile>
-    ): Map<Long, Long?> = withContext(Dispatchers.IO) {
+    ): Map<ImageHashCache.HashKey, Long?> = withContext(Dispatchers.IO) {
         if (images.isEmpty()) return@withContext emptyMap()
-        
-        val imageIds = images.map { it.id }
-        
-        // Step 1: 批量查询已缓存的哈希
-        val cached = hashCache.getHashesBatch(imageIds)
-        
-        // Step 2: 找出需要计算的图片（未缓存的）
+
+        val keys = images.map { it.toHashKey() }
+        // TC58/C1.1：内容版本（DATE_MODIFIED 毫秒）参与缓存有效性。
+        val contentVersions = images.associate { it.toHashKey() to it.dateModified }
+
+        // Step 1: 批量查询已缓存的哈希（版本过期视为未缓存）
+        val cached = hashCache.getHashesBatch(keys, contentVersions)
+
+        // Step 2: 需要计算：未缓存/版本过期/此前失败（有界重试：每轮一次）
         val needCompute = images.filter { img ->
-            val cachedHash = cached[img.id]
-            cachedHash == null  // 未缓存才需要计算，失败的不重试
+            val cachedHash = cached[img.toHashKey()]
+            cachedHash == null || cachedHash.isFailed
         }
-        
+
         android.util.Log.d(TAG, "Need to compute hash for ${needCompute.size} images")
-        
+
         // Step 3: 并发计算哈希（分批处理避免内存压力）
-        val newResults = mutableMapOf<Long, PerceptualHash.HashResult>()
-        
+        val newResults = mutableMapOf<ImageHashCache.HashKey, PerceptualHash.HashResult>()
+
         if (needCompute.isNotEmpty()) {
             try {
                 needCompute.chunked(HASH_COMPUTE_BATCH_SIZE).forEach { batch ->
                     val batchResults = batch.map { img ->
                         async {
                             try {
-                                img.id to PerceptualHash.computeDHash(context, img.uri)
+                                img.toHashKey() to PerceptualHash.computeDHash(context, img.uri)
                             } catch (e: CancellationException) {
                                 throw e  // 重新抛出取消异常
                             } catch (e: Exception) {
                                 // 单张图片计算失败不影响其他图片
                                 android.util.Log.w(TAG, "Hash compute failed for ${img.id}: ${e.message}")
-                                img.id to PerceptualHash.HashResult.Failed(e.message ?: "Unknown error")
+                                img.toHashKey() to PerceptualHash.HashResult.Failed(e.message ?: "Unknown error")
                             }
                         }
                     }.awaitAll()
-                    
-                    batchResults.forEach { (id, result) ->
-                        newResults[id] = result
+
+                    batchResults.forEach { (key, result) ->
+                        newResults[key] = result
                     }
                 }
-                
-                // Step 4: 批量保存新计算的哈希
-                hashCache.saveHashesBatch(newResults)
+
+                // Step 4: 批量保存新计算的哈希（附内容版本）
+                hashCache.saveHashesBatch(newResults, contentVersions)
             } catch (e: CancellationException) {
                 // 协程取消时重新抛出，让上层正确处理
                 android.util.Log.d(TAG, "Hash computation cancelled")
@@ -272,23 +311,23 @@ class SimilarGroupDetector(
                 android.util.Log.e(TAG, "Hash computation error: ${e.message}", e)
             }
         }
-        
+
         // Step 5: 合并结果返回
-        val result = mutableMapOf<Long, Long?>()
-        
+        val result = mutableMapOf<ImageHashCache.HashKey, Long?>()
+
         // 已缓存的
-        for ((imageId, cachedHash) in cached) {
-            result[imageId] = cachedHash.hash
+        for ((key, cachedHash) in cached) {
+            result[key] = cachedHash.hash
         }
-        
+
         // 新计算的
-        for ((imageId, hashResult) in newResults) {
-            result[imageId] = when (hashResult) {
+        for ((key, hashResult) in newResults) {
+            result[key] = when (hashResult) {
                 is PerceptualHash.HashResult.Success -> hashResult.hash
                 is PerceptualHash.HashResult.Failed -> null
             }
         }
-        
+
         result
     }
     
@@ -438,15 +477,15 @@ class SimilarGroupDetector(
         newPhotoIdx: Int,
         groupReps: List<Int>,
         images: List<ImageFile>,
-        hashMap: Map<Long, Long?>
+        hashMap: Map<ImageHashCache.HashKey, Long?>
     ): Boolean {
         val newPhoto = images[newPhotoIdx]
-        val newHash = hashMap[newPhoto.id]
-        
+        val newHash = hashMap[newPhoto.toHashKey()]
+
         // 需要与至少一个代表图通过检查
         return groupReps.any { repIdx ->
             val repPhoto = images[repIdx]
-            val repHash = hashMap[repPhoto.id]
+            val repHash = hashMap[repPhoto.toHashKey()]
             
             val timeDiff = abs(newPhoto.dateModified - repPhoto.dateModified) / 1000
             val sameRes = (newPhoto.actualWidth == repPhoto.actualWidth && 
@@ -515,7 +554,7 @@ class SimilarGroupDetector(
      */
     private inner class ConstrainedUnionFind(
         private val images: List<ImageFile>,
-        private val hashMap: Map<Long, Long?>
+        private val hashMap: Map<ImageHashCache.HashKey, Long?>
     ) {
         private val size = images.size
         private val parent = IntArray(size) { it }
@@ -596,14 +635,14 @@ class SimilarGroupDetector(
             if (candidates.size <= 1) return candidates.first()
             
             return candidates.minByOrNull { candidate ->
-                val hash = hashMap[images[candidate].id]
+                val hash = hashMap[images[candidate].toHashKey()]
                 if (hash == null) {
                     Int.MAX_VALUE.toDouble()
                 } else {
                     val distances = candidates
                         .filter { it != candidate }
                         .mapNotNull { other ->
-                            val otherHash = hashMap[images[other].id]
+                            val otherHash = hashMap[images[other].toHashKey()]
                             otherHash?.let { PerceptualHash.hammingDistance(hash, it) }
                         }
                     

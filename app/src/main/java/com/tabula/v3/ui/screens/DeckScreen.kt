@@ -90,6 +90,16 @@ import androidx.compose.ui.platform.LocalDensity
 import com.tabula.v3.R
 import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
+import com.tabula.v3.data.repository.mediaIdentityKey
+import com.tabula.v3.ui.util.refreshedViewerImage
+import com.tabula.v3.ui.util.refreshedCleanupMonth
+import com.tabula.v3.ui.components.buildMonthInfos
+import com.tabula.v3.ui.util.relocatedIndexAfterSync
+import com.tabula.v3.ui.util.syncCleanupBatchToSnapshot
+import com.tabula.v3.ui.util.syncRowsToSnapshot
+import com.tabula.v3.data.repository.resolveCoverRow
+import com.tabula.v3.ui.util.coverImageRequest
+
 import com.tabula.v3.data.preferences.AlbumCleanupDisplayMode
 import com.tabula.v3.data.preferences.AppPreferences
 import com.tabula.v3.data.preferences.rememberAppPreferences
@@ -112,6 +122,8 @@ import com.tabula.v3.ui.components.SwipeableCardStack
 import com.tabula.v3.ui.components.GenieEffectOverlay
 import com.tabula.v3.ui.components.rememberGenieAnimationController
 import com.tabula.v3.ui.components.TopBar
+import com.tabula.v3.ui.components.CardShareState
+import com.tabula.v3.ui.util.rememberPhotoShareAction
 import com.tabula.v3.ui.components.UndoSnackbar
 import com.tabula.v3.ui.components.ViewerOverlay
 import com.tabula.v3.ui.components.ViewerState
@@ -195,8 +207,9 @@ fun DeckScreen(
     },
     // 推荐模式刷新触发器（用于切换算法时刷新批次）
     recommendModeRefreshKey: Int = 0,
-    // 从冷却池移除照片的回调（切换算法时用于移除未浏览的照片）
-    onRemoveFromCooldown: (List<Long>) -> Unit = {},
+    // 从冷却池移除照片的回调（切换算法时用于移除未浏览的照片；
+    // C1/T03-DECKCOOLDOWN：传照片行，接收端按完整媒体身份键移除）
+    onRemoveFromCooldown: (List<ImageFile>) -> Unit = {},
     // 相册归类相关
     albums: List<Album> = emptyList(),
     systemBuckets: List<LocalImageRepository.SystemBucket> = emptyList(),
@@ -320,6 +333,24 @@ fun DeckScreen(
     
     // 断点续传：保存当前位置（防抖处理，避免频繁写入）
     var lastSavedIndex by remember { mutableIntStateOf(-1) }
+
+    // No currently accessible batch does not imply that unfinished groups were reviewed.
+    fun showCleanupAvailability(cleanupId: String) {
+        currentCleanupBatch = null
+        preloadedNextBatch = null
+        currentBatch = emptyList()
+        currentIndex = 0
+        needsInitialBatch = false
+        albumCleanupTotalGroups = albumCleanupEngine?.getTotalGroups(cleanupId) ?: 0
+        albumCleanupRemainingGroups = albumCleanupEngine?.getRemainingGroups(cleanupId) ?: 0
+        albumCleanupTotalImages = albumCleanupEngine?.getTotalImages(cleanupId) ?: 0
+        albumCleanupRemainingImages = albumCleanupEngine?.getRemainingImages(cleanupId) ?: 0
+        deckState = if (albumCleanupEngine?.isAlbumCompleted(cleanupId) == true) {
+            DeckState.COMPLETED
+        } else {
+            DeckState.BROWSING
+        }
+    }
     androidx.compose.runtime.LaunchedEffect(currentIndex, isAlbumCleanupMode, currentCleanupBatch) {
         if (!isAlbumCleanupMode || albumCleanupEngine == null || currentCleanupBatch == null) return@LaunchedEffect
         // 只在索引真正变化时保存，且至少变化2张才保存（减少写入频率）
@@ -377,7 +408,7 @@ fun DeckScreen(
             return@LaunchedEffect
         }
         
-        if (cleanupId == null || cleanupImages.isEmpty()) return@LaunchedEffect
+        if (cleanupId == null) return@LaunchedEffect
         
         val remaining = (currentBatch.size - currentIndex - 1).coerceAtLeast(0)
         // 【性能优化】更积极的预加载：从 ≤3 改成 ≤5，给预加载更多时间完成
@@ -386,8 +417,10 @@ fun DeckScreen(
             isPreloadingNextBatch = true
             
             // 预取下一批数据，排除当前正在处理的组（避免重复）
+            // 分析范围仍是当前图集/月；已保存成员的访问与版本校验使用完整快照，
+            // 避免外部编辑跨月或移动图集后把仍可访问的成员误判为权限缺席。
             val currentGroupIds = currentCleanupBatch?.groupIds ?: emptyList()
-            val nextBatch = albumCleanupEngine.getNextBatch(cleanupId, cleanupImages, currentGroupIds)
+            val nextBatch = albumCleanupEngine.getNextBatch(cleanupId, cleanupImages, currentGroupIds, latestSnapshot = allImagesForCleanup)
             if (nextBatch != null) {
                 preloadedNextBatch = nextBatch
                 
@@ -407,14 +440,14 @@ fun DeckScreen(
     }
 
     // 图集/月份清理模式恢复：当从设置返回时，状态已保持但批次数据需要重新加载
-    androidx.compose.runtime.LaunchedEffect(isAlbumCleanupMode, selectedCleanupAlbum, selectedCleanupMonth, isMonthCleanupMode, allImages, allImagesForCleanup, isLoading) {
+    androidx.compose.runtime.LaunchedEffect(isAlbumCleanupMode, selectedCleanupAlbum, selectedCleanupMonth, isMonthCleanupMode, allImages, allImagesForCleanup, isLoading, currentCleanupBatch) {
         // 如果处于清理模式，但批次数据为空（组件重建后丢失），需要恢复
         if (isAlbumCleanupMode && currentCleanupBatch == null && 
             !isLoading && albumCleanupEngine != null) {
             
             // 根据是月份清理还是图集清理，获取对应的 ID 和图片列表
             val cleanupId: String?
-            val cleanupImages: List<ImageFile>
+            var cleanupImages: List<ImageFile>
             val cleanupName: String?
             
             if (isMonthCleanupMode && selectedCleanupMonth != null) {
@@ -422,6 +455,9 @@ fun DeckScreen(
                 cleanupId = selectedCleanupMonth?.cleanupAlbumId
                 cleanupImages = selectedCleanupMonth?.images ?: emptyList()
                 cleanupName = selectedCleanupMonth?.displayName
+                val rebuilt = refreshedCleanupMonth(selectedCleanupMonth!!, allImagesForCleanup)
+                selectedCleanupMonth = rebuilt
+                cleanupImages = rebuilt.images
             } else if (!isMonthCleanupMode && selectedCleanupAlbum != null) {
                 // 图集清理模式
                 val album = selectedCleanupAlbum!!
@@ -432,20 +468,25 @@ fun DeckScreen(
                 // 没有有效的清理目标，退出
                 return@LaunchedEffect
             }
-            
-            if (cleanupId == null || cleanupImages.isEmpty()) {
-                // 没有图片，退出清理模式
-                onAlbumCleanupModeChange(false)
-                onSelectedCleanupAlbumChange(null)
-                selectedCleanupMonth = null
-                isMonthCleanupMode = false
+
+            if (cleanupId == null || (cleanupImages.isEmpty() && albumCleanupEngine.getTotalGroups(cleanupId) < 0)) {
+                // 任务 A：清空可能源于权限收窄/外部删除（暂时不可见）——存在
+                // 断点即持有会话（隐藏照片、保留断点与未处理意图），访问恢复
+                // 后经本 effect 续接；无断点才退出清理
+                val hasHeldIntent = cleanupId != null && albumCleanupEngine.getCheckpoint(cleanupId) != null
+                if (!hasHeldIntent) {
+                    onAlbumCleanupModeChange(false)
+                    onSelectedCleanupAlbumChange(null)
+                    selectedCleanupMonth = null
+                    isMonthCleanupMode = false
+                }
                 return@LaunchedEffect
             }
             
             android.util.Log.d("DeckScreen", "Restoring cleanup mode for: $cleanupName")
             
             // 尝试从断点恢复
-            val checkpointResult = albumCleanupEngine.getCheckpointBatch(cleanupId, cleanupImages)
+            val checkpointResult = albumCleanupEngine.getCheckpointBatch(cleanupId, cleanupImages, latestSnapshot = allImagesForCleanup)
             if (checkpointResult != null) {
                 val (batch, savedIndex) = checkpointResult
                 currentCleanupBatch = batch
@@ -464,7 +505,7 @@ fun DeckScreen(
                 android.util.Log.d("DeckScreen", "Restored from checkpoint: index=$savedIndex")
             } else {
                 // 没有断点，获取下一批
-                val batch = albumCleanupEngine.getNextBatch(cleanupId, cleanupImages)
+                val batch = albumCleanupEngine.getNextBatch(cleanupId, cleanupImages, latestSnapshot = allImagesForCleanup)
                 if (batch != null) {
                     currentCleanupBatch = batch
                     currentBatch = batch.images
@@ -479,8 +520,7 @@ fun DeckScreen(
                     albumCleanupTotalImages = albumCleanupEngine.getTotalImages(cleanupId)
                     albumCleanupRemainingImages = albumCleanupEngine.getRemainingImages(cleanupId)
                 } else {
-                    // 清理完成
-                    deckState = DeckState.COMPLETED
+                    showCleanupAvailability(cleanupId)
                     onRefreshAlbumCleanupInfos()
                 }
             }
@@ -519,7 +559,7 @@ fun DeckScreen(
             }
         }
     }
-    
+
     // 监听推荐模式切换，实时刷新批次
     // 用于在设置中切换算法后，卡片界面立即显示新算法的推荐结果
     var lastRecommendModeRefreshKey by remember { mutableIntStateOf(recommendModeRefreshKey) }
@@ -550,11 +590,11 @@ fun DeckScreen(
             if (currentBatch.isNotEmpty() && currentIndex < currentBatch.size) {
                 val unviewedImages = currentBatch.drop(currentIndex + 1)
                 if (unviewedImages.isNotEmpty()) {
-                    val unviewedIds = unviewedImages.map { it.id }
-                    android.util.Log.d("DeckScreen", "Removing ${unviewedIds.size} unviewed images from cooldown")
-                    // 在 IO 线程执行移除操作，commit() 会同步完成
+                    android.util.Log.d("DeckScreen", "Removing ${unviewedImages.size} unviewed images from cooldown")
+                    // 在 IO 线程执行移除操作，commit() 会同步完成；
+                    // C1/T03-DECKCOOLDOWN：传行而非裸 ID，跨卷同 ID 他卷已看记录不受影响
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                        onRemoveFromCooldown(unviewedIds)
+                        onRemoveFromCooldown(unviewedImages)
                     }
                 }
             }
@@ -649,7 +689,7 @@ fun DeckScreen(
                 batch
             } else {
                 // 没有预加载，实时获取
-                albumCleanupEngine.getNextBatch(cleanupId, cleanupImages)
+                albumCleanupEngine.getNextBatch(cleanupId, cleanupImages, latestSnapshot = allImagesForCleanup)
             }
             
             if (nextBatch != null) {
@@ -658,8 +698,7 @@ fun DeckScreen(
                 currentIndex = 0
                 markedCount = 0
             } else {
-                // 清理完成
-                deckState = DeckState.COMPLETED
+                showCleanupAvailability(cleanupId)
                 onRefreshAlbumCleanupInfos()
             }
         } else {
@@ -668,6 +707,92 @@ fun DeckScreen(
         }
     }
     
+    // C4/T07：回前台刷新（mediaAccessRevision）产生的新快照向可见消费面同步
+    //（P2 复审项，纯逻辑见 ui/util/ForegroundRefreshSync）——完整媒体身份
+    // 键（卷|ID，O5③ 同口径）。本 effect 声明在 handleCleanupBatchCompletion
+    // 之后：不可访问的未处理组保持待恢复，不按用户完成标记。
+    // · 普通批次：存活行替换为快照最新 ImageFile（dateModified/尺寸随外部
+    //   编辑更新），失效行剔除、顺序保持、currentIndex 对齐（钳制同 deck
+    //   移除路径约定）；剪空走 needsInitialBatch 重新取批。
+    // · 清理批次：仅保留待处理成员完整可见的组，按组重建边界；缺席组
+    //   保留持久处理意图，月份成员从完整新池重建。
+    // · 大图查看器：viewerState.image 按新快照校验——身份仍存在则更新图片
+    //   对象（保持查看位置），已失效则关闭查看器。
+    androidx.compose.runtime.LaunchedEffect(allImages, allImagesForCleanup, isLoading) {
+        val pool = if (allImagesForCleanup.isNotEmpty()) allImagesForCleanup else allImages
+        // 尚未加载完成：等待首次加载。pool 为空且加载已完成 = 有效空快照（全部
+        // 照片被外部删除/权限收窄至空）：各面按空池同步——查看器关闭、批次
+        // 清空、清理会话转入持有（不标记完成、不清断点），访问恢复后续接
+        if (pool.isEmpty() && isLoading) return@LaunchedEffect
+
+        // C-2/C-3 顺序：预取与月份快照先同步，再处理活动批次。
+        preloadedNextBatch?.let { batch ->
+            val synced = syncCleanupBatchToSnapshot(batch, pool)
+            // 预取批整批失效：直接丢弃（预取 effect 会在刷新后的池上重取；
+            // 保留空批会被完成通道消费成空界面）
+            preloadedNextBatch = if (synced.images.isEmpty()) null else synced
+        }
+        selectedCleanupMonth?.let { month ->
+            selectedCleanupMonth = refreshedCleanupMonth(month, pool)
+        }
+        currentCleanupBatch?.let { batch ->
+            val synced = syncCleanupBatchToSnapshot(batch, pool, currentBatch.drop(currentIndex))
+            if (synced !== batch) {
+                if (synced.images.isEmpty()) {
+                    // 任务 A：批次行整体不可见 ≠ 用户完成——快照缺席区分不了
+                    // 外部删除与权限收窄，不得按完成语义标记组。转入持有：
+                    // 清运行态批次（恢复通道在访问恢复后按断点/最新快照续接）、
+                    // 保留断点与未处理意图、隐藏不可操作照片
+                    currentCleanupBatch = null
+                    currentBatch = emptyList()
+                    currentIndex = 0
+                    deckState = DeckState.BROWSING
+                } else {
+                    currentCleanupBatch = synced
+                }
+            }
+        }
+        if (currentBatch.isNotEmpty()) {
+            // deck 空间同步（C-1：与清理空间分列——deck 已剔除用户已处理行，
+            // 清理批仍含之，两空间索引互不可算；索引按当前行身份在同步后
+            // 列表中重定位）
+            val refreshedDeck = syncRowsToSnapshot(currentBatch, pool)
+            val allowedKeys = currentCleanupBatch?.images?.map { it.mediaIdentityKey() }?.toSet()
+            val syncedDeck = if (isAlbumCleanupMode && allowedKeys != null) {
+                refreshedDeck.filter { it.mediaIdentityKey() in allowedKeys }
+            } else refreshedDeck
+            if (syncedDeck != currentBatch) {
+                if (syncedDeck.isEmpty()) {
+                    // deck 可见行全部失效：清理模式下转入持有（同上，不标记
+                    // 不清断点）；普通模式清空待重取
+                    if (isAlbumCleanupMode && currentCleanupBatch != null) {
+                        currentCleanupBatch = null
+                        currentBatch = emptyList()
+                        currentIndex = 0
+                        deckState = DeckState.BROWSING
+                    } else {
+                        currentIndex = 0
+                        currentBatch = syncedDeck
+                        needsInitialBatch = true
+                    }
+                } else {
+                    currentIndex = relocatedIndexAfterSync(currentBatch, syncedDeck, currentIndex)
+                        .coerceIn(0, syncedDeck.lastIndex)
+                    currentBatch = syncedDeck
+                }
+            }
+        }
+
+        viewerState?.let { state ->
+            val refreshed = refreshedViewerImage(state.image, pool)
+            if (refreshed == null) {
+                viewerState = null
+            } else if (refreshed != state.image) {
+                viewerState = state.copy(image = refreshed)
+            }
+        }
+    }
+
     // 图集/月份清理模式：开始下一组（图集模式可能切换到其他图集，月份模式只继续当前月份）
     fun startNextCleanupBatch() {
         if (isLoadingNextBatch || albumCleanupEngine == null) return
@@ -693,7 +818,7 @@ fun DeckScreen(
                     return@launch
                 }
                 
-                if (cleanupId == null || cleanupImages.isEmpty()) {
+                if (cleanupId == null) {
                     deckState = DeckState.COMPLETED
                     return@launch
                 }
@@ -703,7 +828,7 @@ fun DeckScreen(
                 
                 if (remaining > 0) {
                     // 还有剩余组，继续当前清理目标
-                    val nextBatch = albumCleanupEngine.getNextBatch(cleanupId, cleanupImages)
+                    val nextBatch = albumCleanupEngine.getNextBatch(cleanupId, cleanupImages, latestSnapshot = allImagesForCleanup)
                     if (nextBatch != null) {
                         currentCleanupBatch = nextBatch
                         currentBatch = nextBatch.images
@@ -716,6 +841,8 @@ fun DeckScreen(
                         albumCleanupRemainingImages = albumCleanupEngine.getRemainingImages(cleanupId)
                         return@launch
                     }
+                    showCleanupAvailability(cleanupId)
+                    return@launch
                 }
                 
                 // 当前清理目标已完成
@@ -763,7 +890,7 @@ fun DeckScreen(
                 }
                 
                 // 获取新批次
-                val nextBatch = albumCleanupEngine.getNextBatch(nextAlbum.id, albumImages)
+                val nextBatch = albumCleanupEngine.getNextBatch(nextAlbum.id, albumImages, latestSnapshot = allImagesForCleanup)
                 if (nextBatch != null) {
                     currentCleanupBatch = nextBatch
                     currentBatch = nextBatch.images
@@ -780,8 +907,7 @@ fun DeckScreen(
                     // 刷新图集清理信息
                     onRefreshAlbumCleanupInfos()
                 } else {
-                    // 获取失败，显示完成状态
-                    deckState = DeckState.COMPLETED
+                    showCleanupAvailability(nextAlbum.id)
                 }
             } finally {
                 isLoadingNextBatch = false
@@ -1422,15 +1548,17 @@ fun DeckScreen(
             // 获取图集内的图片
             val albumImages = resolveAlbumCleanupImages(album, allImagesForCleanup)
             
-            if (albumImages.isEmpty()) {
+            if (albumImages.isEmpty() && (forceReset || engine.getTotalGroups(album.id) < 0)) {
                 analyzingAlbumId = null
                 Toast.makeText(context, "该图集没有可清理的照片", Toast.LENGTH_SHORT).show()
                 return@launch
             }
             
-            // 分析图集
-            engine.analyzeAlbum(album, albumImages).collect { progress ->
-                analysisProgress = progress
+            // Preserve a complete persisted directory when current access is partial.
+            if (forceReset || engine.getTotalGroups(album.id) < 0) {
+                engine.analyzeAlbum(album, albumImages).collect { progress ->
+                    analysisProgress = progress
+                }
             }
             
             analyzingAlbumId = null
@@ -1439,7 +1567,7 @@ fun DeckScreen(
             val checkpointResult = if (forceReset) {
                 null
             } else {
-                engine.getCheckpointBatch(album.id, albumImages)
+                engine.getCheckpointBatch(album.id, albumImages, latestSnapshot = allImagesForCleanup)
             }
             
             if (checkpointResult != null) {
@@ -1461,7 +1589,7 @@ fun DeckScreen(
                 android.util.Log.d("DeckScreen", "Restored from checkpoint: index=$savedIndex")
             } else {
                 // 没有断点，正常获取下一批
-                val batch = engine.getNextBatch(album.id, albumImages)
+                val batch = engine.getNextBatch(album.id, albumImages, latestSnapshot = allImagesForCleanup)
                 if (batch != null) {
                     onAlbumCleanupModeChange(true)
                     currentCleanupBatch = batch
@@ -1477,16 +1605,14 @@ fun DeckScreen(
                     albumCleanupRemainingImages = engine.getRemainingImages(album.id)
                 } else {
                     // 没有照片需要整理
-                    albumCleanupTotalGroups = 0
-                    albumCleanupRemainingGroups = 0
-                    albumCleanupTotalImages = 0
-                    albumCleanupRemainingImages = 0
+                    albumCleanupTotalGroups = engine.getTotalGroups(album.id)
+                    albumCleanupRemainingGroups = engine.getRemainingGroups(album.id)
+                    albumCleanupTotalImages = engine.getTotalImages(album.id)
+                    albumCleanupRemainingImages = engine.getRemainingImages(album.id)
                     
                     onAlbumCleanupModeChange(true)
                     onSelectedCleanupAlbumChange(album)
-                    currentCleanupBatch = null
-                    currentBatch = emptyList()
-                    deckState = DeckState.COMPLETED
+                    showCleanupAvailability(album.id)
                 }
             }
             
@@ -1518,16 +1644,17 @@ fun DeckScreen(
             // 使用月份的图片列表
             val monthImages = monthInfo.images
             
-            if (monthImages.isEmpty()) {
+            if (monthImages.isEmpty() && (forceReset || engine.getTotalGroups(albumId) < 0)) {
                 analyzingAlbumId = null
                 return@launch
             }
             
             android.util.Log.d("DeckScreen", "Starting month cleanup: ${monthInfo.displayName}, ${monthImages.size} images")
             
-            // 分析月份图片
-            engine.analyzeAlbum(virtualAlbum, monthImages).collect { progress ->
-                analysisProgress = progress
+            if (forceReset || engine.getTotalGroups(albumId) < 0) {
+                engine.analyzeAlbum(virtualAlbum, monthImages).collect { progress ->
+                    analysisProgress = progress
+                }
             }
             
             analyzingAlbumId = null
@@ -1536,7 +1663,7 @@ fun DeckScreen(
             val checkpointResult = if (forceReset) {
                 null
             } else {
-                engine.getCheckpointBatch(albumId, monthImages)
+                engine.getCheckpointBatch(albumId, monthImages, latestSnapshot = allImagesForCleanup)
             }
             
             if (checkpointResult != null) {
@@ -1559,7 +1686,7 @@ fun DeckScreen(
                 android.util.Log.d("DeckScreen", "Month cleanup restored from checkpoint: index=$savedIndex")
             } else {
                 // 没有断点，正常获取下一批
-                val batch = engine.getNextBatch(albumId, monthImages)
+                val batch = engine.getNextBatch(albumId, monthImages, latestSnapshot = allImagesForCleanup)
                 if (batch != null) {
                     onAlbumCleanupModeChange(true)
                     isMonthCleanupMode = true
@@ -1578,16 +1705,14 @@ fun DeckScreen(
                     android.util.Log.d("DeckScreen", "Month cleanup started: ${batch.imageCount} images in ${batch.groupCount} groups")
                 } else {
                     // 没有照片需要整理
-                    albumCleanupTotalGroups = 0
-                    albumCleanupRemainingGroups = 0
-                    albumCleanupTotalImages = 0
-                    albumCleanupRemainingImages = 0
+                    albumCleanupTotalGroups = engine.getTotalGroups(albumId)
+                    albumCleanupRemainingGroups = engine.getRemainingGroups(albumId)
+                    albumCleanupTotalImages = engine.getTotalImages(albumId)
+                    albumCleanupRemainingImages = engine.getRemainingImages(albumId)
                     
                     onAlbumCleanupModeChange(true)
                     isMonthCleanupMode = true
-                    currentCleanupBatch = null
-                    currentBatch = emptyList()
-                    deckState = DeckState.COMPLETED
+                    showCleanupAvailability(albumId)
                 }
             }
             
@@ -1709,6 +1834,8 @@ private fun DeckContent(
 ) {
     val isDarkTheme = LocalIsDarkTheme.current
     val textColor = if (isDarkTheme) Color.White else TabulaColors.CatBlack
+    val shareState = remember { CardShareState() }
+    val sharePhoto = rememberPhotoShareAction()
 
     val hasPrev = currentIndex > 0
     val hasNext = currentIndex < images.lastIndex
@@ -1749,6 +1876,8 @@ private fun DeckContent(
                 displayMode = topBarDisplayMode,
                 onTrashClick = onTrashClick,
                 onSettingsClick = onSettingsClick,
+                onShareClick = { shareState.snapshot()?.let(sharePhoto) },
+                shareEnabled = currentImage != null && shareState.isAvailable,
                 onTrashButtonBoundsChanged = { bounds ->
                     trashButtonBounds = bounds
                 },
@@ -1833,7 +1962,8 @@ private fun DeckContent(
                             fixedTagTriggerIndex = null
                             pendingFixedTagAlbum = null
                         },
-                        genieController = genieController
+                        genieController = genieController,
+                        shareState = shareState
                     )
                 }
             }
@@ -2652,7 +2782,8 @@ private fun AlbumsGrid(
     val context = LocalContext.current
     
     // 建立 ID 到 ImageFile 的映射，加速查找
-    val imageMap = remember(allImages) { allImages.associateBy { it.id } }
+    // C1/T03-COVER：多值映射——跨卷同 ID 行不折叠。
+    val imageMap = remember(allImages) { allImages.groupBy { it.id } }
 
     LazyVerticalGrid(
         columns = GridCells.Fixed(2),
@@ -2672,10 +2803,11 @@ private fun AlbumsGrid(
         }
 
         items(albums) { album ->
-            // 尝试获取封面图片，如果在 imageMap 中找不到则用 coverImageId 构建 URI
-            val coverImage = album.coverImageId?.let { imageMap[it] }
+            // C1/T03-COVER：封面解析按完整媒体身份（卷|ID）——跨卷同 ID 不串图。
+            val coverImage = album.coverImageId?.let { coverId ->
+                resolveCoverRow(album.coverVolumeName, coverId, imageMap[coverId].orEmpty())
+            }
             val coverUri = coverImage?.uri 
-                ?: album.coverImageId?.let { android.net.Uri.parse("content://media/external/images/media/$it") }
             
             // 跟踪图片加载状态
             var loadFailed by remember { mutableStateOf(false) }
@@ -2699,11 +2831,11 @@ private fun AlbumsGrid(
                         )
                 ) {
                    if (coverUri != null && !loadFailed) {
+                       // C1/T03-COVERKEY：封面请求经生产构造器（身份+内容版本键）。
                        AsyncImage(
-                           model = ImageRequest.Builder(context)
-                               .data(coverUri)
-                               .crossfade(true)
-                               .build(),
+                           model = coverImageRequest(
+                               context, coverImage!!, "deck_album_cover_", crossfade = true
+                           ),
                            contentDescription = null,
                            contentScale = ContentScale.Crop,
                            modifier = Modifier.fillMaxSize(),

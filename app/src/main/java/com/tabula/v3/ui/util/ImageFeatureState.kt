@@ -10,27 +10,6 @@ import androidx.compose.ui.platform.LocalContext
 import com.tabula.v3.data.model.ImageFeatures
 import com.tabula.v3.data.model.ImageFile
 import com.tabula.v3.data.repository.ImageFeatureDetector
-import java.util.concurrent.ConcurrentHashMap
-
-/**
- * 图片特征缓存 - 避免重复检测导致闪烁
- */
-private object ImageFeatureCache {
-    // 缓存：imageId -> (enableHdr, enableMotion) -> features
-    private val cache = ConcurrentHashMap<Long, ConcurrentHashMap<Pair<Boolean, Boolean>, ImageFeatures>>()
-    
-    fun get(imageId: Long, enableHdr: Boolean, enableMotion: Boolean): ImageFeatures? {
-        return cache[imageId]?.get(Pair(enableHdr, enableMotion))
-    }
-    
-    fun put(imageId: Long, enableHdr: Boolean, enableMotion: Boolean, features: ImageFeatures) {
-        cache.getOrPut(imageId) { ConcurrentHashMap() }[Pair(enableHdr, enableMotion)] = features
-    }
-    
-    fun clear() {
-        cache.clear()
-    }
-}
 
 @Composable
 fun rememberImageFeatures(
@@ -40,23 +19,28 @@ fun rememberImageFeatures(
 ): ImageFeatures? {
     val context = LocalContext.current
     
+    // T11a：缓存键含内容版本（DATE_MODIFIED 毫秒）与开关组合；不可信阴性不入缓存。
+    val cacheKey = remember(image.id, image.dateModified, enableHdr, enableMotion) {
+        ImageFeatureCacheKey(image.id, image.dateModified, enableHdr, enableMotion)
+    }
+
     // 先从缓存获取，避免初始值为 null 导致闪烁
-    val cachedFeatures = remember(image.id, enableHdr, enableMotion) {
-        ImageFeatureCache.get(image.id, enableHdr, enableMotion)
+    val cachedFeatures = remember(cacheKey) {
+        ImageFeatureCacheStore.get(cacheKey)
     }
     
-    var features by remember(image.id, enableHdr, enableMotion) {
+    var features by remember(cacheKey) {
         mutableStateOf(cachedFeatures)
     }
 
-    LaunchedEffect(image.id, enableHdr, enableMotion) {
+    LaunchedEffect(cacheKey) {
         if (!enableHdr && !enableMotion) {
             features = null
             return@LaunchedEffect
         }
         
         // 如果已有缓存，直接使用
-        val cached = ImageFeatureCache.get(image.id, enableHdr, enableMotion)
+        val cached = ImageFeatureCacheStore.get(cacheKey)
         if (cached != null) {
             features = cached
             return@LaunchedEffect
@@ -69,7 +53,8 @@ fun rememberImageFeatures(
             checkMotion = enableMotion
         )
         
-        ImageFeatureCache.put(image.id, enableHdr, enableMotion, detected)
+        // 不可信阴性（快速模式/信号量繁忙/失败）只用于本次显示，留待重试。
+        ImageFeatureCacheStore.putIfReliable(cacheKey, detected)
         features = detected
     }
 
@@ -88,7 +73,8 @@ suspend fun preloadImageFeatures(
     if (!enableHdr && !enableMotion) return
     
     // 已缓存则跳过
-    if (ImageFeatureCache.get(image.id, enableHdr, enableMotion) != null) return
+    val cacheKey = ImageFeatureCacheKey(image.id, image.dateModified, enableHdr, enableMotion)
+    if (ImageFeatureCacheStore.get(cacheKey) != null) return
     
     val detected = ImageFeatureDetector.detect(
         context = context,
@@ -97,5 +83,5 @@ suspend fun preloadImageFeatures(
         checkMotion = enableMotion
     )
     
-    ImageFeatureCache.put(image.id, enableHdr, enableMotion, detected)
+    ImageFeatureCacheStore.putIfReliable(cacheKey, detected)
 }

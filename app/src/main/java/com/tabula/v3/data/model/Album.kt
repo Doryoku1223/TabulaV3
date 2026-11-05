@@ -36,6 +36,11 @@ data class Album(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
     val coverImageId: Long? = null,
+    /**
+     * C1/T03-COVER：封面照片所属存储卷——封面完整媒体身份 = (卷, 数值 ID)。
+     * null 表示旧口径（卷未知）：展示解析在库内唯一时兼容，跨卷歧义不猜选。
+     */
+    val coverVolumeName: String? = null,
     val color: Long? = null,
     val textColor: Long? = null,
     val emoji: String? = null,

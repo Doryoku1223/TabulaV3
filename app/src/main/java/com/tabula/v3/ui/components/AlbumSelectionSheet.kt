@@ -48,6 +48,10 @@ import coil.size.Size
 import com.tabula.v3.R
 import com.tabula.v3.data.model.Album
 import com.tabula.v3.data.model.ImageFile
+import com.tabula.v3.data.repository.mediaIdentityKey
+import com.tabula.v3.data.repository.resolveCoverRow
+import com.tabula.v3.ui.util.gridThumbnailCacheKey
+
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.util.HapticFeedback
 
@@ -87,7 +91,8 @@ fun AlbumSelectionSheet(
     val dividerColor = if (isDarkTheme) Color(0xFF38383A) else Color(0xFFE5E5EA)
     
     // 图片映射
-    val imageMap = remember(allImages) { allImages.associateBy { it.id } }
+    // C1/T03-COVER：多值映射——跨卷同 ID 行不折叠。
+    val imageMap = remember(allImages) { allImages.groupBy { it.id } }
     
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -151,7 +156,9 @@ fun AlbumSelectionSheet(
                 
                 // 图集列表
                 items(albums, key = { it.id }) { album ->
-                    val coverImage = album.coverImageId?.let { imageMap[it] }
+                    val coverImage = album.coverImageId?.let { coverId ->
+                        resolveCoverRow(album.coverVolumeName, coverId, imageMap[coverId].orEmpty())
+                    }
                     
                     AlbumSelectionRow(
                         album = album,
@@ -257,9 +264,9 @@ private fun AlbumSelectionRow(
 ) {
     val context = LocalContext.current
     
-    // 封面 URI：优先使用 coverImage，否则尝试从 coverImageId 构建
+    // C1/T03-COVER：封面 URI = 解析行的卷限定 URI；解析失败 → null 占位
+    // （聚合 URI fallback 为跨卷串图向量，已移除）。
     val coverUri = coverImage?.uri
-        ?: album.coverImageId?.let { android.net.Uri.parse("content://media/external/images/media/$it") }
     
     // 图片加载失败状态
     var loadFailed by remember { mutableStateOf(false) }
@@ -290,7 +297,10 @@ private fun AlbumSelectionRow(
                 .background(if (isDarkTheme) Color(0xFF2C2C2E) else Color(0xFFF2F2F7))
         ) {
             if (coverUri != null && !loadFailed) {
-                val cacheKey = remember(album.id) { "album_select_${album.id}" }
+                // C1/T03-COVER：键 = 封面行身份 + 内容版本。
+                val cacheKey = remember(coverImage?.mediaIdentityKey(), coverImage?.dateModified) {
+                    gridThumbnailCacheKey("album_select_", coverImage)
+                }
                 AsyncImage(
                     model = ImageRequest.Builder(context)
                         .data(coverUri)

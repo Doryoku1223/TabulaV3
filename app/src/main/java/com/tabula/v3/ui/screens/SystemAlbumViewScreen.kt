@@ -48,12 +48,14 @@ import coil.request.ImageRequest
 import coil.size.Precision
 import coil.size.Size
 import com.tabula.v3.data.model.ImageFile
+import com.tabula.v3.data.repository.mediaIdentityKey
 import com.tabula.v3.di.CoilSetup
 import com.tabula.v3.ui.components.SourceRect
 import com.tabula.v3.ui.components.SwipeableViewerOverlay
 import com.tabula.v3.ui.components.SwipeableViewerState
 import com.tabula.v3.ui.theme.LocalIsDarkTheme
 import com.tabula.v3.ui.util.HapticFeedback
+import com.tabula.v3.ui.util.gridThumbnailCacheKey
 import androidx.compose.foundation.clickable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -144,7 +146,10 @@ fun SystemAlbumViewScreen(
                 state = gridState,
                 modifier = Modifier.weight(1f)
             ) {
-                items(images, key = { it.id }) { image ->
+                // C1/T03-THUMBKEY：列表 key 用完整媒体身份键——bucket 视图
+                // 跨卷同数值 ID 两行共存时不再重复 key 崩溃（与图集网格/
+                // 回收站网格同修法；Compose 重组行为无单测基建，见 PR 范围声明）。
+                items(images, key = { it.mediaIdentityKey() }) { image ->
                     PhotoGridItem(
                         image = image,
                         showHdrBadge = showHdrBadges,
@@ -220,8 +225,10 @@ private fun PhotoGridItem(
                 onClick(sourceRect)
             }
     ) {
-        // 使用稳定的缓存键，基于图片 ID
-        val cacheKey = remember(image.id) { "sys_grid_${image.id}" }
+        // 缩略图缓存键：完整媒体身份 + 内容版本（C1/T03-THUMBKEY）。
+        // 两网格与查看器共用 grid_ 命名空间（请求规格一致），查看器首开
+        // 直接温命中网格缩略图。
+        val cacheKey = remember(image.id, image.dateModified) { gridThumbnailCacheKey("grid_", image) }
         
         // 先绘制占位符背景
         Box(
